@@ -4,6 +4,7 @@ import { providerService } from '../providers/provider.service.js';
 import { catalogService } from '../catalog/catalog.service.js';
 import { q } from '../../packages/database/db.js';
 import { observability } from '../../packages/observability/watchup.adapter.js';
+import { geoService } from '../geo/geo.service.js';
 
 export interface Candidate { providerId: string; score: number; distanceKm: number }
 const WEIGHTS = { distance: 0.5, rating: 0.25, workload: 0.15, fairness: 0.1 };
@@ -19,10 +20,16 @@ export const dispatchService = {
   async findCandidates(job: { serviceId: string; lat: number; lng: number; radiusKm?: number }): Promise<Candidate[]> {
     const svc = await catalogService.get(job.serviceId);
     const radius = job.radiusKm ?? 15;
+    const userZone = await geoService.checkZone(job.lat, job.lng);
     const out: Candidate[] = [];
     for (const p of await providerService.allOnline()) {
       if (svc?.requiresSkill && !p.skills.includes(svc.requiresSkill)) continue;
       if (p.lat === undefined || p.lng === undefined) continue;
+      
+      const providerZone = await geoService.checkZone(p.lat, p.lng);
+      // Strict city match required for dispatch (Uber/Bolt model)
+      if (!userZone.serviceable || !providerZone.serviceable || userZone.cityId !== providerZone.cityId) continue;
+      
       const d = haversineKm([job.lat, job.lng], [p.lat, p.lng]);
       if (d > radius) continue;
       if (svc?.requiresSkill) {

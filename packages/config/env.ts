@@ -11,6 +11,7 @@ const schema = z.object({
   // Empty = local modes (pg-mem / memory queues / local storage). Set on Pxxl
   // via Dashboard > Environment Variables (never in git).
   DATABASE_URL: z.string().default(''),
+  GEOLOCK_CITY: z.string().default(''),
   REDIS_URL: z.string().default(''),
   JWT_ACCESS_SECRET: z.string().default(''),
   JWT_REFRESH_SECRET: z.string().default(''),

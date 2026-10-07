@@ -1,13 +1,17 @@
 // Geo + Tracking — zones, geocode stubs (MapsPort adapter boundary), provider location w/ active-journey guard.
 // Batch points persist to geo.provider_location; read path stays journey-gated.
 import { q } from '../../packages/database/db.js';
+import { config as appConfig } from '../../packages/config/env.js';
 
 export const geoService = {
   async checkZone(lat: number, lng: number) {
-    const zones = await q<any>(`SELECT z.name as zone, c.name as city, z.radius_km as radiusKm, z.lat, z.lng FROM geo.zone z JOIN geo.city c ON z.city_id = c.id`);
+    const zones = await q<any>(`SELECT z.name as zone, c.id as city_id, c.name as city, z.radius_km as radiusKm, z.lat, z.lng FROM geo.zone z JOIN geo.city c ON z.city_id = c.id`);
     for (const z of zones) {
+      // If GEOLOCK_CITY is defined, skip zones that don't match the geolock city
+      if (appConfig.GEOLOCK_CITY && z.city_id !== appConfig.GEOLOCK_CITY && z.city !== appConfig.GEOLOCK_CITY) continue;
+      
       const d = Math.hypot(lat - z.lat, lng - z.lng) * 111; // approx km
-      if (d <= Number(z.radiuskm)) return { serviceable: true, city: String(z.city), zone: String(z.zone), lat: Number(z.lat), lng: Number(z.lng), radiusKm: Number(z.radiuskm) };
+      if (d <= Number(z.radiuskm)) return { serviceable: true, city: String(z.city), cityId: String(z.city_id), zone: String(z.zone), lat: Number(z.lat), lng: Number(z.lng), radiusKm: Number(z.radiuskm) };
     }
     return { serviceable: false as const };
   },
