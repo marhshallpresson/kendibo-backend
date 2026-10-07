@@ -71,7 +71,9 @@ void app.register(cors, {
   origin: (origin, cb) => {
     if (!origin) return cb(null, true); // native (Expo Go / EAS build): no Origin sent
     if (allowedOrigins.includes(origin)) return cb(null, true);
-    if (!PROD && expoOriginAllowed(origin)) return cb(null, true);
+    // Expo dev surfaces (Metro localhost/LAN, devtools ports) are loopback-only
+    // and safe in every environment — demos run Expo web dev against prod.
+    if (expoOriginAllowed(origin)) return cb(null, true);
     return cb(new Error('CORS blocked'), false);
   },
   methods: ['GET', 'POST', 'PATCH', 'DELETE'],
