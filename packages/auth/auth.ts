@@ -12,7 +12,7 @@ const ACCESS_SECRET = config.JWT_ACCESS_SECRET || 'dev-access-INSECURE-DEV-ONLY'
 const REFRESH_SECRET = config.JWT_REFRESH_SECRET || 'dev-refresh-INSECURE-DEV-ONLY';
 
 export async function issueOtp(channel: string, identity: string): Promise<{ code: string; devCode: string }> {
-  const code = String(Math.floor(1000 + Math.random() * 9000));
+  const code = String(Math.floor(100000 + Math.random() * 900000));
   await q(`DELETE FROM identity.otp_code WHERE channel=$1 AND identity=$2`, [channel, identity]);
   await q(
     `INSERT INTO identity.otp_code (channel, identity, code, expires_at) VALUES ($1,$2,$3, now() + interval '5 minutes')`,

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { issueOtp, verifyOtp, signAccess, signRefresh, rotateRefresh, revokeAll } from '../../packages/auth/auth.js';
 import { q } from '../../packages/database/db.js';
 import { sms, email } from '../notifications/channels.js';
+import { templates } from '../notifications/mail.templates.js';
 
 export interface User {
   id: string; phone?: string; email?: string; pinHash?: string; biometric: boolean;
@@ -24,9 +25,10 @@ export const identityService = {
       let phone = identity.replace(/\s+/g, '');
       if (phone.startsWith('+')) phone = phone.substring(1);
       if (phone.startsWith('0')) phone = '234' + phone.substring(1); // Default to NG
-      await sms.send(phone, `Your KENDIBO code is ${r.code}. It expires in 5 minutes.`);
+      await sms.send(phone, `Your Kendibo verification code is ${r.code}. It expires in 5 minutes.`);
     } else {
-      await email.send(identity, 'Your KENDIBO code', `<p>Your KENDIBO code is <b>${r.code}</b>. It expires in 5 minutes.</p>`);
+      const mail = templates.otp(r.code);
+      await email.send(identity, 'Your Kendibo code', mail.html);
     }
     return { devCode: r.devCode };
   },
