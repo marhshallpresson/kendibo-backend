@@ -4,11 +4,17 @@ import { issueOtp, verifyOtp, signAccess, signRefresh, rotateRefresh, revokeAll 
 import { q } from '../../packages/database/db.js';
 import { sms, email } from '../notifications/channels.js';
 
-export interface User { id: string; phone?: string; email?: string; pinHash?: string; biometric: boolean; createdAt: string; }
+export interface User {
+  id: string; phone?: string; email?: string; pinHash?: string; biometric: boolean;
+  name?: string; nickname?: string; dob?: string; avatarUrl?: string; createdAt: string;
+}
 const hashPin = (pin: string) => createHash('sha256').update(`kendibo-pin:${pin}`).digest('hex');
 const row = (r: Record<string, unknown>): User => ({
   id: String(r.id), phone: (r.phone as string) ?? undefined, email: (r.email as string) ?? undefined,
-  pinHash: (r.pin_hash as string) ?? undefined, biometric: Boolean(r.biometric), createdAt: String(r.created_at),
+  pinHash: (r.pin_hash as string) ?? undefined, biometric: Boolean(r.biometric),
+  name: (r.name as string) ?? undefined, nickname: (r.nickname as string) ?? undefined,
+  dob: r.dob ? String(r.dob).slice(0, 10) : undefined,
+  avatarUrl: (r.profile_image as string) ?? undefined, createdAt: String(r.created_at),
 });
 
 export const identityService = {
@@ -63,5 +69,33 @@ export const identityService = {
   async enableBiometrics(userId: string, enabled: boolean) {
     await q(`UPDATE identity.users SET biometric=$2 WHERE id=$1`, [userId, enabled]);
     return { biometric: enabled };
+  },
+  /** Fill/Edit Profile: name, nickname, date of birth, avatar. Phone/email change via OTP re-verify (not here). */
+  async updateProfile(userId: string, patch: { name?: string; nickname?: string; dob?: string; avatarUrl?: string }) {
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    if (patch.name !== undefined) {
+      const clean = String(patch.name).trim().replace(/\s+/g, ' ').slice(0, 80);
+      if (clean.length < 2) throw new Error('NAME_TOO_SHORT');
+      sets.push(`name=$${vals.length + 1}`); vals.push(clean);
+    }
+    if (patch.nickname !== undefined) { sets.push(`nickname=$${vals.length + 1}`); vals.push(String(patch.nickname).trim().slice(0, 40) || null); }
+    if (patch.dob !== undefined) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(patch.dob)) throw new Error('BAD_DOB');
+      sets.push(`dob=$${vals.length + 1}`); vals.push(patch.dob);
+    }
+    if (patch.avatarUrl !== undefined) { sets.push(`profile_image=$${vals.length + 1}`); vals.push(String(patch.avatarUrl).slice(0, 500) || null); }
+    if (sets.length > 0) {
+      await q(`UPDATE identity.users SET ${sets.join(', ')}, updated_at=now() WHERE id=$${vals.length + 1}`, [...vals, userId]);
+    }
+    const me = await this.me(userId);
+    if (!me) throw new Error('NOT_FOUND');
+    return me;
+  },
+  /** Account deactivation: status flag + all refresh tokens revoked. Row retained for audit/finance. */
+  async deactivate(userId: string) {
+    await q(`UPDATE identity.users SET status='inactive' WHERE id=$1`, [userId]);
+    await this.logoutAll(userId);
+    return { ok: true };
   },
 };

@@ -22,11 +22,25 @@ export class TermiiSmsAdapter implements SmsPort {
       return { id: data?.message_id || id('sms') };
     }
     if (devLog) console.log(`[sms] to=${to} body=${body.slice(0, 120)}`);
+    if (process.env.NODE_ENV === 'production') throw new Error('SMS_UNCONFIGURED');
     return { id: id('sms_dev') };
   }
 }
 export class ResendEmailAdapter implements EmailPort {
   async send(to: string, subject: string, html: string) {
+    // Self-hosted first: Brevo SMTP relay (SMTP_* env). Falls back to Resend API.
+    if (process.env.SMTP_HOST) {
+      const nodemailer = (await import('nodemailer')).default;
+      const port = Number(process.env.SMTP_PORT ?? 587);
+      const transport = nodemailer.createTransport({
+        host: process.env.SMTP_HOST, port, secure: port === 465,
+        auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined,
+      });
+      const fromName = process.env.SMTP_FROM_NAME ?? 'Kendibo';
+      const fromAddr = process.env.SMTP_FROM ?? 'no-reply@kendibo.ng';
+      await transport.sendMail({ from: { name: fromName, address: fromAddr }, to, subject, html });
+      return { id: id('em') };
+    }
     if (process.env.RESEND_API_KEY) {
       const r = await fetch('https://api.resend.com/emails', {
         method: 'POST', headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
@@ -36,6 +50,7 @@ export class ResendEmailAdapter implements EmailPort {
       return { id: id('em') };
     }
     if (devLog) console.log(`[email] to=${to} subject=${subject}`);
+    if (process.env.NODE_ENV === 'production') throw new Error('EMAIL_UNCONFIGURED');
     return { id: id('em_dev') };
   }
 }

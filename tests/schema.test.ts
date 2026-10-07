@@ -2,6 +2,9 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { localDb } from '../packages/database/local.js';
 
+// Test isolation: never touch a real DATABASE_URL/REDIS_URL from the machine env.
+// @ts-ignore
+if (typeof globalThis.KENDIBO_TEST_ISOLATION === 'undefined') { (globalThis as any).KENDIBO_TEST_ISOLATION = true; delete process.env.DATABASE_URL; delete process.env.REDIS_URL; }
 describe('schema (PRD Appendix B, local pg-mem)', () => {
   it('reference data seeded', () => {
     const db = localDb();

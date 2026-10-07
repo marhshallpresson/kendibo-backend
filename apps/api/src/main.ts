@@ -1,3 +1,5 @@
+import 'dotenv/config'; // must stay first: loads .env (gitignored) before any env read
+import { config as appConfig } from '../../../packages/config/env.js'; // validates; refuses prod boot on missing secrets
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { z } from 'zod';
@@ -42,8 +44,36 @@ import { requestService } from '../../../modules/requests/request.service.js';
 import { surfaceFor } from '../../../packages/shared/clients.js';
 void surfaceFor;
 
-const app = Fastify({ logger: true, genReqId: () => `req_${Date.now().toString(36)}${Math.floor(Math.random() * 1e6)}` });
-void app.register(cors, { origin: true, methods: ['GET', 'POST', 'PATCH', 'DELETE'] });
+const PROD = appConfig.NODE_ENV === 'production';
+const app = Fastify({
+  logger: true,
+  genReqId: () => `req_${Date.now().toString(36)}${Math.floor(Math.random() * 1e6)}`,
+  trustProxy: PROD, // Pxxl edge terminates TLS ahead of the container
+});
+// Prod CORS: explicit allowlist only (Pxxl dashboard CORS_ORIGINS + deployed app).
+// Dev: permissive + Expo running URLs (Metro bundler on localhost/LAN, legacy
+// devtools ports). Native apps (Expo Go, EAS builds) send no Origin header
+// and are always allowed; Expo web sends its https origin (must allowlist).
+const allowedOrigins = appConfig.CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean);
+const EXPO_DEV_ORIGINS = [
+  'http://localhost:8081', 'http://127.0.0.1:8081',
+  'http://localhost:19000', 'http://localhost:19001', 'http://localhost:19002',
+  'http://127.0.0.1:19000', 'http://127.0.0.1:19001', 'http://127.0.0.1:19002',
+];
+const EXPO_LAN_RE = /^http:\/\/(192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(:\d+)?$/;
+function expoOriginAllowed(origin: string): boolean {
+  if (EXPO_DEV_ORIGINS.includes(origin)) return true;
+  return EXPO_LAN_RE.test(origin); // physical device -> Metro on LAN
+}
+void app.register(cors, {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // native (Expo Go / EAS build): no Origin sent
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    if (!PROD && expoOriginAllowed(origin)) return cb(null, true);
+    return cb(new Error('CORS blocked'), false);
+  },
+  methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+});
 const payments = new PaymentService((globalThis as Record<string, unknown>).__PSP__ as never);
 openPeriod('2026-10');
 // Local DB (pg-mem) when no DATABASE_URL — same SQL, same constraints as Pxxl Postgres.
@@ -391,7 +421,17 @@ app.get('/v1/admin/dispatch/live', async (req, reply) => {
 // ---- USER APP: me/properties ----
 app.patch('/v1/me', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
-  return { data: await identityService.me(a.sub) };
+  try {
+    const patch = z.object({
+      name: z.string().optional(), nickname: z.string().optional(),
+      dob: z.string().optional(), avatarUrl: z.string().optional(),
+    }).parse(req.body);
+    return { data: await identityService.updateProfile(a.sub, patch) };
+  } catch (e: unknown) { return fail(reply, 'BAD_PROFILE', (e as Error).message); }
+});
+app.delete('/v1/me', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  return { data: await identityService.deactivate(a.sub) };
 });
 app.get('/v1/me/properties', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);

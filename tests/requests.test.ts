@@ -6,6 +6,9 @@ import { providerService } from '../modules/providers/provider.service.js';
 import { bookingService } from '../modules/bookings/booking.service.js';
 import { q } from '../packages/database/db.js';
 
+// Test isolation: never touch a real DATABASE_URL/REDIS_URL from the machine env.
+// @ts-ignore
+if (typeof globalThis.KENDIBO_TEST_ISOLATION === 'undefined') { (globalThis as any).KENDIBO_TEST_ISOLATION = true; delete process.env.DATABASE_URL; delete process.env.REDIS_URL; }
 async function testUser(): Promise<string> {
   const rows = await q<{ id: string }>(`INSERT INTO identity.users (email) VALUES ($1) RETURNING id`, [`rq-${randomUUID()}@kendibo.local`]);
   return String(rows[0].id);

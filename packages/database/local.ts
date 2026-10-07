@@ -46,7 +46,8 @@ export function localDb(): IMemoryDb {
   run('006_checklist.sql');
   run('007_requests.sql');
   run('008_checker.sql');
-  console.log('[localdb] pg-mem ready (001-008)');
+  run('009_profile.sql');
+  console.log('[localdb] pg-mem ready (001-009)');
   return mem;
 }
 

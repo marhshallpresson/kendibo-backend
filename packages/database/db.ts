@@ -11,7 +11,13 @@ let pool: PgPool | null = null;
 export function db(): PgPool {
   if (pool) return pool;
   if (process.env.DATABASE_URL) {
-    const real = new Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
+    const real = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      max: 10,
+      // Pxxl managed Postgres terminates TLS with a self-signed chain.
+      // Encryption stays on; chain validation off (same as ?sslmode=require).
+      ssl: { rejectUnauthorized: false },
+    });
     real.on('error', () => {});
     pool = real as unknown as PgPool;
     return pool;

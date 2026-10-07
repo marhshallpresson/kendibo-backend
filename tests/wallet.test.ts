@@ -1,3 +1,6 @@
+// Test isolation: never touch a real DATABASE_URL/REDIS_URL from the machine env.
+// @ts-ignore
+if (typeof globalThis.KENDIBO_TEST_ISOLATION === 'undefined') { (globalThis as any).KENDIBO_TEST_ISOLATION = true; delete process.env.DATABASE_URL; delete process.env.REDIS_URL; }
 // Wallet tests (node:test). Service-level tests hit modules/wallet directly;
 // route tests use the real Fastify app via app.inject.
 // main.ts only listens when NODE_ENV !== 'test', so set it before importing the app.
