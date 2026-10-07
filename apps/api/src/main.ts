@@ -43,6 +43,8 @@ import { maps } from '../../../modules/geo/maps.port.js';
 import { requestService } from '../../../modules/requests/request.service.js';
 import { surfaceFor } from '../../../packages/shared/clients.js';
 void surfaceFor;
+import { watchupTracing } from '../../../packages/observability/watchup/fastify.js';
+import { watchup as watchupClient } from '../../../packages/observability/watchup.adapter.js';
 
 const PROD = appConfig.NODE_ENV === 'production';
 const app = Fastify({
@@ -91,6 +93,11 @@ function authed(req: { headers: Record<string, string | undefined> }): { sub: st
 }
 
 // ---------- health ----------
+// GET / answers platform probes + humans (Pxxl health checks default to /).
+app.get('/', async () => ({
+  ok: true, service: 'kendibo-api', version: '0.1.0',
+  docs: 'GET /health/live, /health/ready, /health/dependencies, /v1/mobile/config',
+}));
 app.get('/health/live', async () => ({ ok: true }));
 app.get('/health/ready', async () => ({ ok: true, db: process.env.DATABASE_URL ? 'postgres' : 'local', redis: process.env.REDIS_URL ? 'redis' : 'memory', storage: objectStore.driver }));
 app.get('/health/dependencies', async () => ({ bachs: 'sandbox', flutterwave: 'fallback', maps: 'adapter', kyc: 'adapter', sms: 'termii', email: 'smtp', push: 'fcm', storage: objectStore.driver }));

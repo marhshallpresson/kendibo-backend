@@ -5,6 +5,7 @@ if (typeof globalThis.KENDIBO_TEST_ISOLATION === 'undefined') { (globalThis as a
 // route tests use the real Fastify app via app.inject.
 // main.ts only listens when NODE_ENV !== 'test', so set it before importing the app.
 // A fake PSP adapter is injected via globalThis.__PSP__ (no network calls).
+import 'dotenv/config';
 import { describe, it, before } from 'node:test';
 import assert from 'node:assert';
 import { randomUUID } from 'node:crypto';

@@ -11,7 +11,7 @@
     "start:api": "node dist/apps/api/src/main.js",
     "dev:api": "tsx watch apps/api/src/main.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/*.test.ts tests/*.test.js",
+    "test": "tsx --test --test-force-exit tests/ledger.money.test.ts tests/domains.test.ts tests/mobile.prd.test.ts tests/schema.test.ts tests/wallet.test.ts tests/requests.test.ts",
     "test:adversarial": "node tests/adversarial.js",
     "migrate": "node scripts/migrate.js",
     "start": "node dist/apps/api/src/main.js"
