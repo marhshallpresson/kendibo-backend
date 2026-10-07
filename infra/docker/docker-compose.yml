@@ -1,0 +1,12 @@
+services:
+  api:
+    build: { context: ../.., dockerfile: infra/docker/Dockerfile }
+    ports: ["3000:3000"]
+    env_file: [../../.env]
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment: { POSTGRES_USER: kendibo, POSTGRES_PASSWORD: kendibo, POSTGRES_DB: kendibo }
+    ports: ["5432:5432"]
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]

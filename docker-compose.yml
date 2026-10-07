@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: kendibo
+      POSTGRES_PASSWORD: kendibo
+      POSTGRES_DB: kendibo
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres:/docker-entrypoint-initdb.d:ro
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    volumes:
+      - redisdata:/data
+  api:
+    build: { context: ., dockerfile: infra/docker/Dockerfile }
+    ports: ["3000:3000"]
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgres://kendibo:kendibo@postgres:5432/kendibo
+      REDIS_URL: redis://redis:6379
+    depends_on: [postgres, redis]
+volumes:
+  pgdata:
+  redisdata:
