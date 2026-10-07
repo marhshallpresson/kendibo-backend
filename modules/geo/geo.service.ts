@@ -7,8 +7,11 @@ export const geoService = {
   async checkZone(lat: number, lng: number) {
     const zones = await q<any>(`SELECT z.name as zone, c.id as city_id, c.name as city, z.radius_km as radiusKm, z.lat, z.lng FROM geo.zone z JOIN geo.city c ON z.city_id = c.id`);
     for (const z of zones) {
-      // If GEOLOCK_CITY is defined, skip zones that don't match the geolock city
-      if (appConfig.GEOLOCK_CITY && z.city_id !== appConfig.GEOLOCK_CITY && z.city !== appConfig.GEOLOCK_CITY) continue;
+      // If GEOLOCK_CITY is defined, split by comma and check if the zone's city or city_id is included
+      if (appConfig.GEOLOCK_CITY) {
+        const allowedCities = appConfig.GEOLOCK_CITY.split(',').map(c => c.trim().toLowerCase());
+        if (!allowedCities.includes(z.city_id.toLowerCase()) && !allowedCities.includes(z.city.toLowerCase())) continue;
+      }
       
       const d = Math.hypot(lat - z.lat, lng - z.lng) * 111; // approx km
       if (d <= Number(z.radiuskm)) return { serviceable: true, city: String(z.city), cityId: String(z.city_id), zone: String(z.zone), lat: Number(z.lat), lng: Number(z.lng), radiusKm: Number(z.radiuskm) };
