@@ -73,6 +73,7 @@ export const reviewService = {
     );
     const r = rows[0];
     if (flagged) await q(`INSERT INTO outbox_event (topic, payload) VALUES ('review.flagged',$1)`, [JSON.stringify({ reviewId: String(r.id), bookingId })]);
+    emit('review.submitted', { reviewId: String(r.id), bookingId, rating: avg, flagged });
     return {
       id: String(r.id), bookingId: String(r.booking_id), providerId: r.provider_id ? String(r.provider_id) : undefined,
       provider: Number(r.provider), quality: Number(r.quality), punctuality: Number(r.punctuality),

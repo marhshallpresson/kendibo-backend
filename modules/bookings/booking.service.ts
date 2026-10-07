@@ -3,6 +3,7 @@
 import { price } from '../pricing/pricing.engine.js';
 import { transition, type JobStatus } from '../job-engine/job.machine.js';
 import { q } from '../../packages/database/db.js';
+import { emit } from '../../packages/observability/emit.js';
 
 export interface Booking {
   id: string; userId: string; serviceId: string; addressId: string;

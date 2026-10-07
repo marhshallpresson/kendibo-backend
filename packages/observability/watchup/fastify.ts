@@ -1,7 +1,21 @@
 // Fastify tracing plugin — method/route/status/duration traces + error capture.
 // Never attaches bodies, headers, cookies, query strings (privacy posture).
+// User identification: verified JWT sub attached per request (no global
+// mutation — safe under concurrent users).
 import type { FastifyInstance } from 'fastify';
+import { verifyAccess } from '../../auth/auth.js';
 import { watchup } from '../watchup.adapter.js';
+
+function requestUser(req: { headers: Record<string, string | undefined> }): { id: string } | undefined {
+  try {
+    const h = req.headers.authorization;
+    if (!h?.startsWith('Bearer ')) return undefined;
+    const v = verifyAccess(h.slice(7));
+    return v ? { id: v.sub } : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export async function watchupTracing(app: FastifyInstance): Promise<void> {
   app.addHook('onRequest', async (req) => {
@@ -16,6 +30,7 @@ export async function watchupTracing(app: FastifyInstance): Promise<void> {
       watchup.trace(`${req.method} ${route}`, ms, reply.statusCode, {
         request_id: req.id,
         route, method: req.method, status: reply.statusCode,
+        user: requestUser(req as never),
       });
     } catch { /* fail open */ }
   });

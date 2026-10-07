@@ -55,6 +55,7 @@ export const b2bService = {
     const upd = await q<Record<string, unknown>>(
       `UPDATE b2b.work_order SET approvals=$2, status='approved' WHERE id=$1 RETURNING *`, [id, JSON.stringify(approvals)],
     );
+    emit('b2b.work_order_approved', { workOrderId: id, role, by });
     return toWO(upd[0]);
   },
   async invoice(orgId: string, workOrderId: string): Promise<Invoice> {

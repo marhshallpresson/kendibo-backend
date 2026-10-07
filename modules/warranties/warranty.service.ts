@@ -70,7 +70,9 @@ export const supportService = {
     const rows = await q<Record<string, unknown>>(
       `INSERT INTO support.ticket (customer_id, job_id, reason, priority) VALUES ($1,$2,$3,$4) RETURNING *`, [customerId, jobId ?? null, reason, priority],
     );
-    return toTicket(rows[0], []);
+    const ticket = toTicket(rows[0], []);
+    emit('support.opened', { ticketId: ticket.id, reason });
+    return ticket;
   },
   async message(id: string, from: string, body: string) {
     await q(`INSERT INTO support.ticket_message (ticket_id, sender, body) VALUES ($1,$2,$3)`, [id, from, body.slice(0, 2000)]);

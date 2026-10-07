@@ -2,6 +2,7 @@
 // All persisted: verify_level on provider.provider, metrics in provider.quality,
 // completions in booking.checklist_done, emergencies in outbox + memory ref.
 import { q } from '../../packages/database/db.js';
+import { emit } from '../../packages/observability/emit.js';
 
 export type VerifyLevel = 'pending' | 'under_review' | 'verified' | 'specialist_verified' | 'suspended' | 'restricted' | 'deactivated';
 export const verificationService = {
@@ -9,6 +10,7 @@ export const verificationService = {
     await q(`UPDATE provider.provider SET verify_level=$2 WHERE id=$1`, [providerId, level]);
     await q(`INSERT INTO outbox_event (topic, payload) VALUES ('provider.verify',$1)`,
       [JSON.stringify({ providerId, level, categories })]);
+    emit('provider.verified', { providerId, level });
     return { level, categories, at: new Date().toISOString() };
   },
   async get(providerId: string) {
@@ -81,6 +83,7 @@ export const emergencyService = {
   async create(jobId: string, kind: string): Promise<EmergencyJob> {
     const e: EmergencyJob = { id: `sos_${Date.now().toString(36)}`, jobId, kind, escalated: false, createdAt: new Date().toISOString() };
     await q(`INSERT INTO outbox_event (topic, payload) VALUES ('emergency.sos',$1)`, [JSON.stringify(e)]);
+    emit('sos.triggered', { jobId, kind });
     return e;
   },
   async escalate(id: string) {
