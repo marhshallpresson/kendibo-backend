@@ -55,5 +55,7 @@ export interface PaymentPort {
   verifyByChargeId(chargeId: string): Promise<VerifiedPayment>;
   refund(input: RefundInput): Promise<{ refundId: string; status: string }>;
   createPayout(input: PayoutInput): Promise<{ payoutId: string; status: string }>;
+  createVirtualAccount(input: { userId: string; email: string; name: string }): Promise<{ accountName: string; accountNumber: string; bankName: string }>;
+  verifyBankAccount(input: { accountNumber: string; bankCode: string }): Promise<{ accountName: string; valid: boolean }>;
   verifyWebhookSignature(rawBody: Buffer | string, headers: Record<string, string | string[] | undefined>): boolean;
 }

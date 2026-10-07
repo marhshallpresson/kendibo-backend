@@ -113,6 +113,31 @@ export class BachsAdapter implements PaymentPort {
     return { payoutId: json.id, status: json.status };
   }
 
+  async createVirtualAccount(input: { userId: string; email: string; name: string }) {
+    const json = await bachsFetch('/v1/virtual-accounts', {
+      method: 'POST',
+      body: JSON.stringify({
+        customer: { email: input.email, name: input.name },
+        reference: 'va_' + input.userId,
+      }),
+    });
+    return {
+      accountName: json.account_name,
+      accountNumber: json.account_number,
+      bankName: json.bank_name,
+    };
+  }
+
+  async verifyBankAccount(input: { accountNumber: string; bankCode: string }) {
+    const json = await bachsFetch('/v1/resolve-account?account_number=' + input.accountNumber + '&bank_code=' + input.bankCode, {
+      method: 'GET',
+    });
+    return {
+      accountName: json.account_name,
+      valid: !!json.account_name,
+    };
+  }
+
   verifyWebhookSignature(rawBody: Buffer | string, headers: Record<string, string | string[] | undefined>): boolean {
     // X-Bachs-Signature over "{timestamp}.{rawBody}", tolerance 300s.
     try {

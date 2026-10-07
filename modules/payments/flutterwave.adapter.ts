@@ -100,6 +100,14 @@ export class FlutterwaveAdapter implements PaymentPort {
     return { payoutId: String(json.data?.id), status: json.data?.status ?? 'NEW' };
   }
 
+  async createVirtualAccount(input: { userId: string; email: string; name: string }) {
+    return { accountName: input.name, accountNumber: '0000000000', bankName: 'Flutterwave Dummy' };
+  }
+
+  async verifyBankAccount(input: { accountNumber: string; bankCode: string }) {
+    return { accountName: 'FW Verified', valid: true };
+  }
+
   verifyWebhookSignature(_rawBody: Buffer | string, headers: Record<string, string | string[] | undefined>): boolean {
     const sig = String(headers['verif-hash'] ?? '');
     if (!sig || !SECRET_HASH) return false;

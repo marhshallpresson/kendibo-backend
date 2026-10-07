@@ -32,3 +32,14 @@ CREATE TABLE IF NOT EXISTS booking.failed_job (
   job_id TEXT PRIMARY KEY, code TEXT NOT NULL,
   actor TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE provider.provider
+  ADD COLUMN IF NOT EXISTS bank_code TEXT,
+  ADD COLUMN IF NOT EXISTS account_number TEXT,
+  ADD COLUMN IF NOT EXISTS account_name TEXT,
+  ADD COLUMN IF NOT EXISTS settlement_account_id TEXT;
+
+ALTER TABLE identity.users
+  ADD COLUMN IF NOT EXISTS virtual_account_id TEXT,
+  ADD COLUMN IF NOT EXISTS virtual_account_name TEXT,
+  ADD COLUMN IF NOT EXISTS virtual_bank_name TEXT;

@@ -69,6 +69,14 @@ export class PaymentService {
     });
   }
 
+  async createVirtualAccount(userId: string, email: string, name: string, preferred: PSP = 'bachs') {
+    return this.adapters[preferred].createVirtualAccount({ userId, email, name });
+  }
+
+  async verifyBankAccount(accountNumber: string, bankCode: string, preferred: PSP = 'bachs') {
+    return this.adapters[preferred].verifyBankAccount({ accountNumber, bankCode });
+  }
+
   /** Webhook handler core: persist raw event, verify signature, then server-side verify before ledger. */
   async handleWebhook(psp: PSP, rawBody: Buffer, headers: Record<string, string | undefined>): Promise<{ ok: boolean; verified?: VerifiedPayment }> {
     const adapter = this.adapters[psp];
