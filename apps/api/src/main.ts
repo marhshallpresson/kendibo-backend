@@ -76,8 +76,23 @@ void app.register(cors, {
   },
   methods: ['GET', 'POST', 'PATCH', 'DELETE'],
 });
+// Kobo amounts travel as bigint internally — JSON has no bigint, so convert
+// globally at the HTTP boundary (strings preserve precision; clients coerce).
+const ser = (v: unknown): unknown =>
+  typeof v === 'bigint'
+    ? v.toString()
+    : Array.isArray(v)
+      ? v.map(ser)
+      : v && typeof v === 'object'
+        ? Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, ser(x)]))
+        : v;
+void app.addHook('preSerialization', async (_req, _reply, payload) => ser(payload));
+void app.addHook('preSerialization', async (_req, _reply, payload) => ser(payload));
 const payments = new PaymentService((globalThis as Record<string, unknown>).__PSP__ as never);
-openPeriod('2026-10');
+void app.register(watchupTracing);
+process.on('unhandledRejection', (err) => observability.captureException(err, { source: 'unhandledRejection' }));
+process.on('SIGTERM', () => void (watchupClient as unknown as { shutdown?: () => Promise<void> }).shutdown?.());
+void openPeriod('2026-10');
 // Local DB (pg-mem) when no DATABASE_URL — same SQL, same constraints as Pxxl Postgres.
 if (!process.env.DATABASE_URL) {
   void import('../../../packages/database/local.js').then((m) => m.localDb());
@@ -101,6 +116,24 @@ app.get('/', async () => ({
 app.get('/health/live', async () => ({ ok: true }));
 app.get('/health/ready', async () => ({ ok: true, db: process.env.DATABASE_URL ? 'postgres' : 'local', redis: process.env.REDIS_URL ? 'redis' : 'memory', storage: objectStore.driver }));
 app.get('/health/dependencies', async () => ({ bachs: 'sandbox', flutterwave: 'fallback', maps: 'adapter', kyc: 'adapter', sms: 'termii', email: 'smtp', push: 'fcm', storage: objectStore.driver }));
+app.get('/v1/admin/monitoring', async (req, reply) => {
+  const a = authed(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const w = watchupClient as unknown as {
+    enabled: boolean; queueDepth: number; lastFlush: { at: string | null; ok: boolean | null };
+    environment: string; release: string; service: string;
+  };
+  return {
+    data: {
+      watchup: {
+        enabled: w.enabled, service: w.service, environment: w.environment, release: w.release,
+        queueDepth: w.queueDepth, lastFlush: w.lastFlush,
+        dashboard: 'https://watchup.site',
+      },
+      slo: { apiP95ms: 500, bookingP95ms: 800, webhookLagSec: 60, queueAgeSec: 60 },
+    },
+  };
+});
 app.get('/v1/config', async () => ({ priceBook: await configurationService.priceBook(), flags: await configurationService.flags() }));
 
 // ---------- auth (OTP + refresh + PIN/biometrics stubs) ----------
@@ -816,7 +849,12 @@ app.get('/v1/media/:id/file', async (req, reply) => {
 
 const port = Number(process.env.PORT ?? 3000);
 if (process.env.VITEST !== 'true' && process.env.NODE_ENV !== 'test') {
-  app.listen({ port, host: '0.0.0.0' }).then(() => app.log.info(`kendibo-api :${port} (bachs primary, flutterwave fallback)`));
+  app.listen({ port, host: '0.0.0.0' }).then(() => {
+    const w = watchupClient as unknown as { enabled: boolean; environment: string; release: string };
+    app.log.info(`kendibo-api :${port} (bachs primary, flutterwave fallback)`);
+    app.log.info(`watchup: ${w.enabled ? `enabled env=${w.environment} release=${w.release}` : 'disabled (no WATCHUP_API_KEY)'}`);
+    if (w.enabled) observability.track('deploy.boot', { port, env: w.environment, release: w.release });
+  });
 }
 export { app };
 export { fraudService };

@@ -62,6 +62,9 @@ export class Watchup {
   }
 
   get enabled(): boolean { return this.transport !== null; }
+  get queueDepth(): number { return this.queue.length; }
+  get lastFlush(): { at: string | null; ok: boolean | null } { return { ...this.lastFlushState }; }
+  private lastFlushState: { at: string | null; ok: boolean | null } = { at: null, ok: null };
 
   setUser(user: WatchupUser | null): void { this.user = user; }
 
@@ -177,6 +180,7 @@ export class Watchup {
         const batch = this.queue.splice(0, MAX_BATCH_ITEMS);
         const body = JSON.stringify(envelope(this.service, batch));
         const r = await this.transport.send(body);
+        this.lastFlushState = { at: new Date().toISOString(), ok: r.ok };
         if (!r.ok && r.retryable) {
           this.queue.unshift(...batch.slice(-50)); // requeue newest 50 only
           break;

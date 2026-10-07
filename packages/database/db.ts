@@ -30,8 +30,25 @@ export function db(): PgPool {
 
 /** Parameterised query. BIGINT comes back as string — wrap with BigInt()/String() at use. */
 export async function q<T = Record<string, unknown>>(text: string, params: unknown[] = []): Promise<T[]> {
-  const r = await db().query(text, params);
-  return r.rows as T[];
+  const t0 = process.hrtime.bigint();
+  try {
+    const r = await db().query(text, params);
+    return r.rows as T[];
+  } finally {
+    // Slow-query trace (>1s) without importing the client (avoids a cycle):
+    // dynamic import keeps db.ts dependency-free at module load.
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    if (ms > 1000 && process.env.WATCHUP_API_KEY) {
+      void import('../observability/watchup/client.js').then(async ({ Watchup }) => {
+        try {
+          const w = new Watchup({ service: 'db' });
+          w.trace('db.slow_query', ms, 200, { sql: text.slice(0, 200) });
+          await w.flush();
+          await w.shutdown();
+        } catch { /* fail open */ }
+      });
+    }
+  }
 }
 
 /** Transactional outbox insert — same DB txn as domain write in production. */
