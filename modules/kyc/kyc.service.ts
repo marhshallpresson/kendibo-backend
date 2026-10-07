@@ -3,6 +3,7 @@
 // unless explicitly enabled with KYC_PROVIDER=dojah + DOJAH_API_KEY).
 // The Dojah integration is fully implemented below but DISABLED by default.
 import { q } from '../../packages/database/db.js';
+import { emit } from '../../packages/observability/emit.js';
 
 export type KycStatus = 'PENDING' | 'UNDER_REVIEW' | 'VERIFIED' | 'REJECTED';
 export interface KycResult { providerId: string; status: KycStatus; checks: Record<string, boolean> }
@@ -17,6 +18,7 @@ async function persist(providerId: string, status: KycStatus, checks: Record<str
   await q(`UPDATE provider.provider SET kyc_status=$1 WHERE id=$2`, [status, providerId]);
   await q(`INSERT INTO audit.log (actor, action, entity_type, entity_id) VALUES ($1,$2,$3,$4)`,
     [providerId, `kyc.completed.status=${status}`, 'provider', providerId]);
+  emit('kyc.completed', { providerId, status });
   return { providerId, status, checks };
 }
 

@@ -1,5 +1,6 @@
 // Quotes — Postgres-backed immutable revisions + change orders + lock.
 import { q } from '../../packages/database/db.js';
+import { emit } from '../../packages/observability/emit.js';
 
 export interface Quote {
   id: string; bookingId: string; providerId: string; version: number;
@@ -47,7 +48,9 @@ export const quoteService = {
        JSON.stringify(input.assumptions ?? []), JSON.stringify(input.exclusions ?? []),
        JSON.stringify(input.attachments ?? []), input.providerNotes ?? null],
     );
-    return toQuote(rows[0]);
+    const created = toQuote(rows[0]);
+    emit('quote.created', { bookingId, version: created.version });
+    return created;
   },
   async revisions(bookingId: string): Promise<Quote[]> {
     const rows = await q<Record<string, unknown>>(`SELECT * FROM booking.quote WHERE job_id=$1 ORDER BY version`, [bookingId]);
@@ -64,7 +67,9 @@ export const quoteService = {
     await q(`UPDATE booking.quote SET status='accepted', locked=TRUE WHERE id=$1`, [String(value.id)]);
     await q(`UPDATE booking.quote SET status='rejected' WHERE job_id=$1 AND version!=$2 AND status='proposed'`, [bookingId, version]);
     const upd = await q<Record<string, unknown>>(`SELECT * FROM booking.quote WHERE id=$1`, [String(value.id)]);
-    return toQuote(upd[0]);
+    const accepted = toQuote(upd[0]);
+    emit('quote.accepted', { bookingId, version });
+    return accepted;
   },
   async requestChange(bookingId: string, quoteId: string, reason: string, amountKobo: bigint, evidence: string[] = []): Promise<ChangeOrder> {
     const rows = await q<Record<string, unknown>>(

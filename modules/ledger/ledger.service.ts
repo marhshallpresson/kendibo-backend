@@ -3,6 +3,7 @@
 // UNIQUE journal reference; periods in ledger.period; reversals, never mutation.
 import type { Kobo } from '../payments/money.js';
 import { q } from '../../packages/database/db.js';
+import { observability } from '../../packages/observability/watchup.adapter.js';
 
 export type AccountType = 'asset' | 'liability' | 'revenue' | 'expense' | 'held';
 export interface LedgerAccount { id: string; code: string; name: string; type: AccountType }
@@ -57,6 +58,7 @@ export async function postJournal(j: Journal): Promise<Journal> {
       [journalId, l.accountCode, String(l.debitKobo), String(l.creditKobo)]);
   }
   await q(`INSERT INTO outbox_event (topic, payload) VALUES ('ledger.posted',$1)`, [JSON.stringify({ reference: j.reference })]);
+  try { observability.track('ledger.posted', { reference: j.reference, period: j.period }); } catch { /* fail open */ }
   return { ...j, id: journalId, createdAt: String(jr[0].created_at) };
 }
 

@@ -3,6 +3,7 @@
 import { providerService } from '../providers/provider.service.js';
 import { catalogService } from '../catalog/catalog.service.js';
 import { q } from '../../packages/database/db.js';
+import { observability } from '../../packages/observability/watchup.adapter.js';
 
 export interface Candidate { providerId: string; score: number; distanceKm: number }
 const WEIGHTS = { distance: 0.5, rating: 0.25, workload: 0.15, fairness: 0.1 };
@@ -38,6 +39,8 @@ export const dispatchService = {
     return out.sort((a, b) => b.score - a.score);
   },
   async assign(jobId: string, providerId: string) {
-    return providerService.offer(jobId, providerId);
+    const offer = await providerService.offer(jobId, providerId);
+    try { observability.track('dispatch.assigned', { jobId, providerId }); } catch { /* fail open */ }
+    return offer;
   },
 };

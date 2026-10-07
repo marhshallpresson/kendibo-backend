@@ -2,6 +2,7 @@
 // Persisted: every transition -> booking.job_event (+ outbox_event, same txn
 // in prod). Exception flags -> job_event rows. Reschedules -> booking.reschedule.
 import { q } from '../../packages/database/db.js';
+import { observability } from '../../packages/observability/watchup.adapter.js';
 
 export type JobStatus =
   | 'DRAFT' | 'REQUESTED' | 'PAYMENT_PENDING' | 'QUOTE_PENDING' | 'CONFIRMED' | 'MATCHING'
@@ -56,7 +57,9 @@ async function record(e: JobEvent): Promise<JobEvent> {
 
 export async function transition(jobId: string, from: JobStatus, to: JobStatus, actor: string, extra?: Partial<JobEvent>): Promise<JobEvent> {
   if (!TRANSITIONS[from].includes(to)) throw new Error(`ILLEGAL_TRANSITION:${from}->${to}`);
-  return record({ jobId, from, to, at: new Date().toISOString(), actor, ...extra });
+  const e = await record({ jobId, from, to, at: new Date().toISOString(), actor, ...extra });
+  try { observability.track('job.transition', { jobId, from, to, actor }); } catch { /* fail open */ }
+  return e;
 }
 export async function flag(jobId: string, f: ExceptionFlag, actor: string, reason?: string): Promise<ExceptionFlag[]> {
   await record({ jobId, from: 'IN_PROGRESS', to: 'IN_PROGRESS', at: new Date().toISOString(), actor, reason: `${f}:${reason ?? ''}`, flags: [f] });

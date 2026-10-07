@@ -1,5 +1,6 @@
 // B2B — Postgres-backed organisations, members, work orders, approvals, invoices.
 import { q } from '../../packages/database/db.js';
+import { emit } from '../../packages/observability/emit.js';
 
 export interface Org { id: string; name: string; type: string; createdAt: string }
 export interface OrgUser { orgId: string; userId: string; role: 'B2B_ADMIN' | 'FACILITY_MANAGER' | 'PROPERTY_MANAGER' | 'APPROVER' | 'STAFF' | 'FINANCE' }
@@ -40,7 +41,9 @@ export const b2bService = {
       `INSERT INTO b2b.work_order (org_id, property_id, title, amount_kobo) VALUES ($1,$2,$3,$4) RETURNING *`,
       [orgId, propertyId || null, title, String(amountKobo)],
     );
-    return toWO(rows[0]);
+    const wo = toWO(rows[0]);
+    emit('b2b.work_order_created', { orgId, workOrderId: wo.id });
+    return wo;
   },
   async approve(id: string, role: string, by: string): Promise<WorkOrder> {
     const cur = await q<Record<string, unknown>>(`SELECT * FROM b2b.work_order WHERE id=$1`, [id]);

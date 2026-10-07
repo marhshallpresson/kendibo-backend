@@ -43,7 +43,8 @@ export class Watchup {
   private sampleRate: number;
 
   constructor(opts: WatchupOptions = {}) {
-    const apiKey = opts.apiKey ?? process.env.WATCHUP_API_KEY ?? '';
+    const testing = process.env.NODE_ENV === 'test' || process.env.VITEST === 'true';
+    const apiKey = testing ? '' : (opts.apiKey ?? process.env.WATCHUP_API_KEY ?? '');
     const baseUrl = opts.baseUrl ?? process.env.WATCHUP_BASE_URL ?? DEFAULT_BASE_URL;
     this.environment = opts.environment ?? process.env.WATCHUP_ENV ?? 'development';
     this.release = opts.release ?? process.env.WATCHUP_RELEASE ?? 'dev';

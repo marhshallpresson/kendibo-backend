@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import { newId } from '../../packages/shared/kernel.js';
 import { objectStore } from '../../packages/storage/object.store.js';
 import { q } from '../../packages/database/db.js';
+import { emit } from '../../packages/observability/emit.js';
 
 export interface MediaAsset { id: string; sha256: string; status: 'quarantined' | 'clean' | 'rejected'; url?: string; }
 
@@ -34,6 +35,7 @@ export const mediaService = {
     const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
     const url = await objectStore.signedUrl(assetId);
     await q(`UPDATE media.asset SET sha256=$2, status='clean', url=$3 WHERE id=$1`, [assetId, sha256, url]);
+    emit('media.ingested', { assetId, mime, sha256 });
     return { id: assetId, sha256, status: 'clean', url };
   },
   async get(assetId: string): Promise<MediaAsset | null> {

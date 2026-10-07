@@ -1,5 +1,7 @@
 // Payouts — Postgres-backed. Cooling via provider.bank_changed_at; maker-checker at route.
 import { q } from '../../packages/database/db.js';
+import { emit } from '../../packages/observability/emit.js';
+import { observability } from '../../packages/observability/watchup.adapter.js';
 
 export type PayoutStatus = 'pending' | 'eligible' | 'held' | 'in_run' | 'awaiting_approval' | 'sent' | 'success' | 'failed' | 'reversed';
 export interface Payout { id: string; providerId: string; amountKobo: string; status: PayoutStatus; reference: string; createdAt: string; approvedBy?: string }
@@ -26,6 +28,7 @@ export const payoutService = {
       `INSERT INTO payment.payout (provider_id, amount_kobo) VALUES ($1,$2) RETURNING *`, [providerId, String(amountKobo)],
     );
     const p = toPayout(rows[0]);
+    emit('payout.created', { payoutId: p.id, providerId, amountKobo: Number(amountKobo) });
     return { ...p, reference };
   },
   async approve(id: string, approver: string) {

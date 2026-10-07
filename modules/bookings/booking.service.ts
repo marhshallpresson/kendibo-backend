@@ -35,6 +35,7 @@ export const bookingService = {
       );
       const b = toBooking(rows[0]);
       await q(`INSERT INTO outbox_event (topic, payload) VALUES ('booking.created',$1)`, [JSON.stringify({ bookingId: b.id })]);
+      emit('booking.created', { bookingId: b.id, serviceId: b.serviceId });
       return b;
     } catch (e: unknown) {
       // concurrent double-insert -> second writer reads the winner

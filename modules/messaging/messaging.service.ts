@@ -1,5 +1,6 @@
 // Messaging — Postgres-backed conversations + messages. Phone numbers stay masked.
 import { q } from '../../packages/database/db.js';
+import { emit } from '../../packages/observability/emit.js';
 
 export interface Message { id: string; jobId: string; from: string; body: string; at: string; read: boolean }
 
@@ -21,7 +22,9 @@ export const messagingService = {
     const r = rows[0];
     await q(`INSERT INTO outbox_event (topic, payload) VALUES ('message.created',$1)`,
       [JSON.stringify({ jobId, messageId: String(r.id) })]);
-    return { id: String(r.id), jobId, from, body, at: String(r.created_at), read: false };
+    const msg = { id: String(r.id), jobId, from, body, at: String(r.created_at), read: false };
+    emit('message.sent', { messageId: msg.id, jobId, from });
+    return msg;
   },
   async list(jobId: string, cursor?: string) {
     const rows = await q<Record<string, unknown>>(

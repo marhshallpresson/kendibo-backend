@@ -1,6 +1,7 @@
 // Providers — Postgres-backed. Offers live in dispatch.assignment
 // (partial UNIQUE: one accepted per job). Offline sync dedupes in SQL.
 import { q } from '../../packages/database/db.js';
+import { emit } from '../../packages/observability/emit.js';
 
 export interface Provider { id: string; userId: string; kycStatus: string; skills: string[]; online: boolean; lat?: number; lng?: number }
 
@@ -78,6 +79,7 @@ export const providerService = {
       } catch {
         throw new Error('OFFER_TAKEN'); // partial unique: another provider won
       }
+      emit('provider.offer_accepted', { offerId, jobId: String(o.job_id), providerId: String(o.provider_id) });
       return { ...o, status: 'accepted' };
     }
     await q(`UPDATE dispatch.assignment SET status='declined' WHERE id=$1`, [offerId]);

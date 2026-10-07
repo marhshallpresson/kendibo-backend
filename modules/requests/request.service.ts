@@ -9,6 +9,7 @@ import { dispatchService } from '../dispatch/dispatch.service.js';
 import { bookingService } from '../bookings/booking.service.js';
 import { notificationService } from '../notifications/notification.service.js';
 import { deviceService } from '../devices/device.service.js';
+import { emit } from '../../packages/observability/emit.js';
 
 export type RequestStatus = 'SUBMITTED' | 'MATCHING' | 'OFFERED' | 'ACCEPTED' | 'BOOKED' | 'CANCELLED' | 'EXPIRED';
 export interface ServiceRequest {
@@ -117,6 +118,7 @@ export const requestService = {
       }
     }
     await q(`UPDATE booking.service_request SET status='OFFERED' WHERE id=$1 AND status IN ('SUBMITTED','MATCHING')`, [id]);
+    emit('request.broadcast', { requestId: id, offersSent: offers.length });
     return { requestId: id, offersSent: offers.length };
   },
 
@@ -148,6 +150,7 @@ export const requestService = {
       [String(o.request_id), offerId]);
     await q(`INSERT INTO outbox_event (topic, payload) VALUES ('request.accepted',$1)`,
       [JSON.stringify({ requestId: String(o.request_id), providerId: String(o.provider_id) })]);
+    emit('request.accepted', { requestId: String(o.request_id), providerId: String(o.provider_id) });
     return { id: offerId, status: 'accepted', requestId: String(o.request_id) };
   },
 

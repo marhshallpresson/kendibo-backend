@@ -1,5 +1,6 @@
 // Warranty claims (§32-33), support tickets, provider earnings — all Postgres-backed.
 import { q } from '../../packages/database/db.js';
+import { emit } from '../../packages/observability/emit.js';
 
 export type WarrantyStatus = 'active' | 'claimed' | 'expired';
 export type ClaimStatus = 'submitted' | 'under_review' | 'approved_rework' | 'approved_refund' | 'rejected' | 'resolved';
@@ -27,17 +28,23 @@ export const warrantyService = {
       `INSERT INTO payment.warranty_claim (warranty_id, reason, description, evidence) VALUES ($1,$2,$3,$4) RETURNING *`,
       [id, reason, description, JSON.stringify(evidence)],
     );
-    return toClaim(rows[0]);
+    const c = toClaim(rows[0]);
+    emit('claim.updated', { claimId: c.id, warrantyId: c.warrantyId, status: c.status });
+    return c;
   },
   async review(id: string) {
     const rows = await q<Record<string, unknown>>(`UPDATE payment.warranty_claim SET status='under_review' WHERE id=$1 AND status='submitted' RETURNING *`, [id]);
     if (!rows[0]) throw new Error('CLAIM_GONE');
-    return toClaim(rows[0]);
+    const c = toClaim(rows[0]);
+    emit('claim.updated', { claimId: c.id, warrantyId: c.warrantyId, status: c.status });
+    return c;
   },
   async resolve(id: string, outcome: Exclude<ClaimStatus, 'submitted' | 'under_review'>, resolution?: string) {
     const rows = await q<Record<string, unknown>>(`UPDATE payment.warranty_claim SET status=$2, resolution=$3 WHERE id=$1 AND status='under_review' RETURNING *`, [id, outcome, resolution ?? null]);
     if (!rows[0]) throw new Error('CLAIM_GONE');
-    return toClaim(rows[0]);
+    const c = toClaim(rows[0]);
+    emit('claim.updated', { claimId: c.id, warrantyId: c.warrantyId, status: c.status });
+    return c;
   },
   async getWarranty(id: string) {
     const rows = await q<Record<string, unknown>>(`SELECT * FROM payment.warranty WHERE id=$1`, [id]);

@@ -1,5 +1,6 @@
 // Disputes (bilateral, PRD §34) + Reviews (PRD §44) — Postgres-backed.
 import { q } from '../../packages/database/db.js';
+import { emit } from '../../packages/observability/emit.js';
 
 export const CUSTOMER_REASONS = ['incomplete', 'poor_quality', 'property_damage', 'misconduct', 'wrong_quote', 'unauthorised_charge', 'missed_appointment', 'billing'] as const;
 export const PROVIDER_REASONS = ['false_claim', 'customer_damage', 'unsafe_property', 'non_payment', 'wrong_scope', 'unfair_rating'] as const;
@@ -25,7 +26,9 @@ export const disputeService = {
       `INSERT INTO payment.dispute (job_id, opened_by, reason, description) VALUES ($1,$2,$3,$4) RETURNING *`,
       [bookingId, raisedBy, reason, description ?? null],
     );
-    return toDispute(rows[0]);
+    const d = toDispute(rows[0]);
+    emit('dispute.filed', { disputeId: d.id, bookingId });
+    return d;
   },
   async attach(id: string, section: string, data: unknown) {
     const cur = await q<Record<string, unknown>>(`SELECT * FROM payment.dispute WHERE id=$1`, [id]);
