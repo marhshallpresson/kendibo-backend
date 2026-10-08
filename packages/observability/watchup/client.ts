@@ -107,6 +107,25 @@ export class Watchup {
     } catch { /* fail open */ }
   }
 
+  /** Structured log capture (WatchUp log monitoring). Errors always ship;
+   *  warn/info are sampled. Never throws. */
+  captureLog(level: 'debug' | 'info' | 'warning' | 'error' | 'fatal', message: string, ctx?: Record<string, unknown>): void {
+    try {
+      if (!this.transport) return;
+      if (level !== 'error' && level !== 'fatal' && Math.random() > this.sampleRate) return;
+      this.push({
+        kind: 'event',
+        name: `log.${level}`,
+        occurred_at: new Date().toISOString(),
+        properties: {
+          ...((sanitize(ctx) as Record<string, unknown>) ?? {}),
+          message: truncateUtf8(message, 8192),
+          environment: this.environment, release: this.release, service: this.service,
+        },
+      });
+    } catch { /* fail open */ }
+  }
+
   /** Custom business event (booking.created, payment.failed, ...). */
   track(name: string, properties?: Record<string, unknown>): void {
     try {

@@ -87,11 +87,28 @@ export interface EventItem {
 export type Item = ErrorItem | TraceItem | EventItem;
 
 export function envelope(service: string, items: Item[]): object {
+  const events: object[] = [];
+  const errors: object[] = [];
+  const traces: object[] = [];
+
+  for (const item of items) {
+    const sanitized = { ...sanitize(item) as object, kind: item.kind };
+    if (item.kind === 'event') {
+      events.push(sanitized);
+    } else if (item.kind === 'error') {
+      errors.push(sanitized);
+    } else if (item.kind === 'trace') {
+      traces.push(sanitized);
+    }
+  }
+
   return {
     contract_version: CONTRACT_VERSION,
     sdk: { name: SDK_NAME, version: SDK_VERSION },
     service,
-    items: items.map((i) => ({ ...sanitize(i) as object, kind: i.kind })),
+    events,
+    errors,
+    traces,
   };
 }
 

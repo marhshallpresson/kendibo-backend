@@ -37,6 +37,9 @@ export async function watchupTracing(app: FastifyInstance): Promise<void> {
   app.setErrorHandler(async (err, req, reply) => {
     try {
       watchup.captureException(err, { route: req.url.split('?')[0], request_id: req.id });
+      watchup.captureLog('error', `5xx ${req.method} ${req.url.split('?')[0]}: ${String((err as Error).message).slice(0, 200)}`, {
+        route: req.url.split('?')[0], request_id: req.id,
+      });
     } catch { /* fail open */ }
     const status = (err as { statusCode?: number }).statusCode ?? 500;
     const code = status === 500 ? 'INTERNAL' : 'BAD_REQUEST';
