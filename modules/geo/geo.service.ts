@@ -4,19 +4,94 @@ import { q } from '../../packages/database/db.js';
 import { config as appConfig } from '../../packages/config/env.js';
 
 export const geoService = {
+  /** Cities allowed by GEOLOCK_CITY (empty lock = all). */
+  private allowed(): string[] {
+    return appConfig.GEOLOCK_CITY
+      ? appConfig.GEOLOCK_CITY.split(',').map((c) => c.trim().toLowerCase())
+      : [];
+  },
+
+  /**
+   * City-wide serviceability: named zones first (hotspots), then the whole
+   * city circle (geo.city.lat/lng + radius_km) so Uyo & Eket are covered
+   * everywhere inside the city, not only around the seed zones.
+   */
   async checkZone(lat: number, lng: number) {
-    const zones = await q<any>(`SELECT z.name as zone, c.id as city_id, c.name as city, z.radius_km as radiusKm, z.lat, z.lng FROM geo.zone z JOIN geo.city c ON z.city_id = c.id`);
+    const allowed = this.allowed();
+    const inLock = (id: string, name: string) =>
+      allowed.length === 0 ||
+      allowed.includes(id.toLowerCase()) ||
+      allowed.includes(name.toLowerCase());
+
+    const zones = await q<any>(
+      `SELECT z.name as zone, c.id as city_id, c.name as city, z.radius_km AS "radiusKm", z.lat, z.lng
+         FROM geo.zone z JOIN geo.city c ON z.city_id = c.id`,
+    );
     for (const z of zones) {
-      // If GEOLOCK_CITY is defined, split by comma and check if the zone's city or city_id is included
-      if (appConfig.GEOLOCK_CITY) {
-        const allowedCities = appConfig.GEOLOCK_CITY.split(',').map(c => c.trim().toLowerCase());
-        if (!allowedCities.includes(z.city_id.toLowerCase()) && !allowedCities.includes(z.city.toLowerCase())) continue;
-      }
-      
+      if (!inLock(String(z.city_id), String(z.city))) continue;
       const d = Math.hypot(lat - z.lat, lng - z.lng) * 111; // approx km
-      if (d <= Number(z.radiuskm)) return { serviceable: true, city: String(z.city), cityId: String(z.city_id), zone: String(z.zone), lat: Number(z.lat), lng: Number(z.lng), radiusKm: Number(z.radiuskm) };
+      if (d <= Number(z.radiusKm)) {
+        return {
+          serviceable: true, scope: 'zone' as const,
+          city: String(z.city), cityId: String(z.city_id), zone: String(z.zone),
+          lat: Number(z.lat), lng: Number(z.lng), radiusKm: Number(z.radiusKm),
+        };
+      }
+    }
+
+    const cities = await q<any>(
+      `SELECT id, name, lat, lng, radius_km FROM geo.city WHERE lat IS NOT NULL AND lng IS NOT NULL`,
+    );
+    for (const c of cities) {
+      if (!inLock(String(c.id), String(c.name))) continue;
+      const d = Math.hypot(lat - c.lat, lng - c.lng) * 111;
+      if (d <= Number(c.radius_km)) {
+        return {
+          serviceable: true, scope: 'city' as const,
+          city: String(c.name), cityId: String(c.id), zone: String(c.name),
+          lat: Number(c.lat), lng: Number(c.lng), radiusKm: Number(c.radius_km),
+        };
+      }
     }
     return { serviceable: false as const };
+  },
+
+  /**
+   * Supported coverage for the client: every city + zone the lock allows,
+   * with the exact latitude/longitude a user can check themselves against.
+   */
+  async coverage() {
+    const allowed = this.allowed();
+    const inLock = (id: string, name: string) =>
+      allowed.length === 0 ||
+      allowed.includes(id.toLowerCase()) ||
+      allowed.includes(name.toLowerCase());
+
+    const cities = await q<any>(
+      `SELECT id, name, lat, lng, radius_km FROM geo.city WHERE lat IS NOT NULL AND lng IS NOT NULL ORDER BY name`,
+    );
+    const zones = await q<any>(
+      `SELECT z.name as zone, c.id as city_id, c.name as city, z.lat, z.lng, z.radius_km
+         FROM geo.zone z JOIN geo.city c ON z.city_id = c.id ORDER BY c.name, z.name`,
+    );
+
+    return cities
+      .filter((c) => inLock(String(c.id), String(c.name)))
+      .map((c) => ({
+        cityId: String(c.id),
+        city: String(c.name),
+        lat: Number(c.lat),
+        lng: Number(c.lng),
+        radiusKm: Number(c.radius_km),
+        zones: zones
+          .filter((z) => String(z.city_id) === String(c.id))
+          .map((z) => ({
+            zone: String(z.zone),
+            lat: Number(z.lat),
+            lng: Number(z.lng),
+            radiusKm: Number(z.radius_km),
+          })),
+      }));
   },
   async openJourney(jobId: string) {
     const rows = await q(`SELECT 1 FROM geo.journey_status WHERE job_id=$1`, [jobId]);

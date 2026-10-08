@@ -296,6 +296,9 @@ app.get('/v1/geo/zones/check', async (req) => {
   const q = req.query as { lat: string; lng: string };
   return { data: await geoService.checkZone(Number(q.lat), Number(q.lng)) };
 });
+// Supported coverage (city-wide Uyo & Eket): lets the client show the exact
+// latitude/longitude we serve instead of a bare "not available" dead end.
+app.get('/v1/geo/coverage', async () => ({ data: await geoService.coverage() }));
 app.post('/v1/properties', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   const { name, addressId } = z.object({ name: z.string(), addressId: z.string() }).parse(req.body);
