@@ -2,12 +2,13 @@
 import { createHash } from 'node:crypto';
 import { issueOtp, verifyOtp, signAccess, signRefresh, rotateRefresh, revokeAll } from '../../packages/auth/auth.js';
 import { q } from '../../packages/database/db.js';
+import { providerService } from '../providers/provider.service.js';
 import { sms, email } from '../notifications/channels.js';
 import { templates } from '../notifications/mail.templates.js';
 
 export interface User {
   id: string; phone?: string; email?: string; pinHash?: string; biometric: boolean;
-  name?: string; nickname?: string; dob?: string; avatarUrl?: string; createdAt: string;
+  name?: string; nickname?: string; dob?: string; avatarUrl?: string; role?: string; createdAt: string;
 }
 const hashPin = (pin: string) => createHash('sha256').update(`kendibo-pin:${pin}`).digest('hex');
 const row = (r: Record<string, unknown>): User => ({
@@ -15,7 +16,8 @@ const row = (r: Record<string, unknown>): User => ({
   pinHash: (r.pin_hash as string) ?? undefined, biometric: Boolean(r.biometric),
   name: (r.name as string) ?? undefined, nickname: (r.nickname as string) ?? undefined,
   dob: r.dob ? String(r.dob).slice(0, 10) : undefined,
-  avatarUrl: (r.profile_image as string) ?? undefined, createdAt: String(r.created_at),
+  avatarUrl: (r.profile_image as string) ?? undefined,
+  role: String(r.role ?? 'customer').toLowerCase(), createdAt: String(r.created_at),
 });
 
 export const identityService = {
@@ -51,18 +53,37 @@ export const identityService = {
     }
     return { devCode: r.devCode };
   },
-  async verifyOtp(channel: 'phone' | 'email', identity: string, code: string, device?: { fp?: string; platform?: string; model?: string; os?: string; appVersion?: string; ip?: string; city?: string }) {
+  async verifyOtp(channel: 'phone' | 'email', identity: string, code: string, device?: { fp?: string; platform?: string; model?: string; os?: string; appVersion?: string; ip?: string; city?: string; name?: string; role?: string }) {
     const norm = this.normalizeIdentity(identity);
     if (norm.channel !== channel) return null;
     if (!(await verifyOtp(channel, norm.value, code))) return null;
+    const normalizedRole = device?.role?.toLowerCase() === 'provider' ? 'PROVIDER' : 'CUSTOMER';
+    const name = device?.name;
     const col = channel === 'phone' ? 'phone' : 'email';
-    let rows = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE ${col}=$1`, [norm.value]);
+    const rows = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE ${col}=$1`, [norm.value]);
     let user = rows[0];
     if (!user) {
       const ins = await q<Record<string, unknown>>(
-        `INSERT INTO identity.users (${col}) VALUES ($1) RETURNING *`, [norm.value],
+        `INSERT INTO identity.users (${col}, role, name) VALUES ($1,$2,$3) RETURNING *`, [norm.value, normalizedRole, name ?? null],
       );
       user = ins[0];
+    } else {
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      if (normalizedRole === 'PROVIDER' && String(user.role ?? 'CUSTOMER').toUpperCase() !== 'PROVIDER') {
+        sets.push(`role=$${vals.length + 1}`); vals.push('PROVIDER');
+      }
+      if (!user.name && name) { sets.push(`name=$${vals.length + 1}`); vals.push(name); }
+      if (sets.length > 0) {
+        const upd = await q<Record<string, unknown>>(
+          `UPDATE identity.users SET ${sets.join(', ')}, updated_at=now() WHERE id=$${vals.length + 1} RETURNING *`,
+          [...vals, user.id],
+        );
+        user = upd[0];
+      }
+    }
+    if (String(user.role ?? '').toUpperCase() === 'PROVIDER') {
+      await providerService.onboard(String(user.id));
     }
     const deviceId = `dev_${Date.now().toString(36)}`;
     const access = signAccess(String(user.id), ['booking:create', 'booking:view:self']);

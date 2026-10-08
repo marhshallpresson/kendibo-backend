@@ -200,15 +200,16 @@ app.post('/v1/auth/otp/request', async (req, reply) => {
   }
 });
 app.post('/v1/auth/otp/verify', async (req) => {
-  const { channel, identity, code, device } = z.object({
+  const { channel, identity, code, device, name, role } = z.object({
     channel: z.enum(['phone', 'email']), identity: z.string(), code: z.string(),
+    name: z.string().optional(), role: z.string().optional(),
     device: z.object({
       fp: z.string().optional(), platform: z.string().optional(), model: z.string().optional(),
       os: z.string().optional(), appVersion: z.string().optional(), city: z.string().optional(),
     }).optional(),
   }).parse(req.body);
   const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip;
-  const s = await identityService.verifyOtp(channel, identity, code, { ...device, ip });
+  const s = await identityService.verifyOtp(channel, identity, code, { ...device, ip, name, role });
   if (!s) return { error: { code: 'BAD_OTP', message: 'Invalid or expired code', retryable: false } };
   observability.track('auth.verified', { channel });
   return { data: s };

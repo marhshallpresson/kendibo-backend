@@ -2,10 +2,10 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { randomUUID } from 'node:crypto';
 import { identityService } from '../modules/identity/identity.service.js';
-import { signAccess } from '../packages/auth/auth.js';
+import { issueOtp, signAccess } from '../packages/auth/auth.js';
 import { q } from '../packages/database/db.js';
 
-let app: { inject: (opts: unknown) => Promise<{ statusCode: number; json: () => { data: { exists: boolean } } }>; close?: () => Promise<void> };
+let app: { inject: (opts: unknown) => Promise<{ statusCode: number; json: () => { data: any } }>; close?: () => Promise<void> };
 before(async () => {
   // Isolate BEFORE main.js import (main loads dotenv + touches DB at import):
   // force test so main never listens on :3000, neutralize URLs to '' so
@@ -66,5 +66,22 @@ describe('unified login (account check + device history)', () => {
   it('POST /v1/auth/google rejects junk tokens without network truth', async () => {
     const r = await app.inject({ method: 'POST', url: '/v1/auth/google', payload: { idToken: 'junk' } });
     assert.ok([401, 502].includes(r.statusCode));
+  });
+
+  it('OTP verify with role=provider persists role and creates provider row', async () => {
+    const email = `prov-${randomUUID()}@kendibo.local`;
+    const { code } = await issueOtp('email', email);
+    const ver = await app.inject({
+      method: 'POST', url: '/v1/auth/otp/verify',
+      payload: { channel: 'email', identity: email, code, name: 'Provider One', role: 'provider' },
+    });
+    assert.equal(ver.statusCode, 200);
+    const session = ver.json().data;
+    assert.equal(session.user.role, 'provider');
+    assert.equal(session.user.name, 'Provider One');
+    const me = await identityService.me(session.user.id);
+    assert.equal(me?.role, 'provider');
+    const prov = await q(`SELECT id FROM provider.provider WHERE user_id=$1`, [session.user.id]);
+    assert.equal(prov.length, 1);
   });
 });
