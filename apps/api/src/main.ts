@@ -176,6 +176,7 @@ app.get('/v1/admin/monitoring', async (req, reply) => {
   };
 });
 app.get('/v1/config', async () => ({ priceBook: await configurationService.priceBook(), flags: await configurationService.flags() }));
+app.get('/v1/config/flags', async () => ({ data: await configurationService.flags() }));
 
 // ---------- auth (OTP + refresh + PIN/biometrics stubs) ----------
 app.post('/v1/auth/otp/request', async (req, reply) => {
@@ -292,6 +293,26 @@ app.post('/v1/addresses', async (req, reply) => {
   try { return { data: await propertyService.createAddress(a.sub, req.body) }; }
   catch { return fail(reply, 'BAD_ADDRESS', 'Invalid Nigerian address payload'); }
 });
+app.patch('/v1/addresses/:id', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  try {
+    const updated = await propertyService.updateAddress(a.sub, (req.params as { id: string }).id, req.body);
+    if (!updated) return fail(reply, 'NOT_FOUND', 'Address not found', 404);
+    return { data: updated };
+  } catch { return fail(reply, 'BAD_ADDRESS', 'Invalid Nigerian address payload'); }
+});
+app.delete('/v1/addresses/:id', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const removed = await propertyService.deleteAddress(a.sub, (req.params as { id: string }).id);
+  if (!removed) return fail(reply, 'NOT_FOUND', 'Address not found', 404);
+  return { data: { deleted: true } };
+});
+app.post('/v1/addresses/:id/default', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const addr = await propertyService.setDefault(a.sub, (req.params as { id: string }).id);
+  if (!addr) return fail(reply, 'NOT_FOUND', 'Address not found', 404);
+  return { data: addr };
+});
 app.get('/v1/geo/zones/check', async (req) => {
   const q = req.query as { lat: string; lng: string };
   return { data: await geoService.checkZone(Number(q.lat), Number(q.lng)) };
@@ -395,20 +416,31 @@ void app.register(fastifyRawBody, { global: false });
 
 for (const psp of ['bachs', 'flutterwave'] as const) {
   app.post(`/webhooks/payments/${psp}`, { config: { rawBody: true } }, async (req, reply) => {
-    const raw = Buffer.from((req as unknown as { rawBody?: string }).rawBody || JSON.stringify(req.body ?? {}));
-    const result = await payments.handleWebhook(psp, raw, req.headers as Record<string, string>);
-    if (!result.ok) return fail(reply, 'BAD_SIGNATURE', 'Invalid webhook signature', 401);
-    if (result.verified?.status === 'successful') {
-      if (result.verified.reference.startsWith('wt_')) {
-        const userId = result.verified.reference.split('_')[1];
-        try { await walletService.credit(userId, Number(result.verified.amountKobo), result.verified.reference, 'topup'); } catch (e) { observability.captureException(e); }
-        observability.track('wallet.topup_succeeded', { psp, reference: result.verified.reference });
-      } else {
-        try { await postCollection(result.verified.reference, result.verified.amountKobo, '2026-10'); } catch (e) { observability.captureException(e); }
-        observability.track('booking.payment_succeeded', { psp, reference: result.verified.reference });
+    try {
+      const raw = Buffer.from((req as unknown as { rawBody?: string }).rawBody || JSON.stringify(req.body ?? {}));
+      const result = await payments.handleWebhook(psp, raw, req.headers as Record<string, string>);
+      if (!result.ok) return fail(reply, 'BAD_SIGNATURE', 'Invalid webhook signature', 401);
+      if (result.notFound) return fail(reply, 'UNKNOWN_CHARGE', 'Charge not found', 404);
+      if (result.amountMismatch) {
+        observability.captureMessage?.(`webhook.amount_mismatch psp=${psp}`);
+        return fail(reply, 'AMOUNT_MISMATCH', 'Amount does not match recorded payment', 409);
       }
+      if (result.verified?.status === 'successful') {
+        if (result.verified.reference.startsWith('wt_')) {
+          const userId = result.verified.reference.split('_')[1];
+          try { await walletService.credit(userId, Number(result.verified.amountKobo), result.verified.reference, 'topup'); } catch (e) { observability.captureException(e); }
+          observability.track('wallet.topup_succeeded', { psp, reference: result.verified.reference });
+        } else {
+          try { await postCollection(result.verified.reference, result.verified.amountKobo, '2026-10'); } catch (e) { observability.captureException(e); }
+          observability.track('booking.payment_succeeded', { psp, reference: result.verified.reference });
+        }
+      }
+      return { ok: true };
+    } catch (e) {
+      observability.captureException(e);
+      app.log.error({ err: e, psp }, 'webhook processing failed');
+      return fail(reply, 'WEBHOOK_ERROR', 'Webhook processing failed', 500);
     }
-    return { ok: true };
   });
 }
 app.post('/v1/refunds', async (req) => {

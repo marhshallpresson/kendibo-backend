@@ -78,34 +78,54 @@ export class PaymentService {
   }
 
   /** Webhook handler core: persist raw event, verify signature, then server-side verify before ledger. */
-  async handleWebhook(psp: PSP, rawBody: Buffer, headers: Record<string, string | undefined>): Promise<{ ok: boolean; verified?: VerifiedPayment }> {
+  async handleWebhook(psp: PSP, rawBody: Buffer, headers: Record<string, string | undefined>): Promise<{ ok: boolean; verified?: VerifiedPayment; notFound?: boolean; amountMismatch?: boolean }> {
     const adapter = this.adapters[psp];
     const raw = rawBody.toString('utf-8');
     if (!adapter.verifyWebhookSignature(rawBody, headers)) return { ok: false };
-    
+
     const event = JSON.parse(raw) as any;
     const eventId = event.id ?? event.event_id ?? `${psp}:${Date.now()}`;
     
+    // Dedupe on the raw event BEFORE any PSP verify call — replays short-circuit here.
     try {
       await q(`INSERT INTO payment.webhook_event (psp, event_id, raw) VALUES ($1,$2,$3)`, [psp, eventId, raw]);
-    } catch (e) {
-      // UNIQUE constraint violation means we already processed this webhook event
-      return { ok: true, verified: undefined }; 
+    } catch {
+      // UNIQUE violation = already processed this webhook event (idempotent replay).
+      return { ok: true, verified: undefined };
     }
     
     const reference =
       event.data?.tx_ref ?? event.data?.reference ?? event.data?.checkout_id ?? event.txRef;
-    const chargeId = event.data?.id ?? event.data?.charge_id;
-    const verified = chargeId
-      ? await adapter.verifyByChargeId(String(chargeId))
-      : await adapter.verifyByReference(String(reference));
-    
-    // Mark payment successful in local db
-    if (verified && verified.status === 'successful') {
-       await q(`UPDATE payment.payment SET status='successful', charge_id=$1 WHERE reference=$2`, [verified.chargeId || chargeId, verified.reference]);
+    const chargeId = event.data?.charge_id ?? event.data?.payment_id ?? event.data?.id;
+
+    let verified: VerifiedPayment;
+    try {
+      verified = chargeId
+        ? await adapter.verifyByChargeId(String(chargeId))
+        : await adapter.verifyByReference(String(reference));
+    } catch (e) {
+      // Unknown charge at the PSP (deleted/never existed) — 404 semantics, not a crash.
+      if ((e as Error).message?.includes('404')) return { ok: true, notFound: true };
+      throw e;
     }
 
-    // Only `successful` + amount/currency match may credit the ledger (caller checks expected amount).
+    if (verified.status === 'successful') {
+      // Amount cross-check: the PSP-verified amount must match what we recorded.
+      // A mismatch means tampering or a stale reference — never mark paid.
+      const rows = await q<{ amount_kobo: string | number; status: string }>(
+        `SELECT amount_kobo, status FROM payment.payment WHERE reference=$1`, [verified.reference],
+      );
+      const local = rows[0];
+      if (local && local.status !== 'successful' && BigInt(String(local.amount_kobo)) !== verified.amountKobo) {
+        return { ok: true, amountMismatch: true };
+      }
+      await q(
+        `UPDATE payment.payment SET status='successful', charge_id=$1 WHERE reference=$2 AND status<>'successful'`,
+        [verified.chargeId || String(chargeId ?? ''), verified.reference],
+      );
+    }
+
+    // Only `successful` + amount match may credit the ledger (caller checks expected amount).
     return { ok: true, verified };
   }
 }

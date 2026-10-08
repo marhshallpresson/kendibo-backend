@@ -3,17 +3,23 @@ import { q } from '../../packages/database/db.js';
 
 export interface Service { id: string; category: string; name: string; bookingMode: 'fixed' | 'quote'; baseKobo: bigint; warrantyDays: number; durationMinutes: number; requiresSkill?: string; }
 export interface AddOn { id: string; serviceId: string; name: string; priceKobo: bigint; }
+export interface Category { id: string; name: string; description: string; iconName: string; sortOrder: number; isActive: boolean }
 
 export const catalogService = {
-  async categories(): Promise<string[]> {
-    const rows = await q<{ name: string }>(`SELECT name FROM catalog.category WHERE active ORDER BY sort_order`);
-    return rows.map((r) => r.name);
+  async categories(): Promise<Category[]> {
+    const rows = await q<Record<string, unknown>>(
+      `SELECT id, name, description, icon_name, sort_order, active FROM catalog.category WHERE active ORDER BY sort_order`,
+    );
+    return rows.map((r) => ({
+      id: String(r.id), name: String(r.name), description: String(r.description ?? ''),
+      iconName: String(r.icon_name ?? 'Sparkles'), sortOrder: Number(r.sort_order ?? 0), isActive: Boolean(r.active),
+    }));
   },
   async list(category?: string): Promise<Service[]> {
     const rows = await q<Record<string, unknown>>(
       `SELECT s.id, c.name AS category, s.name, s.booking_type, s.base_price_kobo, s.warranty_days, s.duration_minutes, s.requires_skill
        FROM catalog.service s JOIN catalog.category c ON c.id = s.category_id
-       WHERE s.active AND ($1::text IS NULL OR c.name = $1)`, [category ?? null],
+       WHERE s.active AND ($1::text IS NULL OR c.id = $1 OR c.name = $1)`, [category ?? null],
     );
     return rows.map(toService);
   },
