@@ -374,9 +374,12 @@ app.post('/v1/bookings/:id/payments', async (req, reply) => {
     return { data: session };
   } catch (e: unknown) { observability.captureException(e); return fail(reply, 'PSP_UNAVAILABLE', 'Provider unavailable', 502, true); }
 });
+import fastifyRawBody from 'fastify-raw-body';
+void app.register(fastifyRawBody, { global: false });
+
 for (const psp of ['bachs', 'flutterwave'] as const) {
-  app.post(`/webhooks/payments/${psp}`, async (req, reply) => {
-    const raw = Buffer.from(JSON.stringify(req.body ?? {}));
+  app.post(`/webhooks/payments/${psp}`, { config: { rawBody: true } }, async (req, reply) => {
+    const raw = Buffer.from((req as unknown as { rawBody?: string }).rawBody || JSON.stringify(req.body ?? {}));
     const result = await payments.handleWebhook(psp, raw, req.headers as Record<string, string>);
     if (!result.ok) return fail(reply, 'BAD_SIGNATURE', 'Invalid webhook signature', 401);
     if (result.verified?.status === 'successful') {
