@@ -65,6 +65,19 @@ const app = Fastify({
   genReqId: () => `req_${Date.now().toString(36)}${Math.floor(Math.random() * 1e6)}`,
   trustProxy: PROD, // Pxxl edge terminates TLS ahead of the container
 });
+import helmet from '@fastify/helmet';
+import rateLimit from '@fastify/rate-limit';
+
+void app.register(helmet, {
+  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true }, // Strict encrypted rails
+  contentSecurityPolicy: PROD,
+});
+void app.register(rateLimit, {
+  max: 100,
+  timeWindow: '1 minute',
+  errorResponseBuilder: () => ({ error: { code: 'RATE_LIMIT', message: 'Too many requests' } }),
+});
+
 // Prod CORS: explicit allowlist only (Pxxl dashboard CORS_ORIGINS + deployed app).
 // Dev: permissive + Expo running URLs (Metro bundler on localhost/LAN, legacy
 // devtools ports). Native apps (Expo Go, EAS builds) send no Origin header
