@@ -38,11 +38,19 @@ export async function credit(userId: string, amountKobo: number, ref: string, ki
   if (!ref) throw new Error('REF_REQUIRED');
   const existing = await q<Record<string, unknown>>(`SELECT * FROM payment.wallet_txn WHERE ref=$1`, [ref]);
   if (existing[0]) return toTxn(existing[0]); // replay-safe
-  const rows = await q<Record<string, unknown>>(
-    `INSERT INTO payment.wallet_txn (user_id, kind, amount_kobo, ref, booking_id) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-    [userId, kind, amountKobo, ref, bookingId ?? null],
-  );
-  return toTxn(rows[0]);
+  try {
+    const rows = await q<Record<string, unknown>>(
+      `INSERT INTO payment.wallet_txn (user_id, kind, amount_kobo, ref, booking_id) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [userId, kind, amountKobo, ref, bookingId ?? null],
+    );
+    return toTxn(rows[0]);
+  } catch (err: any) {
+    if (err.code === '23505') { // Postgres UNIQUE constraint violation
+      const existing = await q<Record<string, unknown>>(`SELECT * FROM payment.wallet_txn WHERE ref=$1`, [ref]);
+      return toTxn(existing[0]);
+    }
+    throw err;
+  }
 }
 
 export async function debit(userId: string, amountKobo: number, ref: string, kind: WalletTxnKind = 'payment', bookingId?: string): Promise<WalletTxn> {
@@ -52,11 +60,19 @@ export async function debit(userId: string, amountKobo: number, ref: string, kin
   if (existing[0]) return toTxn(existing[0]); // replay-safe
   const balance = await getBalance(userId);
   if (balance < amountKobo) throw new Error('INSUFFICIENT_FUNDS');
-  const rows = await q<Record<string, unknown>>(
-    `INSERT INTO payment.wallet_txn (user_id, kind, amount_kobo, ref, booking_id) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-    [userId, kind, amountKobo, ref, bookingId ?? null],
-  );
-  return toTxn(rows[0]);
+  try {
+    const rows = await q<Record<string, unknown>>(
+      `INSERT INTO payment.wallet_txn (user_id, kind, amount_kobo, ref, booking_id) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [userId, kind, amountKobo, ref, bookingId ?? null],
+    );
+    return toTxn(rows[0]);
+  } catch (err: any) {
+    if (err.code === '23505') {
+      const existing = await q<Record<string, unknown>>(`SELECT * FROM payment.wallet_txn WHERE ref=$1`, [ref]);
+      return toTxn(existing[0]);
+    }
+    throw err;
+  }
 }
 
 /** Test isolation hook (scoped delete, not truncate-all). */
