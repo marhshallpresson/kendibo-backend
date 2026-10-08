@@ -12,7 +12,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync } from '
 import { join } from 'node:path';
 import { S3Client, PutObjectCommand, GetObjectCommand, CopyObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { ftpStore } from './ftp.store.js';
+import { ftpStore, storageKey } from './ftp.store.js';
 
 export type MediaFolder = 'avatars' | 'photos' | 'videos' | 'docs';
 export type MediaKind = 'avatar' | 'photo' | 'video' | 'doc';
@@ -63,23 +63,23 @@ export const objectStore = {
     void ttlSec;
     return { assetId, uploadUrl: `store://${folder}/quarantine/${assetId}`, maxBytes: MAX_BYTES };
   },
-  async putQuarantine(folder: MediaFolder, assetId: string, bytes: Buffer): Promise<void> {
+  async putQuarantine(folder: MediaFolder, assetId: string, bytes: Buffer, mime = 'image/jpeg'): Promise<void> {
     if (bytes.length > MAX_BYTES) throw new Error('FILE_TOO_LARGE');
     if (DRIVER === 's3') paused();
-    if (DRIVER === 'ftp') { await ftpStore.putQuarantine(folder, assetId, bytes); return; }
-    writeFileSync(join(localDir(folder, 'quarantine'), assetId), bytes);
+    if (DRIVER === 'ftp') { await ftpStore.putQuarantine(folder, assetId, bytes, mime); return; }
+    writeFileSync(join(localDir(folder, 'quarantine'), storageKey(assetId, mime)), bytes);
   },
-  async promote(folder: MediaFolder, assetId: string): Promise<void> {
+  async promote(folder: MediaFolder, assetId: string, mime = 'image/jpeg'): Promise<void> {
     if (DRIVER === 's3') paused();
-    if (DRIVER === 'ftp') { await ftpStore.promote(folder, assetId); return; }
-    const src = join(localDir(folder, 'quarantine'), assetId);
+    if (DRIVER === 'ftp') { await ftpStore.promote(folder, assetId, mime); return; }
+    const src = join(localDir(folder, 'quarantine'), storageKey(assetId, mime));
     if (!existsSync(src)) throw new Error('NOT_UPLOADED');
-    renameSync(src, join(localDir(folder, 'clean'), assetId));
+    renameSync(src, join(localDir(folder, 'clean'), storageKey(assetId, mime)));
   },
-  async readClean(folder: MediaFolder, assetId: string): Promise<Buffer> {
+  async readClean(folder: MediaFolder, assetId: string, mime = 'image/jpeg'): Promise<Buffer> {
     if (DRIVER === 's3') paused();
-    if (DRIVER === 'ftp') return ftpStore.readClean(folder, assetId);
-    const p = join(localDir(folder, 'clean'), assetId);
+    if (DRIVER === 'ftp') return ftpStore.readClean(folder, assetId, mime);
+    const p = join(localDir(folder, 'clean'), storageKey(assetId, mime));
     if (!existsSync(p)) throw new Error('NOT_FOUND');
     return readFileSync(p);
   },

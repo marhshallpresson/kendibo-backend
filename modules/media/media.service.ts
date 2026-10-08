@@ -7,7 +7,7 @@ import { objectStore, folderForKind, type MediaFolder, type MediaKind } from '..
 import { q } from '../../packages/database/db.js';
 import { emit } from '../../packages/observability/emit.js';
 
-export interface MediaAsset { id: string; sha256: string; status: 'quarantined' | 'clean' | 'rejected'; url?: string; folder?: string }
+export interface MediaAsset { id: string; sha256: string; status: 'quarantined' | 'clean' | 'rejected'; url?: string; folder?: string; mime?: string }
 
 const ALLOWED_MIME = ['image/jpeg', 'image/png', 'video/mp4', 'application/pdf'];
 
@@ -32,11 +32,11 @@ export const mediaService = {
       await q(`UPDATE media.asset SET status='rejected' WHERE id=$1`, [assetId]);
       return { id: assetId, sha256: '', status: 'rejected', folder };
     }
-    await objectStore.putQuarantine(folder, assetId, bytes);
-    await objectStore.promote(folder, assetId);
+    await objectStore.putQuarantine(folder, assetId, bytes, mime);
+    await objectStore.promote(folder, assetId, mime);
     const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
     const url = await objectStore.signedUrl(assetId);
-    await q(`UPDATE media.asset SET sha256=$2, status='clean', url=$3 WHERE id=$1`, [assetId, sha256, url]);
+    await q(`UPDATE media.asset SET sha256=$2, status='clean', url=$3, mime=$4 WHERE id=$1`, [assetId, sha256, url, mime]);
     emit('media.ingested', { assetId, mime, sha256, folder });
     return { id: assetId, sha256, status: 'clean', url, folder };
   },
@@ -47,12 +47,15 @@ export const mediaService = {
     return {
       id: String(r.id), sha256: String(r.sha256 ?? ''), status: r.status as MediaAsset['status'],
       url: (r.url as string) ?? undefined, folder: r.folder ? String(r.folder) : undefined,
+      mime: (r.mime as string) ?? undefined,
     };
   },
   /** Serve path: reads from the asset's own folder (local or FTP). */
-  async readAsset(assetId: string): Promise<Buffer> {
+  async readAsset(assetId: string): Promise<{ bytes: Buffer; mime: string }> {
     const a = await this.get(assetId);
     if (!a || a.status !== 'clean') throw new Error('NOT_FOUND');
-    return objectStore.readClean((a.folder ?? 'photos') as MediaFolder, assetId);
+    const mime = a.mime ?? 'image/jpeg';
+    const bytes = await objectStore.readClean((a.folder ?? 'photos') as MediaFolder, assetId, mime);
+    return { bytes, mime };
   },
 };

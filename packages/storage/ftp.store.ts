@@ -43,32 +43,43 @@ async function withClient<T>(fn: (client: Client, cfg: FtpConfig) => Promise<T>)
   }
 }
 
-const qkey = (folder: string, assetId: string): string => `${folder}/quarantine/${assetId}`;
-const ckey = (folder: string, assetId: string): string => `${folder}/clean/${assetId}`;
+/** Storage key keeps the real extension so files are recognisable on the
+ *  host and served with correct types even outside the API. */
+export function storageKey(assetId: string, mime: string): string {
+  const ext =
+    mime === 'image/png' ? '.png'
+    : mime === 'video/mp4' ? '.mp4'
+    : mime === 'application/pdf' ? '.pdf'
+    : '.jpg';
+  return assetId.endsWith(ext) ? assetId : `${assetId}${ext}`;
+}
 
 export const ftpStore = {
-  async putQuarantine(folder: string, assetId: string, bytes: Buffer): Promise<void> {
+  async putQuarantine(folder: string, assetId: string, bytes: Buffer, mime = 'image/jpeg'): Promise<void> {
+    const key = storageKey(assetId, mime);
     await withClient(async (client, cfg) => {
       const dir = `${cfg.baseDir}/${folder}/quarantine`;
       await client.ensureDir(dir);
-      await client.uploadFrom(Readable.from(bytes), `${dir}/${assetId}`);
+      await client.uploadFrom(Readable.from(bytes), `${dir}/${key}`);
     });
   },
-  async promote(folder: string, assetId: string): Promise<void> {
+  async promote(folder: string, assetId: string, mime = 'image/jpeg'): Promise<void> {
+    const key = storageKey(assetId, mime);
     await withClient(async (client, cfg) => {
       const dir = `${cfg.baseDir}/${folder}/clean`;
       await client.ensureDir(dir);
-      await client.rename(`${cfg.baseDir}/${qkey(folder, assetId)}`, `${dir}/${assetId}`);
+      await client.rename(`${cfg.baseDir}/${folder}/quarantine/${key}`, `${dir}/${key}`);
     });
   },
-  async readClean(folder: string, assetId: string): Promise<Buffer> {
+  async readClean(folder: string, assetId: string, mime = 'image/jpeg'): Promise<Buffer> {
+    const key = storageKey(assetId, mime);
     const chunks: Buffer[] = [];
     await withClient(async (client, cfg) => {
       const { Writable } = await import('node:stream');
       const sink = new Writable({
         write(chunk, _enc, cb) { chunks.push(Buffer.from(chunk)); cb(); },
       });
-      await client.downloadTo(sink, `${cfg.baseDir}/${ckey(folder, assetId)}`);
+      await client.downloadTo(sink, `${cfg.baseDir}/${folder}/clean/${key}`);
     });
     return Buffer.concat(chunks);
   },

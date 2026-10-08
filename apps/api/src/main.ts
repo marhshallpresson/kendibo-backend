@@ -920,8 +920,8 @@ app.get('/v1/media/:id/file', async (req, reply) => {
     return fail(reply, 'BAD_SIGNATURE', 'Invalid or expired signed URL', 403);
   }
   try {
-    const bytes = await mediaService.readAsset(asset.id);
-    void reply.header('Content-Type', 'application/octet-stream');
+    const { bytes, mime } = await mediaService.readAsset(asset.id);
+    void reply.header('Content-Type', mime);
     void reply.header('Cache-Control', 'private, max-age=3600');
     return reply.send(bytes);
   } catch {
