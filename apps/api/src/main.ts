@@ -2,6 +2,7 @@ import 'dotenv/config'; // must stay first: loads .env (gitignored) before any e
 import { config as appConfig } from '../../../packages/config/env.js'; // validates; refuses prod boot on missing secrets
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import multipart from '@fastify/multipart';
 import { z } from 'zod';
 import { PaymentService } from '../../../modules/payments/payment.service.js';
 import { postCollection, postSettlement, trialBalance, openPeriod } from '../../../modules/ledger/ledger.service.js';
@@ -77,6 +78,10 @@ void app.register(cors, {
     return cb(new Error('CORS blocked'), false);
   },
   methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+});
+void app.register(multipart, {
+  limits: { fileSize: 25 * 1024 * 1024, files: 1 },
+  attachFieldsToBody: false,
 });
 // Kobo amounts travel as bigint internally — JSON has no bigint, so convert
 // globally at the HTTP boundary (strings preserve precision; clients coerce).
@@ -473,6 +478,27 @@ app.post('/v1/notify', async (req, reply) => {
 app.post('/v1/media/presign', async (req) => {
   const { kind } = z.object({ kind: z.enum(['photo', 'video', 'doc']) }).parse(req.body);
   return { data: await mediaService.presign(kind) };
+});
+// Multipart direct upload (self-hosted path, ADR-001): auth -> validate ->
+// quarantine -> promote. Poor-network clients keep using presign + base64 ingest.
+app.post('/v1/media/upload', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  try {
+    const file = await req.file();
+    if (!file) return fail(reply, 'NO_FILE', 'Attach a single file field.');
+    const kindRaw = (file.fields as Record<string, { value?: string } | undefined> | undefined)?.kind?.value ?? 'photo';
+    const kind = kindRaw === 'video' || kindRaw === 'doc' ? kindRaw : 'photo';
+    const { assetId } = await mediaService.presign(kind as 'photo' | 'video' | 'doc');
+    const bytes = await file.toBuffer();
+    const done = await mediaService.ingest(assetId, bytes, file.mimetype);
+    if (done.status !== 'clean') return fail(reply, 'FILE_REJECTED', 'File type or size not allowed.');
+    return { data: done };
+  } catch (e: unknown) {
+    const msg = (e as Error).message;
+    if (msg === 'STORAGE_PAUSED') return fail(reply, 'STORAGE_PAUSED', 'Object storage paused.', 503, true);
+    if (msg === 'FTP_NOT_CONFIGURED') return fail(reply, 'STORAGE_UNCONFIGURED', 'FTP storage is not configured.', 503, true);
+    return fail(reply, 'UPLOAD_FAILED', msg);
+  }
 });
 
 // ---------- payouts / disputes / warranty / reviews ----------

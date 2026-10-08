@@ -1,19 +1,18 @@
-// Object store — provider-neutral. Two drivers, one interface:
+// Object store — provider-neutral. Drivers, one interface:
 //
-//   STORAGE_DRIVER=local  -> ./storage/{quarantine,clean}/ (dev, Pxxl single-container)
-//   STORAGE_DRIVER=s3     -> any S3-compatible endpoint. PRIMARY for Pxxl hosting:
-//                            Pxxl CDN Storage bucket + bucket-scoped access key:
-//                            endpoint https://storage.pxxl.app/s3, region auto,
-//                            path-style. Also works for R2/MinIO. AWS S3 is only
-//                            ever an endpoint value here — no AWS services used.
+//   STORAGE_DRIVER=local  -> ./storage/{quarantine,clean}/ (dev, single container)
+//   STORAGE_DRIVER=ftp    -> self-hosted FTP ({FTP_BASE_DIR}/quarantine|clean) — ACTIVE (ADR-001)
+//   STORAGE_DRIVER=s3     -> PAUSED (ADR-001). S3-compatible code retained for a
+//                            future flip, but presign refuses while paused.
 //
-// Flow (both drivers): presign -> PUT bytes -> quarantine -> scan/promote ->
+// Flow (all drivers): presign -> PUT bytes -> quarantine -> scan/promote ->
 // signed GET. Quarantine is never publicly readable.
 import { createHmac, randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { S3Client, PutObjectCommand, GetObjectCommand, CopyObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { ftpStore } from './ftp.store.js';
 
 export interface PresignedUpload { assetId: string; uploadUrl: string; maxBytes: number; }
 const MAX_BYTES = 25 * 1024 * 1024;
@@ -41,52 +40,52 @@ function localDir(kind: 'quarantine' | 'clean'): string {
   mkdirSync(d, { recursive: true });
   return d;
 }
-function localSign(assetId: string, exp: number): string {
+function apiSign(assetId: string, exp: number): string {
   return createHmac('sha256', SIGN_SECRET).update(`${assetId}.${exp}`).digest('hex');
 }
+/** API-signed GET path served by GET /v1/media/:id/file (local + ftp drivers). */
+function apiSignedUrl(assetId: string, ttlSec: number): string {
+  const exp = Math.floor(Date.now() / 1000) + ttlSec;
+  return `/v1/media/${assetId}/file?exp=${exp}&sig=${apiSign(assetId, exp)}`;
+}
+
+const paused = (): never => { throw new Error('STORAGE_PAUSED'); };
 
 export const objectStore = {
   driver: DRIVER,
   async presign(assetId: string, ttlSec = 900): Promise<PresignedUpload> {
-    if (DRIVER !== 's3') return { assetId, uploadUrl: `store://quarantine/${assetId}`, maxBytes: MAX_BYTES };
-    const put = await getSignedUrl(s3(), new PutObjectCommand({ Bucket: BUCKET, Key: qkey(assetId) }), { expiresIn: ttlSec });
-    return { assetId, uploadUrl: put, maxBytes: MAX_BYTES };
+    if (DRIVER === 's3') paused();
+    if (DRIVER === 'ftp') return { assetId, uploadUrl: `store://quarantine/${assetId}`, maxBytes: MAX_BYTES };
+    return { assetId, uploadUrl: `store://quarantine/${assetId}`, maxBytes: MAX_BYTES };
   },
   async putQuarantine(assetId: string, bytes: Buffer): Promise<void> {
     if (bytes.length > MAX_BYTES) throw new Error('FILE_TOO_LARGE');
-    if (DRIVER !== 's3') { writeFileSync(join(localDir('quarantine'), assetId), bytes); return; }
-    await s3().send(new PutObjectCommand({ Bucket: BUCKET, Key: qkey(assetId), Body: bytes }));
+    if (DRIVER === 's3') paused();
+    if (DRIVER === 'ftp') { await ftpStore.putQuarantine(assetId, bytes); return; }
+    writeFileSync(join(localDir('quarantine'), assetId), bytes);
   },
   async promote(assetId: string): Promise<void> {
-    if (DRIVER !== 's3') {
-      const src = join(localDir('quarantine'), assetId);
-      if (!existsSync(src)) throw new Error('NOT_UPLOADED');
-      renameSync(src, join(localDir('clean'), assetId));
-      return;
-    }
-    await s3().send(new CopyObjectCommand({ Bucket: BUCKET, Key: ckey(assetId), CopySource: `${BUCKET}/${qkey(assetId)}` }));
-    await s3().send(new DeleteObjectCommand({ Bucket: BUCKET, Key: qkey(assetId) }));
+    if (DRIVER === 's3') paused();
+    if (DRIVER === 'ftp') { await ftpStore.promote(assetId); return; }
+    const src = join(localDir('quarantine'), assetId);
+    if (!existsSync(src)) throw new Error('NOT_UPLOADED');
+    renameSync(src, join(localDir('clean'), assetId));
   },
   async readClean(assetId: string): Promise<Buffer> {
-    if (DRIVER !== 's3') {
-      const p = join(localDir('clean'), assetId);
-      if (!existsSync(p)) throw new Error('NOT_FOUND');
-      return readFileSync(p);
-    }
-    const r = await s3().send(new GetObjectCommand({ Bucket: BUCKET, Key: ckey(assetId) }));
-    return Buffer.from(await r.Body!.transformToByteArray());
+    if (DRIVER === 's3') paused();
+    if (DRIVER === 'ftp') return ftpStore.readClean(assetId);
+    const p = join(localDir('clean'), assetId);
+    if (!existsSync(p)) throw new Error('NOT_FOUND');
+    return readFileSync(p);
   },
   async signedUrl(assetId: string, ttlSec = 3600): Promise<string> {
-    if (DRIVER !== 's3') {
-      const exp = Math.floor(Date.now() / 1000) + ttlSec;
-      return `/v1/media/${assetId}/file?exp=${exp}&sig=${localSign(assetId, exp)}`;
-    }
-    return getSignedUrl(s3(), new GetObjectCommand({ Bucket: BUCKET, Key: ckey(assetId) }), { expiresIn: ttlSec });
+    if (DRIVER === 's3') paused();
+    return apiSignedUrl(assetId, ttlSec);
   },
   verifyLocalUrl(assetId: string, exp: string, sig: string): boolean {
     if (Date.now() / 1000 > Number(exp)) return false;
     try {
-      const a = Buffer.from(localSign(assetId, Number(exp)));
+      const a = Buffer.from(apiSign(assetId, Number(exp)));
       const b = Buffer.from(sig);
       return a.length === b.length && a.every((v, i) => v === b[i]);
     } catch { return false; }
