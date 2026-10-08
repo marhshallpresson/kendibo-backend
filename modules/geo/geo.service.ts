@@ -5,7 +5,7 @@ import { config as appConfig } from '../../packages/config/env.js';
 
 export const geoService = {
   /** Cities allowed by GEOLOCK_CITY (empty lock = all). */
-  private allowed(): string[] {
+  allowed(): string[] {
     return appConfig.GEOLOCK_CITY
       ? appConfig.GEOLOCK_CITY.split(',').map((c) => c.trim().toLowerCase())
       : [];
