@@ -139,17 +139,67 @@ app.get('/v1/admin/monitoring', async (req, reply) => {
 app.get('/v1/config', async () => ({ priceBook: await configurationService.priceBook(), flags: await configurationService.flags() }));
 
 // ---------- auth (OTP + refresh + PIN/biometrics stubs) ----------
-app.post('/v1/auth/otp/request', async (req) => {
-  const { channel, identity } = z.object({ channel: z.enum(['phone', 'email']), identity: z.string() }).parse(req.body);
-  const r = await identityService.requestOtp(channel, identity);
-  return { data: { sent: true, devCode: r.devCode } };
+app.post('/v1/auth/otp/request', async (req, reply) => {
+  try {
+    const { channel, identity } = z.object({ channel: z.enum(['phone', 'email']), identity: z.string() }).parse(req.body);
+    const r = await identityService.requestOtp(channel, identity);
+    return { data: { sent: true, devCode: r.devCode } };
+  } catch (e: unknown) {
+    const msg = (e as Error).message;
+    if (msg === 'BAD_IDENTITY') return fail(reply, 'BAD_IDENTITY', 'Enter a valid phone number or email address.');
+    if (msg === 'SEND_FAILED') return fail(reply, 'SEND_FAILED', 'Could not deliver the code. Try again.', 502, true);
+    throw e;
+  }
 });
 app.post('/v1/auth/otp/verify', async (req) => {
-  const { channel, identity, code } = z.object({ channel: z.enum(['phone', 'email']), identity: z.string(), code: z.string() }).parse(req.body);
-  const s = await identityService.verifyOtp(channel, identity, code);
+  const { channel, identity, code, device } = z.object({
+    channel: z.enum(['phone', 'email']), identity: z.string(), code: z.string(),
+    device: z.object({
+      fp: z.string().optional(), platform: z.string().optional(), model: z.string().optional(),
+      os: z.string().optional(), appVersion: z.string().optional(), city: z.string().optional(),
+    }).optional(),
+  }).parse(req.body);
+  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip;
+  const s = await identityService.verifyOtp(channel, identity, code, { ...device, ip });
   if (!s) return { error: { code: 'BAD_OTP', message: 'Invalid or expired code', retryable: false } };
   observability.track('auth.verified', { channel });
   return { data: s };
+});
+// Login button pre-check: normalised identity -> existence only (constant-time body).
+app.post('/v1/auth/account-exists', async (req, reply) => {
+  const t0 = Date.now();
+  try {
+    const { identity } = z.object({ identity: z.string() }).parse(req.body);
+    const r = await identityService.accountExists(identity);
+    observability.track('auth.account_checked', { channel: r.channel, exists: r.exists });
+    await new Promise((res) => setTimeout(res, Math.max(0, 300 - (Date.now() - t0))));
+    return { data: r };
+  } catch {
+    await new Promise((res) => setTimeout(res, Math.max(0, 300 - (Date.now() - t0))));
+    return fail(reply, 'BAD_IDENTITY', 'Enter a valid phone number or email address.');
+  }
+});
+// Google SSO (in-app browser now, native SDK later — same endpoint either way).
+app.post('/v1/auth/google', async (req, reply) => {
+  const { idToken, device } = z.object({
+    idToken: z.string(),
+    device: z.object({
+      fp: z.string().optional(), platform: z.string().optional(), model: z.string().optional(),
+      os: z.string().optional(), appVersion: z.string().optional(), city: z.string().optional(),
+    }).optional(),
+  }).parse(req.body);
+  try {
+    const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip;
+    const s = await identityService.googleVerify(idToken, { ...device, ip });
+    observability.track('auth.google_verified', { isNew: s.isNew });
+    return { data: s };
+  } catch (e: unknown) {
+    const code = String((e as Error).message);
+    if (['BAD_GOOGLE_TOKEN', 'BAD_GOOGLE_AUDIENCE', 'GOOGLE_TOKEN_EXPIRED', 'GOOGLE_UNVERIFIED'].includes(code)) {
+      return fail(reply, 'GOOGLE_REJECTED', 'Google sign-in failed. Try again.', 401);
+    }
+    return fail(reply, 'GOOGLE_FAILED', 'Google sign-in unavailable. Try OTP instead.', 502, true);
+  }
 });
 app.post('/v1/auth/refresh', async (req) => {
   const { refresh } = z.object({ refresh: z.string() }).parse(req.body);
@@ -527,10 +577,10 @@ app.post('/v1/change-orders/:id/approve', async (req) => {
   const { approve, approver } = z.object({ approve: z.boolean(), approver: z.string() }).parse(req.body);
   return { data: await quoteService.decideChange((req.params as { id: string }).id, approve, approver) };
 });
-app.get('/v1/payments/:reference', async (req) => {
+app.get('/v1/payments/:reference', async (req, reply) => {
   const rows = await q<Record<string, unknown>>(`SELECT * FROM payment.payment WHERE reference=$1`, [(req.params as { reference: string }).reference]);
   const p = rows[0];
-  if (!p) return { error: { code: 'NOT_FOUND', message: 'Payment not found', retryable: false } };
+  if (!p) return fail(reply, 'NOT_FOUND', 'Payment not found', 404);
   return { data: { reference: String(p.reference), psp: String(p.psp), amountKobo: String(p.amount_kobo), currency: 'NGN', status: String(p.status) } };
 });
 app.post('/v1/payments/:reference/verify', async (req, reply) => {

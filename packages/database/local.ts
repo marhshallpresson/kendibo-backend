@@ -47,7 +47,8 @@ export function localDb(): IMemoryDb {
   run('007_requests.sql');
   run('008_checker.sql');
   run('009_profile.sql');
-  console.log('[localdb] pg-mem ready (001-009)');
+  run('010_auth_google_devices.sql');
+  console.log('[localdb] pg-mem ready (001-010)');
   return mem;
 }
 

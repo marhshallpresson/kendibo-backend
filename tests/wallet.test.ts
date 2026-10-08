@@ -1,12 +1,11 @@
-// Test isolation: never touch a real DATABASE_URL/REDIS_URL from the machine env.
-// @ts-ignore
-if (typeof globalThis.KENDIBO_TEST_ISOLATION === 'undefined') { (globalThis as any).KENDIBO_TEST_ISOLATION = true; delete process.env.DATABASE_URL; delete process.env.REDIS_URL; }
+// Test isolation: scrubbed in before() AFTER main.js import (main loads dotenv
+// which would otherwise restore the live DATABASE_URL from .env).
 // Wallet tests (node:test). Service-level tests hit modules/wallet directly;
 // route tests use the real Fastify app via app.inject.
 // main.ts only listens when NODE_ENV !== 'test', so set it before importing the app.
 // A fake PSP adapter is injected via globalThis.__PSP__ (no network calls).
 import 'dotenv/config';
-import { describe, it, before } from 'node:test';
+import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { randomUUID } from 'node:crypto';
 import { walletService } from '../modules/wallet/wallet.service.js';
@@ -23,10 +22,20 @@ const fakePsp = {
 };
 (globalThis as Record<string, unknown>).__PSP__ = { bachs: fakePsp, flutterwave: fakePsp };
 
-let app: { inject: (opts: unknown) => Promise<{ statusCode: number; json: () => { error: { code: string }; data: { psp: string; balanceKobo: number; txns: { kind: string }[] } } }> };
+let app: { inject: (opts: unknown) => Promise<{ statusCode: number; json: () => { error: { code: string }; data: { psp: string; balanceKobo: number; txns: { kind: string }[] } } }>; close?: () => Promise<void> };
 before(async () => {
-  process.env.NODE_ENV ??= 'test';
+  // Isolate BEFORE main.js import (main loads dotenv + touches DB at import):
+  // force test so main never listens on :3000, neutralize URLs to '' so
+  // dotenv cannot restore the live URL and openPeriod uses pg-mem.
+  process.env.NODE_ENV = 'test';
+  process.env.DATABASE_URL = '';
+  process.env.REDIS_URL = '';
   ({ app } = await import('../apps/api/src/main.js'));
+  delete process.env.DATABASE_URL;
+  delete process.env.REDIS_URL;
+});
+after(async () => {
+  await app?.close?.().catch(() => {});
 });
 
 const freshUser = () => `test_${randomUUID()}`;

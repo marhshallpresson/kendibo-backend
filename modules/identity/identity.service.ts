@@ -19,33 +19,55 @@ const row = (r: Record<string, unknown>): User => ({
 });
 
 export const identityService = {
+  /** Normalise + validate. Throws BAD_IDENTITY for garbage (route maps to 400). */
+  normalizeIdentity(identity: string): { channel: 'phone' | 'email'; value: string } {
+    const id = identity.trim();
+    if (id.includes('@')) {
+      const email = id.toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) throw new Error('BAD_IDENTITY');
+      return { channel: 'email', value: email };
+    }
+    const digits = id.replace(/\D/g, '');
+    let phone = '';
+    if (digits.startsWith('234') && digits.length >= 12) phone = `+${digits.slice(0, 13)}`;
+    else if (digits.startsWith('0') && digits.length === 11) phone = `+234${digits.slice(1)}`;
+    else if (/^\d{7,15}$/.test(digits)) phone = `+${digits}`;
+    if (!phone) throw new Error('BAD_IDENTITY');
+    return { channel: 'phone', value: phone };
+  },
   async requestOtp(channel: 'phone' | 'email', identity: string) {
-    const r = await issueOtp(channel, identity);
-    if (channel === 'phone') {
-      let phone = identity.replace(/\s+/g, '');
-      if (phone.startsWith('+')) phone = phone.substring(1);
-      if (phone.startsWith('0')) phone = '234' + phone.substring(1); // Default to NG
-      await sms.send(phone, `Your Kendibo verification code is ${r.code}. It expires in 5 minutes.`);
-    } else {
-      const mail = templates.otp(r.code);
-      await email.send(identity, 'Your Kendibo code', mail.html);
+    const norm = this.normalizeIdentity(identity);
+    if (norm.channel !== channel) throw new Error('BAD_IDENTITY');
+    const r = await issueOtp(channel, norm.value);
+    try {
+      if (channel === 'phone') {
+        await sms.send(norm.value, `Your Kendibo verification code is ${r.code}. It expires in 5 minutes.`);
+      } else {
+        const mail = templates.otp(r.code);
+        await email.send(norm.value, 'Your Kendibo code', mail.html);
+      }
+    } catch (e) {
+      throw Object.assign(new Error('SEND_FAILED'), { cause: e });
     }
     return { devCode: r.devCode };
   },
-  async verifyOtp(channel: 'phone' | 'email', identity: string, code: string) {
-    if (!(await verifyOtp(channel, identity, code))) return null;
+  async verifyOtp(channel: 'phone' | 'email', identity: string, code: string, device?: { fp?: string; platform?: string; model?: string; os?: string; appVersion?: string; ip?: string; city?: string }) {
+    const norm = this.normalizeIdentity(identity);
+    if (norm.channel !== channel) return null;
+    if (!(await verifyOtp(channel, norm.value, code))) return null;
     const col = channel === 'phone' ? 'phone' : 'email';
-    let rows = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE ${col}=$1`, [identity]);
+    let rows = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE ${col}=$1`, [norm.value]);
     let user = rows[0];
     if (!user) {
       const ins = await q<Record<string, unknown>>(
-        `INSERT INTO identity.users (${col}) VALUES ($1) RETURNING *`, [identity],
+        `INSERT INTO identity.users (${col}) VALUES ($1) RETURNING *`, [norm.value],
       );
       user = ins[0];
     }
     const deviceId = `dev_${Date.now().toString(36)}`;
     const access = signAccess(String(user.id), ['booking:create', 'booking:view:self']);
     const refresh = await signRefresh(String(user.id), deviceId);
+    await this.logDevice(String(user.id), device ?? {});
     return { user: row(user), access, refresh: refresh.token, deviceId };
   },
   refresh(token: string) { return rotateRefresh(token); },
@@ -99,5 +121,65 @@ export const identityService = {
     await q(`UPDATE identity.users SET status='inactive' WHERE id=$1`, [userId]);
     await this.logoutAll(userId);
     return { ok: true };
+  },
+  /** Pre-check for the login button: normalises identity, answers existence only. */
+  async accountExists(identity: string): Promise<{ exists: boolean; channel: 'phone' | 'email' }> {
+    const norm = this.normalizeIdentity(identity);
+    const col = norm.channel === 'phone' ? 'phone' : 'email';
+    const rows = await q(`SELECT id FROM identity.users WHERE ${col}=$1`, [norm.value]);
+    return { exists: rows.length > 0, channel: norm.channel };
+  },
+  /** Silent device history: upsert per (user, fingerprint). Never blocks login. */
+  async logDevice(userId: string, d: { fp?: string; platform?: string; model?: string; os?: string; appVersion?: string; ip?: string; city?: string }) {
+    const fp = String(d.fp ?? `${d.platform ?? 'unknown'}:${d.model ?? 'unknown'}`).slice(0, 160);
+    try {
+      const rows = await q<Record<string, unknown>>(
+        `SELECT id FROM identity.device_session WHERE user_id=$1 AND device_fp=$2`, [userId, fp],
+      );
+      if (rows[0]) {
+        await q(`UPDATE identity.device_session SET last_seen=now(), ip=$3, city=$4 WHERE id=$1`, [String(rows[0].id), userId, d.ip ?? null, d.city ?? null]);
+      } else {
+        await q(`INSERT INTO identity.device_session (user_id, device_fp, platform, model, os, app_version, ip, city)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [userId, fp, d.platform ?? 'unknown', d.model ?? null, d.os ?? null, d.appVersion ?? null, d.ip ?? null, d.city ?? null]);
+      }
+    } catch { /* history must never break login */ }
+    return { ok: true };
+  },
+  /** Google SSO: verify ID token, match-or-create verified user, same session bundle. */
+  async googleVerify(idToken: string, device?: { fp?: string; platform?: string; model?: string; os?: string; appVersion?: string; ip?: string; city?: string }) {
+    // Fail fast on obvious junk without network (keeps tests hermetic, avoids
+    // useless external round-trip on garbage that can never verify).
+    if (!idToken || idToken.length < 20 || idToken.split('.').length !== 3) throw new Error('BAD_GOOGLE_TOKEN');
+    const res = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`);
+    if (!res.ok) throw new Error('BAD_GOOGLE_TOKEN');
+    const claims = (await res.json()) as { aud?: string; exp?: string; email?: string; email_verified?: string; sub?: string; name?: string };
+    const allowed = (process.env.GOOGLE_CLIENT_IDS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (allowed.length > 0 && !allowed.includes(String(claims.aud ?? ''))) throw new Error('BAD_GOOGLE_AUDIENCE');
+    if (Number(claims.exp ?? 0) * 1000 < Date.now()) throw new Error('GOOGLE_TOKEN_EXPIRED');
+    if (claims.email_verified !== 'true' || !claims.email || !claims.sub) throw new Error('GOOGLE_UNVERIFIED');
+    const email = String(claims.email).toLowerCase();
+    let rows = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE google_sub=$1`, [String(claims.sub)]);
+    let isNew = false;
+    if (!rows[0]) {
+      const byEmail = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE email=$1`, [email]);
+      if (byEmail[0]) {
+        await q(`UPDATE identity.users SET google_sub=$2 WHERE id=$1`, [String(byEmail[0].id), String(claims.sub)]);
+        rows = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE id=$1`, [String(byEmail[0].id)]);
+      } else {
+        const ins = await q<Record<string, unknown>>(
+          `INSERT INTO identity.users (email, name, google_sub) VALUES ($1,$2,$3) RETURNING *`,
+          [email, String((claims as { name?: string }).name ?? email.split('@')[0]).slice(0, 80), String(claims.sub)],
+        );
+        rows = ins;
+        isNew = true;
+      }
+    }
+    const user = row(rows[0]);
+    const deviceId = `dev_${Date.now().toString(36)}`;
+    const access = signAccess(user.id, ['booking:create', 'booking:view:self']);
+    const refresh = await signRefresh(user.id, deviceId);
+    await this.logDevice(user.id, device ?? {});
+    return { user, access, refresh: refresh.token, deviceId, isNew };
   },
 };
