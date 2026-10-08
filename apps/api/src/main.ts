@@ -476,7 +476,7 @@ app.post('/v1/notify', async (req, reply) => {
   return await notificationService.dispatch(template as (typeof TEMPLATES)[number], to, vars as Record<string, string>);
 });
 app.post('/v1/media/presign', async (req) => {
-  const { kind } = z.object({ kind: z.enum(['photo', 'video', 'doc']) }).parse(req.body);
+  const { kind } = z.object({ kind: z.enum(['avatar', 'photo', 'video', 'doc']) }).parse(req.body);
   return { data: await mediaService.presign(kind) };
 });
 // Multipart direct upload (self-hosted path, ADR-001): auth -> validate ->
@@ -487,8 +487,8 @@ app.post('/v1/media/upload', async (req, reply) => {
     const file = await req.file();
     if (!file) return fail(reply, 'NO_FILE', 'Attach a single file field.');
     const kindRaw = (file.fields as Record<string, { value?: string } | undefined> | undefined)?.kind?.value ?? 'photo';
-    const kind = kindRaw === 'video' || kindRaw === 'doc' ? kindRaw : 'photo';
-    const { assetId } = await mediaService.presign(kind as 'photo' | 'video' | 'doc');
+    const kind = kindRaw === 'avatar' || kindRaw === 'video' || kindRaw === 'doc' ? kindRaw : 'photo';
+    const { assetId } = await mediaService.presign(kind);
     const bytes = await file.toBuffer();
     const done = await mediaService.ingest(assetId, bytes, file.mimetype);
     if (done.status !== 'clean') return fail(reply, 'FILE_REJECTED', 'File type or size not allowed.');
@@ -740,7 +740,7 @@ app.post('/v1/provider/jobs/:id/decline', async (req) => {
   return { data: await providerService.respondToOffer(offerId, false) };
 });
 app.post('/v1/provider/jobs/:id/evidence', async (req, reply) => {
-  const { kind } = z.object({ kind: z.enum(['photo', 'video', 'doc']) }).parse(req.body);
+  const { kind } = z.object({ kind: z.enum(['avatar', 'photo', 'video', 'doc']) }).parse(req.body);
   return { data: await mediaService.presign(kind) };
 });
 app.post('/v1/provider/jobs/:id/quote', async (req) => {
@@ -919,10 +919,14 @@ app.get('/v1/media/:id/file', async (req, reply) => {
   if (!q.exp || !q.sig || !objectStore.verifyLocalUrl(asset.id, q.exp, q.sig)) {
     return fail(reply, 'BAD_SIGNATURE', 'Invalid or expired signed URL', 403);
   }
-  const bytes = await objectStore.readClean(asset.id);
-  void reply.header('Content-Type', 'application/octet-stream');
-  void reply.header('Cache-Control', 'private, max-age=3600');
-  return reply.send(bytes);
+  try {
+    const bytes = await mediaService.readAsset(asset.id);
+    void reply.header('Content-Type', 'application/octet-stream');
+    void reply.header('Cache-Control', 'private, max-age=3600');
+    return reply.send(bytes);
+  } catch {
+    return fail(reply, 'NOT_FOUND', 'Asset unavailable', 404);
+  }
 });
 
 const port = Number(process.env.PORT ?? 3000);

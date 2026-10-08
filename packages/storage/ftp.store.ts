@@ -43,32 +43,32 @@ async function withClient<T>(fn: (client: Client, cfg: FtpConfig) => Promise<T>)
   }
 }
 
-const qkey = (assetId: string): string => `quarantine/${assetId}`;
-const ckey = (assetId: string): string => `clean/${assetId}`;
+const qkey = (folder: string, assetId: string): string => `${folder}/quarantine/${assetId}`;
+const ckey = (folder: string, assetId: string): string => `${folder}/clean/${assetId}`;
 
 export const ftpStore = {
-  async putQuarantine(assetId: string, bytes: Buffer): Promise<void> {
+  async putQuarantine(folder: string, assetId: string, bytes: Buffer): Promise<void> {
     await withClient(async (client, cfg) => {
-      const dir = `${cfg.baseDir}/quarantine`;
+      const dir = `${cfg.baseDir}/${folder}/quarantine`;
       await client.ensureDir(dir);
       await client.uploadFrom(Readable.from(bytes), `${dir}/${assetId}`);
     });
   },
-  async promote(assetId: string): Promise<void> {
+  async promote(folder: string, assetId: string): Promise<void> {
     await withClient(async (client, cfg) => {
-      const dir = `${cfg.baseDir}/clean`;
+      const dir = `${cfg.baseDir}/${folder}/clean`;
       await client.ensureDir(dir);
-      await client.rename(`${cfg.baseDir}/${qkey(assetId)}`, `${dir}/${assetId}`);
+      await client.rename(`${cfg.baseDir}/${qkey(folder, assetId)}`, `${dir}/${assetId}`);
     });
   },
-  async readClean(assetId: string): Promise<Buffer> {
+  async readClean(folder: string, assetId: string): Promise<Buffer> {
     const chunks: Buffer[] = [];
     await withClient(async (client, cfg) => {
       const { Writable } = await import('node:stream');
       const sink = new Writable({
         write(chunk, _enc, cb) { chunks.push(Buffer.from(chunk)); cb(); },
       });
-      await client.downloadTo(sink, `${cfg.baseDir}/${ckey(assetId)}`);
+      await client.downloadTo(sink, `${cfg.baseDir}/${ckey(folder, assetId)}`);
     });
     return Buffer.concat(chunks);
   },

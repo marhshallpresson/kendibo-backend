@@ -1,18 +1,23 @@
 // Object store — provider-neutral. Drivers, one interface:
 //
-//   STORAGE_DRIVER=local  -> ./storage/{quarantine,clean}/ (dev, single container)
-//   STORAGE_DRIVER=ftp    -> self-hosted FTP ({FTP_BASE_DIR}/quarantine|clean) — ACTIVE (ADR-001)
+//   STORAGE_DRIVER=local  -> ./storage/{folder}/{quarantine,clean}/ (dev, single container)
+//   STORAGE_DRIVER=ftp    -> self-hosted FTP ({FTP_BASE_DIR}/{folder}/{quarantine,clean}) — ACTIVE (ADR-001)
 //   STORAGE_DRIVER=s3     -> PAUSED (ADR-001). S3-compatible code retained for a
 //                            future flip, but presign refuses while paused.
 //
-// Flow (all drivers): presign -> PUT bytes -> quarantine -> scan/promote ->
-// signed GET. Quarantine is never publicly readable.
+// Delegation by need: kind -> folder (avatar->avatars, photo->photos,
+// video->videos, doc->docs). Quarantine is never publicly readable.
 import { createHmac, randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { S3Client, PutObjectCommand, GetObjectCommand, CopyObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { ftpStore } from './ftp.store.js';
+
+export type MediaFolder = 'avatars' | 'photos' | 'videos' | 'docs';
+export type MediaKind = 'avatar' | 'photo' | 'video' | 'doc';
+export const folderForKind = (kind: MediaKind): MediaFolder =>
+  kind === 'avatar' ? 'avatars' : kind === 'video' ? 'videos' : kind === 'doc' ? 'docs' : 'photos';
 
 export interface PresignedUpload { assetId: string; uploadUrl: string; maxBytes: number; }
 const MAX_BYTES = 25 * 1024 * 1024;
@@ -32,11 +37,11 @@ function s3(): S3Client {
     },
   });
 }
-const qkey = (assetId: string) => `quarantine/${assetId}`;
-const ckey = (assetId: string) => `clean/${assetId}`;
+const qkey = (folder: string, assetId: string) => `${folder}/quarantine/${assetId}`;
+const ckey = (folder: string, assetId: string) => `${folder}/clean/${assetId}`;
 
-function localDir(kind: 'quarantine' | 'clean'): string {
-  const d = join(ROOT, kind);
+function localDir(folder: string, kind: 'quarantine' | 'clean'): string {
+  const d = join(ROOT, folder, kind);
   mkdirSync(d, { recursive: true });
   return d;
 }
@@ -53,28 +58,28 @@ const paused = (): never => { throw new Error('STORAGE_PAUSED'); };
 
 export const objectStore = {
   driver: DRIVER,
-  async presign(assetId: string, ttlSec = 900): Promise<PresignedUpload> {
+  async presign(assetId: string, folder: MediaFolder = 'photos', ttlSec = 900): Promise<PresignedUpload> {
     if (DRIVER === 's3') paused();
-    if (DRIVER === 'ftp') return { assetId, uploadUrl: `store://quarantine/${assetId}`, maxBytes: MAX_BYTES };
-    return { assetId, uploadUrl: `store://quarantine/${assetId}`, maxBytes: MAX_BYTES };
+    void ttlSec;
+    return { assetId, uploadUrl: `store://${folder}/quarantine/${assetId}`, maxBytes: MAX_BYTES };
   },
-  async putQuarantine(assetId: string, bytes: Buffer): Promise<void> {
+  async putQuarantine(folder: MediaFolder, assetId: string, bytes: Buffer): Promise<void> {
     if (bytes.length > MAX_BYTES) throw new Error('FILE_TOO_LARGE');
     if (DRIVER === 's3') paused();
-    if (DRIVER === 'ftp') { await ftpStore.putQuarantine(assetId, bytes); return; }
-    writeFileSync(join(localDir('quarantine'), assetId), bytes);
+    if (DRIVER === 'ftp') { await ftpStore.putQuarantine(folder, assetId, bytes); return; }
+    writeFileSync(join(localDir(folder, 'quarantine'), assetId), bytes);
   },
-  async promote(assetId: string): Promise<void> {
+  async promote(folder: MediaFolder, assetId: string): Promise<void> {
     if (DRIVER === 's3') paused();
-    if (DRIVER === 'ftp') { await ftpStore.promote(assetId); return; }
-    const src = join(localDir('quarantine'), assetId);
+    if (DRIVER === 'ftp') { await ftpStore.promote(folder, assetId); return; }
+    const src = join(localDir(folder, 'quarantine'), assetId);
     if (!existsSync(src)) throw new Error('NOT_UPLOADED');
-    renameSync(src, join(localDir('clean'), assetId));
+    renameSync(src, join(localDir(folder, 'clean'), assetId));
   },
-  async readClean(assetId: string): Promise<Buffer> {
+  async readClean(folder: MediaFolder, assetId: string): Promise<Buffer> {
     if (DRIVER === 's3') paused();
-    if (DRIVER === 'ftp') return ftpStore.readClean(assetId);
-    const p = join(localDir('clean'), assetId);
+    if (DRIVER === 'ftp') return ftpStore.readClean(folder, assetId);
+    const p = join(localDir(folder, 'clean'), assetId);
     if (!existsSync(p)) throw new Error('NOT_FOUND');
     return readFileSync(p);
   },
