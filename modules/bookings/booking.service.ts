@@ -54,11 +54,25 @@ export const bookingService = {
     if (userId && String(b.user_id) !== userId) throw new Error('FORBIDDEN'); // IDOR guard
     return toBooking(b);
   },
+  async getRaw(id: string) {
+    const rows = await q<Record<string, unknown>>(`SELECT * FROM booking.booking WHERE id=$1`, [id]);
+    return rows[0] ? toBooking(rows[0]) : null;
+  },
   async list(userId: string, cursor?: string) {
     const rows = await q<Record<string, unknown>>(`SELECT * FROM booking.booking WHERE user_id=$1 ORDER BY created_at DESC LIMIT 21`, [userId]);
     const items = rows.map(toBooking);
     void cursor;
     return { items: items.slice(0, 20), nextCursor: items.length > 20 ? items[19].id : null };
+  },
+  async listForProvider(providerId: string) {
+    const rows = await q<Record<string, unknown>>(
+      `SELECT b.* FROM booking.booking b
+       JOIN dispatch.assignment a ON a.job_id = b.id
+       WHERE a.provider_id=$1 AND a.status='accepted'
+       ORDER BY b.created_at DESC LIMIT 50`,
+      [providerId],
+    );
+    return { items: rows.map(toBooking) };
   },
   async cancel(id: string, userId: string): Promise<Booking> {
     const b = await this.get(id, userId);

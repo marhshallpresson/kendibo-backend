@@ -33,6 +33,16 @@ export function localDb(): IMemoryDb {
         .join('\n');
       // pg-mem shims: no ON CONFLICT, native gen_random_uuid() is built in.
       sql = sql.replace(/ON CONFLICT[^\n;]*DO NOTHING/gi, '');
+      if (f === '015_provider_one_per_user.sql') {
+        sql = sql.replace(/WITH ranked AS \([^)]+\)[\s\S]*?WHERE p\.id = r\.id AND r\.rn > 1;/i, '');
+      }
+      if (f === '013_geo_city_coverage.sql') {
+        // pg-mem can't upsert (no ON CONFLICT) and errors updating a city that
+        // zones FK-reference, so drop the city-centre upsert locally: 004
+        // already seeds the cities/zones and zone coverage is what local
+        // dispatch tests exercise. Real Postgres applies 013 untouched.
+        sql = sql.replace(/INSERT INTO geo\.city[\s\S]*?ON CONFLICT[\s\S]*?;/i, '');
+      }
       mem!.public.none(sql);
     } catch (e) {
       console.warn(`[localdb] ${f}: ${(e as Error).message.split('\n')[0]}`);
@@ -50,7 +60,11 @@ export function localDb(): IMemoryDb {
   run('010_auth_google_devices.sql');
   run('011_media_folders.sql');
   run('012_media_mime.sql');
-  console.log('[localdb] pg-mem ready (001-012)');
+  run('013_geo_city_coverage.sql');
+  run('014_category_icon_address_city.sql');
+  run('015_provider_one_per_user.sql');
+  run('016_dispatch_sla.sql');
+  console.log('[localdb] pg-mem ready (001-016)');
   return mem;
 }
 

@@ -175,8 +175,16 @@ app.get('/v1/admin/monitoring', async (req, reply) => {
     },
   };
 });
-app.get('/v1/config', async () => ({ priceBook: await configurationService.priceBook(), flags: await configurationService.flags() }));
-app.get('/v1/config/flags', async () => ({ data: await configurationService.flags() }));
+  app.get('/v1/config', async () => ({ priceBook: await configurationService.priceBook(), flags: await configurationService.flags() }));
+  app.get('/v1/config/flags', async () => {
+    const flags = await configurationService.flags();
+    try {
+      const { config: appConfig } = await import('../../../packages/config/env.js');
+      const launchCity = appConfig.GEOLOCK_CITY?.split(',')[0]?.trim().toLowerCase();
+      if (launchCity && (flags as any).launchCity === undefined) (flags as any).launchCity = launchCity;
+    } catch {}
+    return { data: flags };
+  });
 
 // ---------- auth (OTP + refresh + PIN/biometrics stubs) ----------
 app.post('/v1/auth/otp/request', async (req, reply) => {
@@ -368,6 +376,10 @@ app.post('/v1/bookings', async (req, reply) => {
       for (const cand of candidates.slice(0, 5)) {
         await dispatchService.assign(booking.id, cand.providerId).catch(() => {});
       }
+      // Enter the matching state so the customer app can poll matches/offers.
+      await bookingService.setStatus(booking.id, 'MATCHING', 'system').catch((e) => observability.captureException(e));
+      const updated = await bookingService.getRaw(booking.id);
+      return { data: updated ?? booking };
     }
     return { data: booking };
   }
@@ -382,12 +394,158 @@ app.get('/v1/bookings/:id', async (req, reply) => {
   try { return { data: await bookingService.get((req.params as { id: string }).id, a?.sub) }; }
   catch { return fail(reply, 'FORBIDDEN', 'Not your booking', 403); }
 });
+app.get('/v1/bookings/:id/tracking', async (req, reply) => {
+  const a = authed(req as never);
+  const bookingId = (req.params as { id: string }).id;
+  const booking = await bookingService.getRaw(bookingId);
+  if (!booking) return fail(reply, 'NOT_FOUND', 'Booking not found', 404);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const isOwner = booking.userId === a.sub;
+  let isProvider = false;
+  const p = await providerService.byUserId(a.sub);
+  if (p) {
+    const assigns = await q<any>(`SELECT * FROM dispatch.assignment WHERE job_id=$1 AND provider_id=$2 AND status='accepted'`, [bookingId, p.id]);
+    if (assigns.length > 0) isProvider = true;
+  }
+  if (!isOwner && !isProvider) return fail(reply, 'FORBIDDEN', 'Not authorized', 403);
+
+  const jobId = bookingId;
+  const isActive = await geoService.isJourneyActive(jobId);
+  let provider = null;
+  let location = null;
+  let destination = null;
+  let etaMinutes = null;
+  let distanceKm = null;
+
+  const assigned = await q<any>(`SELECT provider_id FROM dispatch.assignment WHERE job_id=$1 AND status='accepted' LIMIT 1`, [jobId]);
+  const assignedProviderId = assigned[0]?.provider_id;
+  if (assignedProviderId) {
+    const prov = await providerService.byId(assignedProviderId);
+    if (prov) {
+      const user = await q<any>(`SELECT name, profile_image, phone FROM identity.users WHERE id=$1`, [prov.userId]);
+      provider = {
+        id: prov.id,
+        name: user[0]?.name || user[0]?.phone || 'Provider',
+        avatarUrl: user[0]?.profile_image || null,
+        phone: user[0]?.phone || null,
+      };
+    }
+  }
+
+  if (provider && isActive) {
+    const latest = await q<any>(`SELECT lat, lng, created_at FROM geo.provider_location WHERE provider_id=$1 ORDER BY created_at DESC LIMIT 1`, [provider.id]);
+    if (latest[0]) {
+      location = {
+        lat: Number(latest[0].lat),
+        lng: Number(latest[0].lng),
+        at: latest[0].created_at ? String(latest[0].created_at) : new Date().toISOString(),
+      };
+    }
+  }
+
+  const addr = await q<any>(`SELECT lat, lng, street, house_number, estate, landmark, postcode FROM property.address WHERE id=$1`, [booking.addressId]);
+  if (addr[0]) {
+    const parts = [addr[0].house_number, addr[0].street, addr[0].estate, addr[0].landmark].filter(Boolean);
+    destination = {
+      lat: addr[0].lat ? Number(addr[0].lat) : null,
+      lng: addr[0].lng ? Number(addr[0].lng) : null,
+      label: parts.length > 0 ? parts.join(', ') : (addr[0].postcode || 'Address'),
+    };
+  }
+
+  if (destination?.lat != null && destination?.lng != null && location) {
+    const d = geoService.haversineKm(location.lat, location.lng, destination.lat, destination.lng);
+    distanceKm = Math.round(d * 100) / 100;
+    etaMinutes = Math.round(d * 3 + 5);
+  } else {
+    try {
+      etaMinutes = await geoService.etaMinutes(bookingId, booking.addressId);
+    } catch {}
+  }
+
+  return {
+    data: {
+      status: booking.status,
+      provider,
+      location: provider ? (location || null) : null,
+      destination,
+      etaMinutes,
+      distanceKm,
+    },
+  };
+});
+// Hybrid matching fallback: when auto-dispatch offers are all declined/expired,
+// the customer can list eligible providers and pick one (hybrid flow).
+app.get('/v1/bookings/:id/match/candidates', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const bookingId = (req.params as { id: string }).id;
+  const b = await bookingService.getRaw(bookingId);
+  if (!b) return fail(reply, 'NOT_FOUND', 'Booking not found', 404);
+  if (b.userId !== a.sub) return fail(reply, 'FORBIDDEN', 'Not your booking', 403);
+
+  const assignments = await q<Record<string, unknown>>(`SELECT provider_id, status FROM dispatch.assignment WHERE job_id=$1`, [bookingId]);
+  const byProvider = new Map(assignments.map((r) => [String(r.provider_id), String(r.status)]));
+  const activeOffer = assignments.some((r) => ['offered', 'accepted'].includes(String(r.status)));
+
+  const addr = await q<Record<string, unknown>>(`SELECT lat, lng FROM property.address WHERE id=$1`, [b.addressId]);
+  const lat = addr[0]?.lat != null ? Number(addr[0].lat) : null;
+  const lng = addr[0]?.lng != null ? Number(addr[0].lng) : null;
+  if (lat == null || lng == null) return { data: { slaExhausted: true, candidates: [] } };
+
+  const cands = await dispatchService.findCandidates({ serviceId: b.serviceId, lat, lng });
+  const candidates: Record<string, unknown>[] = [];
+  for (const c of cands) {
+    const prov = await providerService.byId(c.providerId);
+    if (!prov) continue;
+    const u = await q<Record<string, unknown>>(`SELECT name, profile_image FROM identity.users WHERE id=$1`, [prov.userId]);
+    const qual = await q<Record<string, unknown>>(`SELECT * FROM provider.quality WHERE provider_id=$1`, [c.providerId]);
+    let etaMinutes = Math.round(c.distanceKm * 3 + 5);
+    try {
+      const loc = await q<Record<string, unknown>>(`SELECT lat, lng FROM geo.provider_location WHERE provider_id=$1 ORDER BY created_at DESC LIMIT 1`, [c.providerId]);
+      if (loc[0]?.lat != null) {
+        etaMinutes = Math.round(geoService.haversineKm(Number(loc[0].lat), Number(loc[0].lng), lat, lng) * 3 + 5);
+      }
+    } catch { /* keep zone-based estimate */ }
+    const st = byProvider.get(c.providerId);
+    candidates.push({
+      providerId: c.providerId,
+      name: u[0]?.name ?? 'Provider',
+      avatarUrl: u[0]?.profile_image ?? null,
+      rating: Number(qual[0]?.rating ?? 4.5) || 4.5,
+      distanceKm: c.distanceKm,
+      etaMinutes,
+      rateKobo: b.priceKobo,
+      offered: st === 'offered',
+      declined: st === 'declined' || st === 'expired',
+    });
+  }
+  return { data: { slaExhausted: !activeOffer, candidates } };
+});
+app.post('/v1/bookings/:id/match/pick', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const bookingId = (req.params as { id: string }).id;
+  const { providerId } = z.object({ providerId: z.string() }).parse(req.body);
+  const b = await bookingService.getRaw(bookingId);
+  if (!b) return fail(reply, 'NOT_FOUND', 'Booking not found', 404);
+  if (b.userId !== a.sub) return fail(reply, 'FORBIDDEN', 'Not your booking', 403);
+  if (b.status !== 'MATCHING') return fail(reply, 'NO_CANDIDATE', 'Booking is not awaiting a match', 409);
+
+  const addr = await q<Record<string, unknown>>(`SELECT lat, lng FROM property.address WHERE id=$1`, [b.addressId]);
+  if (addr[0]?.lat == null || addr[0]?.lng == null) return fail(reply, 'NO_CANDIDATE', 'No serviceable location', 409);
+  const cands = await dispatchService.findCandidates({ serviceId: b.serviceId, lat: Number(addr[0].lat), lng: Number(addr[0].lng) });
+  if (!cands.some((c) => c.providerId === providerId)) return fail(reply, 'NO_CANDIDATE', 'Provider is not eligible', 409);
+  try {
+    const offer = await dispatchService.assign(bookingId, providerId);
+    return { data: { offerId: offer.id, status: 'offered' } };
+  } catch {
+    return fail(reply, 'NO_CANDIDATE', 'Provider is not available', 409);
+  }
+});
 app.post('/v1/bookings/:id/cancel', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   try { return { data: await bookingService.cancel((req.params as { id: string }).id, a.sub) }; }
   catch { return fail(reply, 'FORBIDDEN', 'Cannot cancel', 403); }
-});
-app.get('/v1/bookings/:id/timeline', async (req) => ({ data: await bookingService.timeline((req.params as { id: string }).id) }));
+});app.get('/v1/bookings/:id/timeline', async (req) => ({ data: await bookingService.timeline((req.params as { id: string }).id) }));
 app.post('/v1/quotes', async (req) => {
   const { bookingId, amountKobo, notes } = z.object({ bookingId: z.string(), amountKobo: z.string(), notes: z.string().optional() }).parse(req.body);
   return { data: await quoteService.propose(bookingId, { amountKobo: BigInt(amountKobo), providerNotes: notes }) };
@@ -480,9 +638,43 @@ app.post('/v1/wallet/topup', async (req, reply) => {
 });
 
 // ---------- providers / dispatch / tracking / execution ----------
+// Hybrid dispatch lifecycle helpers (also driven by the SLA sweep below).
+async function advanceBookingAfterAccept(jobId: string): Promise<void> {
+  try {
+    const b = await bookingService.getRaw(jobId);
+    if (!b) return;
+    if (b.status === 'MATCHING') await bookingService.setStatus(jobId, 'PROVIDER_ASSIGNED', 'system');
+    const after = await bookingService.getRaw(jobId);
+    if (after?.status === 'PROVIDER_ASSIGNED') await bookingService.setStatus(jobId, 'PROVIDER_ACCEPTED', 'system');
+  } catch (e) { observability.captureException(e); }
+}
+async function escalateJob(jobId: string): Promise<void> {
+  try {
+    const b = await bookingService.getRaw(jobId);
+    if (!b || b.status !== 'MATCHING') return;
+    const active = await q(`SELECT 1 FROM dispatch.assignment WHERE job_id=$1 AND status IN ('offered','accepted')`, [jobId]);
+    if (active.length > 0) return;
+    const addr = await q<Record<string, unknown>>(`SELECT lat, lng FROM property.address WHERE id=$1`, [b.addressId]);
+    if (addr[0]?.lat == null || addr[0]?.lng == null) return;
+    await dispatchService.escalateNext(jobId, b.serviceId, Number(addr[0].lat), Number(addr[0].lng));
+  } catch (e) { observability.captureException(e); }
+}
+async function dispatchSweep(): Promise<void> {
+  try {
+    await dispatchService.expireOverdueOffers();
+    const jobs = await q<Record<string, unknown>>(`SELECT DISTINCT job_id FROM dispatch.assignment WHERE status IN ('expired','declined')`);
+    for (const row of jobs) await escalateJob(String(row.job_id));
+  } catch (e) { observability.captureException(e); }
+}
+
 app.post('/v1/provider/onboarding', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   return { data: await providerService.onboard(a.sub) };
+});
+app.get('/v1/provider/me', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const provider = await providerService.byUserId(a.sub);
+  return { data: provider };
 });
 app.post('/v1/provider/kyc', async (req) => {
   const { providerId, nin, bvn } = z.object({ providerId: z.string(), nin: z.string().optional(), bvn: z.string().optional() }).parse(req.body);
@@ -497,9 +689,20 @@ app.post('/v1/provider/online', async (req) => {
   return { data: await providerService.setOnline(providerId, online, lat, lng) };
 });
 app.get('/v1/provider/offers', async (req) => ({ data: await providerService.offersFor((req.query as { providerId: string }).providerId) }));
-app.post('/v1/provider/offers/:id/respond', async (req) => {
+app.post('/v1/provider/offers/:id/respond', async (req, reply) => {
   const { accept } = z.object({ accept: z.boolean() }).parse(req.body);
-  return { data: await providerService.respondToOffer((req.params as { id: string }).id, accept) };
+  let result: Record<string, unknown>;
+  try {
+    result = (await providerService.respondToOffer((req.params as { id: string }).id, accept)) as Record<string, unknown>;
+  } catch (e: unknown) {
+    return fail(reply, 'OFFER_GONE', (e as Error).message, 409);
+  }
+  const jobId = String(result.job_id ?? result.jobId ?? '');
+  if (jobId) {
+    if (accept) await advanceBookingAfterAccept(jobId);
+    else await escalateJob(jobId);
+  }
+  return { data: result };
 });
 app.post('/v1/provider/sync', async (req) => {
   const { commands } = z.object({ commands: z.array(z.object({ clientEventId: z.string(), command: z.string(), jobId: z.string() })) }).parse(req.body);
@@ -765,6 +968,11 @@ app.get('/v1/provider/requests', async (req, reply) => {
   if (!providerId) return fail(reply, 'BAD_REQUEST', 'providerId required');
   return { data: await requestService.incoming(providerId) };
 });
+app.get('/v1/provider/bookings', async (req, reply) => {
+  const providerId = (req.query as { providerId?: string }).providerId;
+  if (!providerId) return fail(reply, 'BAD_REQUEST', 'providerId required');
+  return { data: await bookingService.listForProvider(providerId) };
+});
 app.post('/v1/provider/requests/:id/respond', async (req, reply) => {
   const { accept } = z.object({ accept: z.boolean() }).parse(req.body);
   try { return { data: await requestService.respondOffer((req.params as { id: string }).id, accept) }; }
@@ -1003,6 +1211,10 @@ app.get('/v1/media/:id/file', async (req, reply) => {
 
 const port = Number(process.env.PORT ?? 3000);
 if (process.env.VITEST !== 'true' && process.env.NODE_ENV !== 'test') {
+  // Hybrid dispatch SLA sweep: expire overdue offers and escalate to the next
+  // eligible candidate (or fall through to customer-pick) every 60s.
+  const sweepTimer = setInterval(() => { void dispatchSweep(); }, 60_000);
+  sweepTimer.unref?.();
   app.listen({ port, host: '0.0.0.0' }).then(() => {
     const w = watchupClient as unknown as { enabled: boolean; environment: string; release: string };
     app.log.info(`kendibo-api :${port} (bachs primary, flutterwave fallback)`);

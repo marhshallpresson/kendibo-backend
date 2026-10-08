@@ -105,12 +105,17 @@ export const geoService = {
     const rows = await q<{ is_active: boolean }>(`SELECT is_active FROM geo.journey_status WHERE job_id=$1`, [jobId]);
     return rows[0]?.is_active ?? false;
   },
+  haversineKm(aLat: number, aLng: number, bLat: number, bLng: number): number {
+    const R = 6371; const dLa = ((bLat - aLat) * Math.PI) / 180; const dLo = ((bLng - aLng) * Math.PI) / 180;
+    const s = Math.sin(dLa / 2) ** 2 + Math.cos((aLat * Math.PI) / 180) * Math.cos((bLat * Math.PI) / 180) * Math.sin(dLo / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(s));
+  },
   async etaMinutes(jobId: string, addressId: string): Promise<number> { 
     // Dynamically calculate ETA based on provider's last location and property address
     const providers = await q<any>(`SELECT lat, lng FROM geo.provider_location WHERE provider_id = (SELECT provider_id FROM booking.booking WHERE id = $1 LIMIT 1) ORDER BY created_at DESC LIMIT 1`, [jobId]);
     const address = await q<any>(`SELECT lat, lng FROM property.address WHERE id=$1`, [addressId]);
     if (providers[0] && address[0]) {
-       const d = Math.hypot(Number(providers[0].lat) - Number(address[0].lat), Number(providers[0].lng) - Number(address[0].lng)) * 111;
+       const d = this.haversineKm(Number(providers[0].lat), Number(providers[0].lng), Number(address[0].lat), Number(address[0].lng));
        return Math.round(d * 3 + 5);
     }
     return 15; // default fallback

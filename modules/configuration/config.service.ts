@@ -11,7 +11,13 @@ export const configurationService = {
   },
   async flags(): Promise<Record<string, boolean>> {
     const rows = await q<{ key: string; value: boolean }>(`SELECT key, value FROM configuration.flag`);
-    return Object.fromEntries(rows.map((r) => [r.key, r.value]));
+    const flags = Object.fromEntries(rows.map((r) => [r.key, r.value]));
+    try {
+      const { config } = await import('../../packages/config/env.js');
+      const launchCity = config.GEOLOCK_CITY?.split(',')[0]?.trim().toLowerCase();
+      if (launchCity) (flags as any).launchCity = launchCity;
+    } catch {}
+    return flags;
   },
   async setFlag(k: string, v: boolean, actor: string) {
     const exists = await q(`SELECT 1 FROM configuration.flag WHERE key=$1`, [k]);

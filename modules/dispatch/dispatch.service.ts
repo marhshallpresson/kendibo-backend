@@ -15,6 +15,8 @@ function haversineKm(a: [number, number], b: [number, number]): number {
   return 2 * R * Math.asin(Math.sqrt(s));
 }
 
+const OFFER_SLA_SECONDS = Number(process.env.DISPATCH_OFFER_SLA_SECONDS ?? 180);
+
 export const dispatchService = {
   weights: WEIGHTS,
   async findCandidates(job: { serviceId: string; lat: number; lng: number; radiusKm?: number }): Promise<Candidate[]> {
@@ -45,9 +47,55 @@ export const dispatchService = {
     }
     return out.sort((a, b) => b.score - a.score);
   },
-  async assign(jobId: string, providerId: string) {
-    const offer = await providerService.offer(jobId, providerId);
+  async assign(jobId: string, providerId: string, expiresInSeconds?: number) {
+    const sla = expiresInSeconds ?? OFFER_SLA_SECONDS;
+    const expiresAt = new Date(Date.now() + sla * 1000);
+    const offer = await providerService.offer(jobId, providerId, expiresAt);
     try { observability.track('dispatch.assigned', { jobId, providerId }); } catch { /* fail open */ }
     return offer;
+  },
+  getSlaSeconds() {
+    return OFFER_SLA_SECONDS;
+  },
+  async expireOverdueOffers() {
+    // Two-step (select then update by id) so the relative-time comparison is
+    // evaluated in JS: pg-mem ignores NOW() in an UPDATE's WHERE clause.
+    const rows = await q<{ id: string; expires_at: unknown }>(
+      `SELECT id, expires_at FROM dispatch.assignment WHERE status='offered' AND expires_at IS NOT NULL`,
+    );
+    const now = Date.now();
+    for (const r of rows) {
+      if (new Date(String(r.expires_at)).getTime() < now) {
+        await q(`UPDATE dispatch.assignment SET status='expired' WHERE id=$1`, [r.id]);
+      }
+    }
+  },
+  async getJobCandidatesWithStatus(jobId: string) {
+    const rows = await q<Record<string, unknown>>(`SELECT provider_id, status FROM dispatch.assignment WHERE job_id=$1`, [jobId]);
+    return rows.map(r => ({ providerId: String(r.provider_id), status: String(r.status) }));
+  },
+  async allCandidatesExhausted(jobId: string) {
+    const rows = await q<Record<string, unknown>>(`SELECT 1 FROM dispatch.assignment WHERE job_id=$1 AND status IN ('offered', 'accepted')`, [jobId]);
+    if (rows.length > 0) return false;
+    // Check if there are any candidates at all that were considered - but also if all offered/declined/expired
+    // Another check: any pending offered?
+    const pending = await q<Record<string, unknown>>(`SELECT 1 FROM dispatch.assignment WHERE job_id=$1 AND status='offered'`, [jobId]);
+    if (pending.length > 0) return false;
+    // If there exists at least one assignment that's declined/expired or if we want to know if we've tried all from candidates pool
+    // For the requirement: "After ALL candidates are exhausted (declined/expired/none left)"
+    return true;
+  },
+  async escalateNext(jobId: string, serviceId: string, lat: number, lng: number) {
+    // Get all provider IDs already considered for this job
+    const considered = await q<Record<string, unknown>>(`SELECT provider_id FROM dispatch.assignment WHERE job_id=$1`, [jobId]);
+    const consideredSet = new Set(considered.map(r => String(r.provider_id)));
+    
+    const candidates = await this.findCandidates({ serviceId, lat, lng });
+    const next = candidates.find(c => !consideredSet.has(c.providerId));
+    if (next) {
+      await this.assign(jobId, next.providerId);
+      return true;
+    }
+    return false;
   },
 };

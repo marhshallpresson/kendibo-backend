@@ -27,8 +27,11 @@ const toProvider = async (r: Record<string, unknown>): Promise<Provider> => ({
 
 export const providerService = {
   async onboard(userId: string): Promise<Provider> {
-    const rows = await q<Record<string, unknown>>(`INSERT INTO provider.provider (user_id) VALUES ($1) RETURNING *`, [userId]);
-    return toProvider(rows[0]);
+    const rows = await q<Record<string, unknown>>(
+      `INSERT INTO provider.provider (user_id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING *`, [userId],
+    );
+    if (rows[0]) return toProvider(rows[0]);
+    return (await this.byUserId(userId))!;
   },
   async addSkill(id: string, skill: string) {
     // skill here is a requires_skill tag; link a matching service if one exists
@@ -57,14 +60,27 @@ export const providerService = {
     await q(`INSERT INTO geo.provider_location (provider_id, lat, lng) VALUES ($1,$2,$3)`, [id, lat, lng]);
     return { ok: true, at: new Date().toISOString() };
   },
-  async offer(jobId: string, providerId: string) {
-    const rows = await q<Record<string, unknown>>(
-      `INSERT INTO dispatch.assignment (job_id, provider_id) VALUES ($1,$2) RETURNING *`, [jobId, providerId],
-    ).catch(async () => q<Record<string, unknown>>(
-      `SELECT * FROM dispatch.assignment WHERE job_id=$1 AND provider_id=$2`, [jobId, providerId],
-    ));
+  async offer(jobId: string, providerId: string, expiresAt?: Date) {
+    let rows = await q<Record<string, unknown>>(
+      `INSERT INTO dispatch.assignment (job_id, provider_id, expires_at) VALUES ($1,$2,$3) RETURNING *`, [jobId, providerId, expiresAt ?? null],
+    ).catch(() => undefined);
+    if (!rows || rows.length === 0) {
+      // Already assigned before (auto-dispatch or a prior declined/expired
+      // offer): reactivate it. Look up by provider_id (indexed UUID) and match
+      // the job in JS — pg-mem misses direct TEXT job_id lookups locally.
+      const mine = await q<Record<string, unknown>>(
+        `SELECT * FROM dispatch.assignment WHERE provider_id=$1`, [providerId],
+      );
+      const existing = mine.find((r) => String(r.job_id) === jobId);
+      if (existing) {
+        rows = await q<Record<string, unknown>>(
+          `UPDATE dispatch.assignment SET status='offered', expires_at=$2 WHERE id=$1 RETURNING *`, [existing.id, expiresAt ?? null],
+        );
+      }
+    }
+    if (!rows || rows.length === 0) throw new Error('OFFER_FAILED');
     const r = rows[0];
-    return { id: String(r.id), jobId: String(r.job_id), providerId: String(r.provider_id), status: String(r.status), createdAt: String(r.created_at) };
+    return { id: String(r.id), jobId: String(r.job_id), providerId: String(r.provider_id), status: String(r.status), createdAt: String(r.created_at), expiresAt: r.expires_at ? String(r.expires_at) : null };
   },
   async respondToOffer(offerId: string, accept: boolean) {
     const rows = await q<Record<string, unknown>>(`SELECT * FROM dispatch.assignment WHERE id=$1`, [offerId]);
@@ -91,6 +107,10 @@ export const providerService = {
   },
   async byId(id: string) {
     const rows = await q<Record<string, unknown>>(`SELECT * FROM provider.provider WHERE id=$1`, [id]);
+    return rows[0] ? toProvider(rows[0]) : null;
+  },
+  async byUserId(userId: string) {
+    const rows = await q<Record<string, unknown>>(`SELECT * FROM provider.provider WHERE user_id=$1 LIMIT 1`, [userId]);
     return rows[0] ? toProvider(rows[0]) : null;
   },
   async allOnline(): Promise<Provider[]> {
