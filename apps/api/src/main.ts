@@ -44,12 +44,24 @@ import { maps } from '../../../modules/geo/maps.port.js';
 import { requestService } from '../../../modules/requests/request.service.js';
 import { surfaceFor } from '../../../packages/shared/clients.js';
 void surfaceFor;
+import { Writable } from 'node:stream';
 import { watchupTracing } from '../../../packages/observability/watchup/fastify.js';
 import { watchup as watchupClient } from '../../../packages/observability/watchup.adapter.js';
 
 const PROD = appConfig.NODE_ENV === 'production';
+const logStream = new Writable({
+  write(chunk, enc, cb) {
+    try {
+      const log = JSON.parse(chunk.toString());
+      const lvl = log.level >= 50 ? 'error' : log.level >= 40 ? 'warning' : 'info';
+      if (log.msg) watchupClient.captureLog(lvl, log.msg, log);
+    } catch {}
+    process.stdout.write(chunk, enc, cb);
+  }
+});
+
 const app = Fastify({
-  logger: true,
+  logger: { stream: logStream },
   genReqId: () => `req_${Date.now().toString(36)}${Math.floor(Math.random() * 1e6)}`,
   trustProxy: PROD, // Pxxl edge terminates TLS ahead of the container
 });
@@ -122,7 +134,16 @@ app.get('/', async () => ({
 }));
 app.get('/health/live', async () => ({ ok: true }));
 app.get('/health/ready', async () => ({ ok: true, db: process.env.DATABASE_URL ? 'postgres' : 'local', redis: process.env.REDIS_URL ? 'redis' : 'memory', storage: objectStore.driver }));
-app.get('/health/dependencies', async () => ({ bachs: 'sandbox', flutterwave: 'fallback', maps: 'adapter', kyc: 'adapter', sms: 'termii', email: 'smtp', push: 'fcm', storage: objectStore.driver }));
+app.get('/health/dependencies', async () => {
+  const w = watchupClient as unknown as { enabled: boolean; environment: string; release: string; queueDepth: number };
+  return {
+    bachs: 'sandbox', flutterwave: 'fallback', maps: 'adapter', kyc: 'adapter',
+    sms: 'termii', email: 'smtp', push: 'fcm', storage: objectStore.driver,
+    watchup: w.enabled
+      ? { status: 'enabled', environment: w.environment, release: w.release, queueDepth: w.queueDepth }
+      : { status: 'disabled', hint: 'set WATCHUP_API_KEY and redeploy' },
+  };
+});
 app.get('/v1/admin/monitoring', async (req, reply) => {
   const a = authed(req as never);
   if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
