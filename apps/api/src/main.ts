@@ -78,11 +78,20 @@ void app.register(rateLimit, {
   errorResponseBuilder: () => ({ error: { code: 'RATE_LIMIT', message: 'Too many requests' } }),
 });
 
-// Prod CORS: explicit allowlist only (Pxxl dashboard CORS_ORIGINS + deployed app).
+// Prod CORS: explicit allowlist only (deployed app origins + Pxxl dashboard
+// CORS_ORIGINS). DEFAULT_CORS_ORIGINS is hardcoded so a missing/legacy env
+// value can never block the production web app (every POST preflight fails
+// closed without Access-Control-Allow-Origin).
 // Dev: permissive + Expo running URLs (Metro bundler on localhost/LAN, legacy
 // devtools ports). Native apps (Expo Go, EAS builds) send no Origin header
 // and are always allowed; Expo web sends its https origin (must allowlist).
-const allowedOrigins = appConfig.CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean);
+const DEFAULT_CORS_ORIGINS = [
+  'https://kendibo-app.pxxl.click',
+  'https://kendibo-page.pxxlspace.cv',
+];
+const allowedOrigins = new Set(
+  [...DEFAULT_CORS_ORIGINS, ...appConfig.CORS_ORIGINS.split(',')].map((s) => s.trim()).filter(Boolean),
+);
 const EXPO_DEV_ORIGINS = [
   'http://localhost:8081', 'http://127.0.0.1:8081',
   'http://localhost:19000', 'http://localhost:19001', 'http://localhost:19002',
@@ -96,11 +105,13 @@ function expoOriginAllowed(origin: string): boolean {
 void app.register(cors, {
   origin: (origin, cb) => {
     if (!origin) return cb(null, true); // native (Expo Go / EAS build): no Origin sent
-    if (allowedOrigins.includes(origin)) return cb(null, true);
+    if (allowedOrigins.has(origin)) return cb(null, true);
     // Expo dev surfaces (Metro localhost/LAN, devtools ports) are loopback-only
     // and safe in every environment — demos run Expo web dev against prod.
     if (expoOriginAllowed(origin)) return cb(null, true);
-    return cb(new Error('CORS blocked'), false);
+    // Deny without throwing: an error here turns every preflight into a 500
+    // with no CORS headers (identical client outcome, noisy misleading logs).
+    return cb(null, false);
   },
   methods: ['GET', 'POST', 'PATCH', 'DELETE'],
 });
