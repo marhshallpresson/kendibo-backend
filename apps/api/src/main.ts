@@ -1,6 +1,6 @@
 import 'dotenv/config'; // must stay first: loads .env (gitignored) before any env read
 import { config as appConfig } from '../../../packages/config/env.js'; // validates; refuses prod boot on missing secrets
-import Fastify from 'fastify';
+import Fastify, { FastifyReply } from 'fastify';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import { z } from 'zod';
@@ -717,24 +717,66 @@ app.get('/v1/provider/me', async (req, reply) => {
   const provider = await providerService.byUserId(a.sub);
   return { data: provider };
 });
-app.post('/v1/provider/kyc', async (req) => {
-  const { providerId, nin, bvn } = z.object({ providerId: z.string(), nin: z.string().optional(), bvn: z.string().optional() }).parse(req.body);
-  return { data: await kycService.adapter.verifyIdentity(providerId, { nin, bvn }) };
+// Session-scoped provider identity: never trust a client-supplied providerId.
+// Returns the caller's provider row or sends the failure response and nulls out.
+async function providerActor(req: never, reply: FastifyReply): Promise<{ id: string } | null> {
+  const a = authed(req); if (!a) { void fail(reply, 'UNAUTHENTICATED', 'Login required', 401); return null; }
+  const me = await providerService.byUserId(a.sub);
+  if (!me) { void fail(reply, 'NOT_FOUND', 'Provider profile not found', 404); return null; }
+  return { id: me.id };
+}
+app.post('/v1/provider/kyc', async (req, reply) => {
+  const me = await providerActor(req as never, reply);
+  if (!me) return reply;
+  const { nin, bvn, businessName, skills, bank, location } = z.object({
+    nin: z.string().optional(), bvn: z.string().optional(),
+    businessName: z.string().optional(),
+    skills: z.array(z.string()).optional(),
+    bank: z.object({ accountNumber: z.string(), bankCode: z.string(), bankName: z.string().optional(), accountName: z.string().optional() }).optional(),
+    location: z.object({ lat: z.number(), lng: z.number() }).optional(),
+  }).parse(req.body ?? {});
+  if (businessName || bank || location) {
+    const sets: string[] = []; const vals: unknown[] = [];
+    if (businessName) { sets.push(`business_name=$${vals.length + 1}`); vals.push(businessName); }
+    if (bank) {
+      sets.push(`account_number=$${vals.length + 1}`, `bank_code=$${vals.length + 2}`, `bank_changed_at=now()`);
+      vals.push(bank.accountNumber, bank.bankCode);
+      if (bank.accountName) { sets.push(`account_name=$${vals.length + 1}`); vals.push(bank.accountName); }
+      if (bank.bankName) { sets.push(`bank_name=$${vals.length + 1}`); vals.push(bank.bankName); }
+    }
+    if (location) { sets.push(`lat=$${vals.length + 1}`, `lng=$${vals.length + 2}`); vals.push(location.lat, location.lng); }
+    if (sets.length > 0) await q(`UPDATE provider.provider SET ${sets.join(', ')} WHERE id=$${vals.length + 1}`, [...vals, me.id]);
+  }
+  for (const s of skills ?? []) { try { await providerService.addSkill(me.id, s); } catch { /* unknown skill tag */ } }
+  return { data: await kycService.adapter.verifyIdentity(me.id, { nin, bvn }) };
 });
-app.post('/v1/provider/skills', async (req) => {
-  const { providerId, skill } = z.object({ providerId: z.string(), skill: z.string() }).parse(req.body);
-  return { data: await providerService.addSkill(providerId, skill) };
+app.post('/v1/provider/skills', async (req, reply) => {
+  const me = await providerActor(req as never, reply);
+  if (!me) return reply;
+  const { skill } = z.object({ skill: z.string() }).parse(req.body);
+  return { data: await providerService.addSkill(me.id, skill) };
 });
-app.post('/v1/provider/online', async (req) => {
-  const { providerId, online, lat, lng } = z.object({ providerId: z.string(), online: z.boolean(), lat: z.number().optional(), lng: z.number().optional() }).parse(req.body);
-  return { data: await providerService.setOnline(providerId, online, lat, lng) };
+app.post('/v1/provider/online', async (req, reply) => {
+  const me = await providerActor(req as never, reply);
+  if (!me) return reply;
+  const { online, lat, lng } = z.object({ online: z.boolean(), lat: z.number().optional(), lng: z.number().optional() }).parse(req.body);
+  return { data: await providerService.setOnline(me.id, online, lat, lng) };
 });
-app.get('/v1/provider/offers', async (req) => ({ data: await providerService.offersFor((req.query as { providerId: string }).providerId) }));
+app.get('/v1/provider/offers', async (req, reply) => {
+  const me = await providerActor(req as never, reply);
+  if (!me) return reply;
+  return { data: await providerService.offersFor(me.id) };
+});
 app.post('/v1/provider/offers/:id/respond', async (req, reply) => {
+  const me = await providerActor(req as never, reply);
+  if (!me) return reply;
   const { accept } = z.object({ accept: z.boolean() }).parse(req.body);
+  const offerId = (req.params as { id: string }).id;
+  const owned = await q<{ provider_id: string }>(`SELECT provider_id FROM dispatch.assignment WHERE id=$1`, [offerId]);
+  if (!owned[0] || String(owned[0].provider_id) !== me.id) return fail(reply, 'NOT_FOUND', 'Offer unavailable', 404);
   let result: Record<string, unknown>;
   try {
-    result = (await providerService.respondToOffer((req.params as { id: string }).id, accept)) as Record<string, unknown>;
+    result = (await providerService.respondToOffer(offerId, accept)) as Record<string, unknown>;
   } catch (e: unknown) {
     return fail(reply, 'OFFER_GONE', (e as Error).message, 409);
   }
@@ -745,13 +787,33 @@ app.post('/v1/provider/offers/:id/respond', async (req, reply) => {
   }
   return { data: result };
 });
-app.post('/v1/provider/sync', async (req) => {
+app.post('/v1/provider/sync', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   const { commands } = z.object({ commands: z.array(z.object({ clientEventId: z.string(), command: z.string(), jobId: z.string() })) }).parse(req.body);
   return { data: { results: await providerService.sync(commands) } };
 });
-app.post('/v1/provider/location', async (req) => {
-  const { providerId, lat, lng } = z.object({ providerId: z.string(), lat: z.number(), lng: z.number() }).parse(req.body);
-  return { data: await providerService.updateLocation(providerId, lat, lng) };
+app.post('/v1/provider/location', async (req, reply) => {
+  const me = await providerActor(req as never, reply);
+  if (!me) return reply;
+  const { lat, lng } = z.object({ lat: z.number(), lng: z.number() }).parse(req.body);
+  return { data: await providerService.updateLocation(me.id, lat, lng) };
+});
+// Approved providers visible to customers ("providers in your area" home strip).
+// Only KYC-verified, active accounts are listed; customers see an empty strip
+// until a real approved provider has applied.
+app.get('/v1/providers/approved', async () => {
+  const rows = await q<Record<string, unknown>>(
+    `SELECT p.id, p.rating, p.service_radius_km, p.lat, p.lng, u.name
+       FROM provider.provider p JOIN identity.users u ON u.id = p.user_id
+      WHERE p.kyc_status = 'VERIFIED' AND p.status = 'active'
+      ORDER BY p.rating DESC LIMIT 20`,
+  );
+  return {
+    data: rows.map((r) => ({
+      id: String(r.id), name: String(r.name ?? 'Provider'),
+      rating: Number(r.rating ?? 5), lat: r.lat as number ?? null, lng: r.lng as number ?? null,
+    })),
+  };
 });
 app.get('/v1/dispatch/candidates', async (req) => {
   const q = req.query as { serviceId: string; lat: string; lng: string };
@@ -764,8 +826,22 @@ app.post('/v1/dispatch/assign', async (req, reply) => {
   return { data: await dispatchService.assign(jobId, providerId) };
 });
 app.post('/v1/jobs/:id/transition', async (req, reply) => {
-  const { from, to, actor } = z.object({ from: z.string(), to: z.string(), actor: z.string().optional() }).parse(req.body);
-  try { return await transition((req.params as { id: string }).id, from as JobStatus, to as JobStatus, actor ?? 'system'); }
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const { from: fromParam, to, actor } = z.object({ from: z.string().optional(), to: z.string(), actor: z.string().optional() }).parse(req.body);
+  const jobId = (req.params as { id: string }).id;
+  let from = fromParam as JobStatus | undefined;
+  if (!from) {
+    // Derive the current status from the event log (server-authoritative).
+    // pg-mem misses constant TEXT lookups, so filter recent rows in JS — same
+    // pattern as provider.service offer reactivation.
+    const events = await q<{ job_id: string; to_status: string }>(
+      `SELECT job_id, to_status FROM booking.job_event ORDER BY created_at DESC LIMIT 200`,
+    );
+    const latest = events.find((e) => String(e.job_id) === jobId);
+    if (!latest) return fail(reply, 'NOT_FOUND', 'No job events for this job', 404);
+    from = latest.to_status as JobStatus;
+  }
+  try { return await transition(jobId, from, to as JobStatus, actor ?? 'provider'); }
   catch (e: unknown) { return fail(reply, 'ILLEGAL_TRANSITION', (e as Error).message, 409); }
 });
 app.post('/v1/jobs/:id/settle', async (req) => {
@@ -818,6 +894,32 @@ app.post('/v1/media/upload', async (req, reply) => {
 });
 
 // ---------- payouts / disputes / warranty / reviews ----------
+// Bank reference + account resolution for provider payout onboarding.
+// The list is public reference data (cached for 24h; stale beats broken);
+// name resolution requires a session so the PSP endpoint stays off the open web.
+let banksCache: { at: number; banks: { name: string; code: string }[] } | null = null;
+app.get('/v1/banks', async (req, reply) => {
+  const country = String((req.query as { country?: string }).country ?? 'NG').toUpperCase().slice(0, 2);
+  if (banksCache && banksCache.at > Date.now() - 24 * 60 * 60 * 1000) return { data: banksCache.banks };
+  try {
+    const banks = await payments.listBanks(country);
+    if (banks.length > 0) banksCache = { at: Date.now(), banks };
+    return { data: banks };
+  } catch (e: unknown) {
+    if (banksCache) return { data: banksCache.banks };
+    return fail(reply, 'BANKS_UNAVAILABLE', (e as Error).message, 502);
+  }
+});
+app.post('/v1/payouts/resolve-account', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const { accountNumber, bankCode } = z.object({
+    accountNumber: z.string().regex(/^\d{10}$/, 'Account number must be 10 digits'),
+    bankCode: z.string().min(1),
+  }).parse(req.body);
+  const r = await payments.verifyBankAccount(accountNumber, bankCode);
+  if (!r.valid || !r.accountName) return fail(reply, 'ACCOUNT_UNRESOLVED', 'Account number not recognised for this bank', 422);
+  return { data: { accountName: r.accountName, valid: true } };
+});
 app.post('/v1/payouts', async (req, reply) => {
   const a = authed(req as never);
   if (!a || !authorize('FINANCE', 'payout:approve')) return fail(reply, 'FORBIDDEN', 'Finance approval required', 403);
@@ -1242,9 +1344,11 @@ app.get('/v1/me/sessions', async (req, reply) => {
 });
 // Throttled batch ingest from the Android tracker hook.
 app.post('/v1/provider/location/batch', async (req, reply) => {
+  const me = await providerActor(req as never, reply);
+  if (!me) return reply;
   try {
-    const { providerId, points } = z.object({ providerId: z.string(), points: z.array(z.object({ lat: z.number(), lng: z.number(), at: z.string() })) }).parse(req.body);
-    return { data: await geoService.ingestBatch(providerId, points) };
+    const { points } = z.object({ points: z.array(z.object({ lat: z.number(), lng: z.number(), at: z.string() })) }).parse(req.body);
+    return { data: await geoService.ingestBatch(me.id, points) };
   } catch (e: unknown) { return fail(reply, 'BAD_BATCH', (e as Error).message); }
 });
 // Media ingest writes through the object store (quarantine -> promote).
@@ -1260,6 +1364,10 @@ app.post('/v1/media/:id/ingest', async (req, reply) => {
 // Signed file delivery. Local driver serves bytes; s3 driver redirects to the
 // bucket-signed URL (Pxxl CDN Storage / R2 / MinIO).
 app.get('/v1/media/:id/file', async (req, reply) => {
+  // Signed media is embedded cross-origin (web <img> from the app origin);
+  // helmet's default CORP same-origin makes Chromium block the render (the
+  // request succeeds with 200 but the image never paints), so opt this route out.
+  void reply.header('Cross-Origin-Resource-Policy', 'cross-origin');
   const q = req.query as { exp?: string; sig?: string };
   const asset = await mediaService.get((req.params as { id: string }).id);
   if (!asset || asset.status !== 'clean' || !asset.url) return fail(reply, 'NOT_FOUND', 'Asset unavailable', 404);

@@ -77,6 +77,13 @@ export class PaymentService {
     return this.adapters[preferred].verifyBankAccount({ accountNumber, bankCode });
   }
 
+  /** Supported payout banks for a country (PSP reference data). */
+  async listBanks(country = 'NG', preferred: PSP = 'bachs') {
+    const adapter = this.adapters[preferred];
+    if (!adapter.listBanks) throw new Error('BANKS_UNSUPPORTED');
+    return adapter.listBanks(country);
+  }
+
   /** Webhook handler core: persist raw event, verify signature, then server-side verify before ledger. */
   async handleWebhook(psp: PSP, rawBody: Buffer, headers: Record<string, string | undefined>): Promise<{ ok: boolean; verified?: VerifiedPayment; notFound?: boolean; amountMismatch?: boolean }> {
     const adapter = this.adapters[psp];

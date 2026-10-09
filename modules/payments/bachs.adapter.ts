@@ -129,13 +129,28 @@ export class BachsAdapter implements PaymentPort {
   }
 
   async verifyBankAccount(input: { accountNumber: string; bankCode: string }) {
-    const json = await bachsFetch('/v1/resolve-account?account_number=' + input.accountNumber + '&bank_code=' + input.bankCode, {
-      method: 'GET',
-    });
-    return {
-      accountName: json.account_name,
-      valid: !!json.account_name,
-    };
+    // Documented endpoint: POST /v1/misc/bank-accounts/resolve.
+    // (The previous GET /v1/resolve-account path was never in the Bachs API —
+    // every call 404'd, which is why payout onboarding never resolved names.)
+    try {
+      const json = await bachsFetch('/v1/misc/bank-accounts/resolve', {
+        method: 'POST',
+        body: JSON.stringify({ account_number: input.accountNumber, bank_code: input.bankCode }),
+      });
+      const name = json.account_name ?? json.data?.account_name ?? json.accountName;
+      return { accountName: name ?? '', valid: Boolean(name) };
+    } catch {
+      return { accountName: '', valid: false };
+    }
+  }
+
+  /** Supported payout banks for a country (reference data; cache upstream). */
+  async listBanks(country = 'NG'): Promise<{ name: string; code: string }[]> {
+    const json = await bachsFetch(`/v1/reference/banks?country=${encodeURIComponent(country)}`, { method: 'GET' });
+    const banks = json.banks ?? json.items ?? json.data ?? [];
+    return (Array.isArray(banks) ? banks : [])
+      .map((b: { name?: string; code?: string }) => ({ name: String(b.name ?? ''), code: String(b.code ?? '') }))
+      .filter((b: { name: string; code: string }) => b.name && b.code);
   }
 
   verifyWebhookSignature(rawBody: Buffer | string, headers: Record<string, string | string[] | undefined>): boolean {
