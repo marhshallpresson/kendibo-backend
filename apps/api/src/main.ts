@@ -926,7 +926,8 @@ app.post('/v1/service-requests', async (req, reply) => {
   const idem = req.headers['idempotency-key'];
   if (typeof idem !== 'string') return fail(reply, 'IDEMPOTENCY_REQUIRED', 'Idempotency-Key header required');
   const body = z.object({
-    serviceId: z.string().optional(), title: z.string(), details: z.string().optional(),
+    serviceId: z.string().optional(), categoryId: z.string().optional(),
+    title: z.string(), details: z.string().optional(),
     urgency: z.enum(['emergency', 'today', 'this_week']).optional(),
     addressId: z.string().optional(), lat: z.number().optional(), lng: z.number().optional(),
     contactName: z.string().optional(), contactPhone: z.string().optional(), contactEmail: z.string().optional(),
@@ -940,19 +941,31 @@ app.get('/v1/service-requests', async (req, reply) => {
   return { data: await requestService.list(a.sub) };
 });
 app.get('/v1/service-requests/:id', async (req, reply) => {
-  const a = authed(req as never);
-  try { return { data: await requestService.get((req.params as { id: string }).id, a?.sub) }; }
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  try { return { data: await requestService.get((req.params as { id: string }).id, a.sub) }; }
   catch { return fail(reply, 'FORBIDDEN', 'Not your request', 403); }
 });
-app.get('/v1/service-requests/:id/matches', async (req) => {
-  return { data: await requestService.matches((req.params as { id: string }).id) };
+app.get('/v1/service-requests/:id/matches', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const id = (req.params as { id: string }).id;
+  try {
+    const r = await requestService.get(id, a.sub);
+    if (!r) return fail(reply, 'NOT_FOUND', 'Request not found', 404);
+    return { data: await requestService.matches(id) };
+  } catch { return fail(reply, 'FORBIDDEN', 'Not your request', 403); }
 });
 app.post('/v1/service-requests/:id/broadcast', async (req, reply) => {
-  const a = authed(req as never);
-  if (!a || !authorize('DISPATCHER', 'booking:override')) return fail(reply, 'FORBIDDEN', 'Dispatcher required', 403);
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const id = (req.params as { id: string }).id;
+  // NOTE: authorize('ROLE', perm) is a no-op globally (main.ts hard-codes the
+  // role literal, so it always returns true). Owner check is enforced here.
+  try {
+    const r = await requestService.get(id, a.sub);
+    if (!r) return fail(reply, 'NOT_FOUND', 'Request not found', 404);
+  } catch { return fail(reply, 'FORBIDDEN', 'Not your request', 403); }
   const { limit } = z.object({ limit: z.number().optional() }).parse(req.body ?? {});
-  auditService.log(a.sub, `request.${(req.params as { id: string }).id}.broadcast`);
-  return { data: await requestService.broadcast((req.params as { id: string }).id, limit ?? 5) };
+  auditService.log(a.sub, `request.${id}.broadcast`);
+  return { data: await requestService.broadcast(id, limit ?? 5) };
 });
 app.post('/v1/service-requests/:id/cancel', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
@@ -962,7 +975,11 @@ app.post('/v1/service-requests/:id/cancel', async (req, reply) => {
 app.post('/v1/service-requests/:id/convert', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   try { return { data: await requestService.convert((req.params as { id: string }).id, a.sub) }; }
-  catch (e: unknown) { return fail(reply, 'CONVERT_BLOCKED', (e as Error).message, 409); }
+  catch (e: unknown) {
+    const msg = (e as Error).message;
+    if (msg === 'FORBIDDEN') return fail(reply, 'FORBIDDEN', 'Not your request', 403);
+    return fail(reply, 'CONVERT_BLOCKED', msg, 409);
+  }
 });
 app.get('/v1/provider/requests', async (req, reply) => {
   const providerId = (req.query as { providerId?: string }).providerId;
@@ -976,7 +993,17 @@ app.get('/v1/provider/bookings', async (req, reply) => {
 });
 app.post('/v1/provider/requests/:id/respond', async (req, reply) => {
   const { accept } = z.object({ accept: z.boolean() }).parse(req.body);
-  try { return { data: await requestService.respondOffer((req.params as { id: string }).id, accept) }; }
+  try {
+    const result = (await requestService.respondOffer((req.params as { id: string }).id, accept)) as Record<string, unknown>;
+    // On accept the service links a booking; advance it so tracking/candidate
+    // logic reflects the winning provider (REQUESTED -> MATCHING -> ... -> ACCEPTED).
+    if (accept && result.bookingId) {
+      const bookingId = String(result.bookingId);
+      await bookingService.setStatus(bookingId, 'MATCHING', 'system').catch((e) => observability.captureException(e));
+      await advanceBookingAfterAccept(bookingId);
+    }
+    return { data: result };
+  }
   catch (e: unknown) { return fail(reply, 'OFFER_GONE', (e as Error).message, 409); }
 });
 // ---- USER APP: warranty claims + property history/reminders/recurring ----

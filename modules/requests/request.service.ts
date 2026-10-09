@@ -13,14 +13,17 @@ import { emit } from '../../packages/observability/emit.js';
 
 export type RequestStatus = 'SUBMITTED' | 'MATCHING' | 'OFFERED' | 'ACCEPTED' | 'BOOKED' | 'CANCELLED' | 'EXPIRED';
 export interface ServiceRequest {
-  id: string; userId: string; serviceId: string | null; title: string; details: string;
+  id: string; userId: string; serviceId: string | null; categoryId: string | null;
+  title: string; details: string;
   urgency: string; addressId: string | null; lat: number | null; lng: number | null;
   contactName: string | null; contactPhone: string | null; contactEmail: string | null;
   notes: string | null; smsUpdates: boolean; scheduledDate: string | null; timeWindow: string | null;
   status: RequestStatus; bookingId: string | null; createdAt: string;
 }
+interface MatchCandidate { providerId: string; score: number; distanceKm: number }
 const toReq = (r: Record<string, unknown>): ServiceRequest => ({
   id: String(r.id), userId: String(r.user_id), serviceId: r.service_id ? String(r.service_id) : null,
+  categoryId: r.category_id ? String(r.category_id) : null,
   title: String(r.title), details: String(r.details ?? ''), urgency: String(r.urgency),
   addressId: r.address_id ? String(r.address_id) : null,
   lat: r.lat as number ?? null, lng: r.lng as number ?? null,
@@ -31,9 +34,38 @@ const toReq = (r: Record<string, unknown>): ServiceRequest => ({
   bookingId: r.booking_id ? String(r.booking_id) : null, createdAt: String(r.created_at),
 });
 
+/** Default catalog service for a category — prefers a fixed-price booking so an
+ *  accepted request can mint a booking; quote-only categories fall through. */
+async function defaultServiceFor(categoryId: string | null): Promise<string | null> {
+  if (!categoryId) return null;
+  const svcs = await q<Record<string, unknown>>(
+    `SELECT id, booking_type FROM catalog.service WHERE category_id=$1 AND active`, [categoryId],
+  );
+  if (svcs.length === 0) return null;
+  const fixed = svcs.find((s) => String(s.booking_type) !== 'quote');
+  return String((fixed ?? svcs[0]).id);
+}
+
+/** Record the winning provider as an accepted assignment for the job so
+ *  /v1/bookings/:id/tracking resolves a provider and the job can advance.
+ *  pg-mem misses direct TEXT job_id lookups, so scan by indexed provider_id. */
+async function assignAccepted(jobId: string, providerId: string): Promise<void> {
+  const mine = await q<Record<string, unknown>>(
+    `SELECT id, job_id, status FROM dispatch.assignment WHERE provider_id=$1`, [providerId],
+  );
+  const existing = mine.find((r) => String(r.job_id) === jobId);
+  if (existing) {
+    if (String(existing.status) !== 'accepted') {
+      await q(`UPDATE dispatch.assignment SET status='accepted' WHERE id=$1`, [existing.id]);
+    }
+    return;
+  }
+  await q(`INSERT INTO dispatch.assignment (job_id, provider_id, status) VALUES ($1,$2,'accepted')`, [jobId, providerId]);
+}
+
 export const requestService = {
   async create(userId: string, input: {
-    serviceId?: string; title: string; details?: string; urgency?: string;
+    serviceId?: string; categoryId?: string; title: string; details?: string; urgency?: string;
     addressId?: string; lat?: number; lng?: number;
     contactName?: string; contactPhone?: string; contactEmail?: string; notes?: string;
     smsUpdates?: boolean; scheduledDate?: string; timeWindow?: string; idempotencyKey: string;
@@ -42,18 +74,43 @@ export const requestService = {
       `SELECT * FROM booking.service_request WHERE user_id=$1 AND idempotency_key=$2`, [userId, input.idempotencyKey],
     );
     if (prior[0]) return toReq(prior[0]);
+    // Coordinates may arrive directly or be recovered from the selected address
+    // (the customer app only sends addressId). Without them dispatch cannot rank.
+    let lat = input.lat ?? null;
+    let lng = input.lng ?? null;
+    if ((lat == null || lng == null) && input.addressId) {
+      const addr = await q<Record<string, unknown>>(`SELECT lat, lng FROM property.address WHERE id=$1`, [input.addressId]);
+      if (addr[0]) {
+        if (addr[0].lat != null) lat = Number(addr[0].lat);
+        if (addr[0].lng != null) lng = Number(addr[0].lng);
+      }
+    }
     const rows = await q<Record<string, unknown>>(
       `INSERT INTO booking.service_request
-        (user_id, service_id, title, details, urgency, address_id, lat, lng, contact_name, contact_phone, contact_email, notes, sms_updates, scheduled_date, time_window, idempotency_key)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
-      [userId, input.serviceId ?? null, input.title, input.details ?? '', input.urgency ?? 'this_week',
-       input.addressId ?? null, input.lat ?? null, input.lng ?? null,
+        (user_id, service_id, category_id, title, details, urgency, address_id, lat, lng, contact_name, contact_phone, contact_email, notes, sms_updates, scheduled_date, time_window, idempotency_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+      [userId, input.serviceId ?? null, input.categoryId ?? null, input.title, input.details ?? '', input.urgency ?? 'this_week',
+       input.addressId ?? null, lat, lng,
        input.contactName ?? null, input.contactPhone ?? null, input.contactEmail ?? null,
        input.notes ?? null, input.smsUpdates ?? true, input.scheduledDate ?? null, input.timeWindow ?? null,
        input.idempotencyKey],
     );
     const req = toReq(rows[0]);
     await q(`INSERT INTO outbox_event (topic, payload) VALUES ('request.submitted',$1)`, [JSON.stringify({ requestId: req.id })]);
+    // Auto-match: only when we actually have coordinates AND candidates, so a
+    // request with no reachable providers is not falsely marked OFFERED.
+    if (req.lat != null && req.lng != null) {
+      try {
+        const ranked = await this.candidatesFor(req);
+        if (ranked.candidates.length > 0) {
+          await this.broadcast(req.id);
+          const fresh = await q<Record<string, unknown>>(`SELECT * FROM booking.service_request WHERE id=$1`, [req.id]);
+          return toReq(fresh[0] ?? rows[0]);
+        }
+      } catch (e) {
+        emit('request.automatch_failed', { requestId: req.id, error: String((e as Error).message) });
+      }
+    }
     return req;
   },
 
@@ -73,15 +130,11 @@ export const requestService = {
   },
 
   /** Analyze + rank: catalog skill filter when a service is attached, else zone/online/KYC + distance. */
-  async matches(id: string) {
-    const rows = await q<Record<string, unknown>>(`SELECT * FROM booking.service_request WHERE id=$1`, [id]);
-    if (!rows[0]) throw new Error('NOT_FOUND');
-    const r = toReq(rows[0]);
-    await q(`UPDATE booking.service_request SET status='MATCHING' WHERE id=$1 AND status='SUBMITTED'`, [id]);
-    if (r.lat == null || r.lng == null) return { requestId: id, candidates: [], note: 'NO_LOCATION' };
+  async candidatesFor(r: ServiceRequest): Promise<{ requestId: string; candidates: MatchCandidate[]; note: string }> {
+    if (r.lat == null || r.lng == null) return { requestId: r.id, candidates: [], note: 'NO_LOCATION' };
     if (r.serviceId) {
       const cands = await dispatchService.findCandidates({ serviceId: r.serviceId, lat: r.lat, lng: r.lng });
-      return { requestId: id, candidates: cands.slice(0, 10), note: 'SKILL_MATCHED' };
+      return { requestId: r.id, candidates: cands.slice(0, 10), note: 'SKILL_MATCHED' };
     }
     const { providerService } = await import('../providers/provider.service.js');
     const online = await providerService.allOnline();
@@ -94,7 +147,15 @@ export const requestService = {
       .filter((c) => c.distanceKm <= 15)
       .sort((a, b) => b.score - a.score)
       .slice(0, 10);
-    return { requestId: id, candidates: scored, note: 'PROXIMITY_MATCHED' };
+    return { requestId: r.id, candidates: scored, note: 'PROXIMITY_MATCHED' };
+  },
+
+  async matches(id: string) {
+    const rows = await q<Record<string, unknown>>(`SELECT * FROM booking.service_request WHERE id=$1`, [id]);
+    if (!rows[0]) throw new Error('NOT_FOUND');
+    const r = toReq(rows[0]);
+    await q(`UPDATE booking.service_request SET status='MATCHING' WHERE id=$1 AND status='SUBMITTED'`, [id]);
+    return this.candidatesFor(r);
   },
 
   /** Broadcast to top-N candidates: offer rows + push each provider. */
@@ -131,7 +192,9 @@ export const requestService = {
     return rows;
   },
 
-  /** First qualified accept wins; losers see OFFER_TAKEN. */
+  /** First qualified accept wins; losers see OFFER_TAKEN. On accept we also
+   *  mint (or link) the booking so the customer app can proceed to payment and
+   *  tracking without a second round-trip. */
   async respondOffer(offerId: string, accept: boolean) {
     const rows = await q<Record<string, unknown>>(`SELECT * FROM booking.request_offer WHERE id=$1`, [offerId]);
     const o = rows[0];
@@ -151,17 +214,54 @@ export const requestService = {
     await q(`INSERT INTO outbox_event (topic, payload) VALUES ('request.accepted',$1)`,
       [JSON.stringify({ requestId: String(o.request_id), providerId: String(o.provider_id) })]);
     emit('request.accepted', { requestId: String(o.request_id), providerId: String(o.provider_id) });
-    return { id: offerId, status: 'accepted', requestId: String(o.request_id) };
+
+    const requestId = String(o.request_id);
+    const providerId = String(o.provider_id);
+    const req = toReq(took[0]);
+    // Resolve a catalog service: prefer the explicit one, else a category default.
+    const serviceId = req.serviceId ?? await defaultServiceFor(req.categoryId);
+    if (!serviceId) return { id: offerId, status: 'accepted', requestId };
+    // bookingService.create only prices fixed-price services; quote-mode services
+    // stay ACCEPTED (the quote flow picks up from here) instead of crashing accept.
+    let booking: { id: string } | null = null;
+    try {
+      booking = await bookingService.create(req.userId, {
+        serviceId, addressId: req.addressId ?? '',
+        scheduledAt: req.scheduledDate ?? new Date().toISOString(),
+        urgency: req.urgency, customerNotes: req.notes ?? undefined,
+        idempotencyKey: `req_${requestId}`,
+      });
+    } catch (e) {
+      const msg = (e as Error).message;
+      if (!['QUOTE_REQUIRED', 'SERVICE_NOT_FOUND', 'AMOUNT_MUST_BE_POSITIVE'].includes(msg)) throw e;
+      emit('request.accept_booking_skipped', { requestId, serviceId, reason: msg });
+      return { id: offerId, status: 'accepted', requestId };
+    }
+    await assignAccepted(booking.id, providerId);
+    await q(`UPDATE booking.service_request SET status='BOOKED', booking_id=$2 WHERE id=$1`, [requestId, booking.id]);
+    await q(`INSERT INTO outbox_event (topic, payload) VALUES ('request.booked',$1)`,
+      [JSON.stringify({ requestId, bookingId: booking.id, providerId })]);
+    emit('request.booked', { requestId, bookingId: booking.id, providerId });
+    return { id: offerId, status: 'accepted', requestId, bookingId: booking.id };
   },
 
-  /** Convert an accepted request into a booking (needs a catalog service). */
+  /** Convert an accepted request into a booking (needs a catalog service).
+   *  Idempotent: an already-booked request returns its linked booking. */
   async convert(id: string, actor: string) {
     const rows = await q<Record<string, unknown>>(`SELECT * FROM booking.service_request WHERE id=$1`, [id]);
     const r = rows[0] ? toReq(rows[0]) : null;
-    if (!r || r.status !== 'ACCEPTED') throw new Error('REQUEST_NOT_ACCEPTED');
-    if (!r.serviceId) throw new Error('NEEDS_SERVICE_QUOTE');
+    if (!r) throw new Error('REQUEST_NOT_ACCEPTED');
+    if (r.userId !== actor) throw new Error('FORBIDDEN');
+    if (r.status === 'BOOKED' && r.bookingId) {
+      const existing = await bookingService.get(r.bookingId, actor);
+      if (existing) return { request: r, booking: existing };
+    }
+    if (r.status !== 'ACCEPTED') throw new Error('REQUEST_NOT_ACCEPTED');
+    if (!r.serviceId && !r.categoryId) throw new Error('NEEDS_SERVICE_QUOTE');
+    const serviceId = r.serviceId ?? await defaultServiceFor(r.categoryId);
+    if (!serviceId) throw new Error('NEEDS_SERVICE_QUOTE');
     const booking = await bookingService.create(r.userId, {
-      serviceId: r.serviceId, addressId: r.addressId ?? '',
+      serviceId, addressId: r.addressId ?? '',
       scheduledAt: r.scheduledDate ?? new Date().toISOString(), idempotencyKey: `req_${id}`,
     });
     await q(`UPDATE booking.service_request SET status='BOOKED', booking_id=$2 WHERE id=$1`, [id, booking.id]);

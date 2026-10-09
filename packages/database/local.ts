@@ -65,7 +65,8 @@ export function localDb(): IMemoryDb {
   run('015_provider_one_per_user.sql');
   run('016_dispatch_sla.sql');
   run('017_purge_demo_users.sql');
-  console.log('[localdb] pg-mem ready (001-017)');
+  run('018_service_request_category.sql');
+  console.log('[localdb] pg-mem ready (001-018)');
   return mem;
 }
 
