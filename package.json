@@ -7,7 +7,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
     "start:api": "node dist/apps/api/src/main.js",
     "dev:api": "tsx watch apps/api/src/main.ts",
     "typecheck": "tsc --noEmit",
