@@ -61,20 +61,30 @@ async function createBooking(userId: string) {
 }
 
 describe('booking payments are server-priced', () => {
-  it('rejects an amount that does not match the booking price snapshot', async () => {
+  it('charges the server price even when the client sends its own total', async () => {
     const owner = await testUser();
     const booking = await createBooking(owner);
-    const wrong = String(BigInt(booking.priceKobo) + 1n);
+    // A stale app bundle computes subtotal + VAT + flat fee — never trusted.
+    const clientTotal = String(BigInt(booking.priceKobo) - 50000n);
 
     const res = await app.inject({
       method: 'POST',
       url: `/v1/bookings/${booking.id}/payments`,
       headers: { ...auth(owner), ...idem() },
-      payload: { amountKobo: wrong, email: 'buyer@kendibo.test' },
+      payload: { amountKobo: clientTotal, email: 'buyer@kendibo.test' },
     });
-    assert.equal(res.statusCode, 400);
-    assert.equal(res.json().error.code, 'AMOUNT_MISMATCH');
-    assert.match(res.json().error.message, new RegExp(String(booking.priceKobo)));
+    assert.equal(res.statusCode, 200, 'a mismatched client total must not strand the payment');
+    assert.ok(res.json().data.checkoutUrl, 'hosted checkout url is returned');
+
+    // pg-mem misses indexed TEXT lookups; scan + filter in JS.
+    const rows = await q<Record<string, unknown>>(`SELECT reference, amount_kobo FROM payment.payment`);
+    const intent = rows.find((r) => String(r.reference).startsWith(`bk_${booking.id}_`));
+    assert.ok(intent, 'a payment intent was recorded');
+    assert.equal(
+      String(intent!.amount_kobo),
+      String(booking.priceKobo),
+      'the recorded charge is the booking price snapshot, not the client total',
+    );
   });
 
   it('accepts the server-priced amount and returns a Bachs checkout session', async () => {

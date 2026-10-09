@@ -569,9 +569,11 @@ app.post('/v1/quotes/:bookingId/accept', async (req) => {
 
 // ---------- payments (Bachs primary, Flutterwave fallback) ----------
 // Server-authoritative charge amount: the accepted quote total when one exists
-// (quote flow), otherwise the frozen booking price snapshot. The client may only
-// CONFIRM this number — accepting a client-computed total would let the amount
-// charged drift away from what the pricing engine recorded on the booking.
+// (quote flow), otherwise the frozen booking price snapshot. The client amount
+// is advisory ONLY — a stale bundle may still send its own math, and charging
+// whatever it asked for would let the amount drift from booking.price_kobo.
+// Mismatches are charged at the server price and logged, never rejected: a
+// rejected payment strands customers on older app bundles that cannot deploy.
 async function expectedChargeKobo(bookingId: string, booking: { priceKobo: string }): Promise<bigint> {
   try {
     const rows = await q<Record<string, unknown>>(
@@ -594,12 +596,14 @@ app.post('/v1/bookings/:id/payments', async (req, reply) => {
   if (!booking) return fail(reply, 'BOOKING_NOT_FOUND', 'Booking not found', 404);
   if (booking.userId !== a.sub) return fail(reply, 'FORBIDDEN', 'Not your booking', 403);
   const expected = await expectedChargeKobo(bookingId, booking);
-  let sent: bigint;
-  try { sent = BigInt(parsed.data.amountKobo); } catch { return fail(reply, 'BAD_AMOUNT', 'amountKobo must be an integer kobo amount'); }
-  if (sent !== expected) return fail(reply, 'AMOUNT_MISMATCH', `Amount must be ${expected} kobo`);
+  let sent: bigint | null = null;
+  try { sent = BigInt(parsed.data.amountKobo); } catch { sent = null; }
+  if (sent !== null && sent !== expected) {
+    observability.captureMessage?.(`payment.amount_mismatch booking=${bookingId} client=${sent} server=${expected}`);
+  }
   try {
     const session = await payments.createCheckout({
-      bookingId, amountKobo: sent,
+      bookingId, amountKobo: expected,
       customerEmail: parsed.data.email, reference: `bk_${bookingId}_${idem.slice(0, 24)}`, idempotencyKey: idem,
     });
     observability.track('booking.payment_initiated', { psp: session.psp });
