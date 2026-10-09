@@ -174,23 +174,24 @@ export const identityService = {
     if (!idToken || idToken.length < 20 || idToken.split('.').length !== 3) throw new Error('BAD_GOOGLE_TOKEN');
     const res = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`);
     if (!res.ok) throw new Error('BAD_GOOGLE_TOKEN');
-    const claims = (await res.json()) as { aud?: string; exp?: string; email?: string; email_verified?: string; sub?: string; name?: string };
+    const claims = (await res.json()) as { aud?: string; exp?: string; email?: string; email_verified?: string; sub?: string; name?: string; picture?: string };
     const allowed = (process.env.GOOGLE_CLIENT_IDS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
     if (allowed.length > 0 && !allowed.includes(String(claims.aud ?? ''))) throw new Error('BAD_GOOGLE_AUDIENCE');
     if (Number(claims.exp ?? 0) * 1000 < Date.now()) throw new Error('GOOGLE_TOKEN_EXPIRED');
     if (claims.email_verified !== 'true' || !claims.email || !claims.sub) throw new Error('GOOGLE_UNVERIFIED');
     const email = String(claims.email).toLowerCase();
+    const picture = claims.picture ? String(claims.picture).slice(0, 500) : null;
     let rows = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE google_sub=$1`, [String(claims.sub)]);
     let isNew = false;
     if (!rows[0]) {
       const byEmail = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE email=$1`, [email]);
       if (byEmail[0]) {
-        await q(`UPDATE identity.users SET google_sub=$2 WHERE id=$1`, [String(byEmail[0].id), String(claims.sub)]);
+        await q(`UPDATE identity.users SET google_sub=$2, profile_image=COALESCE(profile_image,$3) WHERE id=$1`, [String(byEmail[0].id), String(claims.sub), picture]);
         rows = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE id=$1`, [String(byEmail[0].id)]);
       } else {
         const ins = await q<Record<string, unknown>>(
-          `INSERT INTO identity.users (email, name, google_sub) VALUES ($1,$2,$3) RETURNING *`,
-          [email, String((claims as { name?: string }).name ?? email.split('@')[0]).slice(0, 80), String(claims.sub)],
+          `INSERT INTO identity.users (email, name, google_sub, profile_image) VALUES ($1,$2,$3,$4) RETURNING *`,
+          [email, String((claims as { name?: string }).name ?? email.split('@')[0]).slice(0, 80), String(claims.sub), picture],
         );
         rows = ins;
         isNew = true;

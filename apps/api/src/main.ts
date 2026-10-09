@@ -261,6 +261,20 @@ app.post('/v1/auth/google', async (req, reply) => {
     return fail(reply, 'GOOGLE_FAILED', 'Google sign-in unavailable. Try OTP instead.', 502, true);
   }
 });
+// Role selection after Google sign-up ("You're joining as…"). New Google
+// accounts default to CUSTOMER (column default); this upgrades to PROVIDER
+// or confirms customer. PROVIDER → CUSTOMER is one-way immutable.
+app.post('/v1/auth/role', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const parsed = z.object({ role: z.enum(['customer', 'provider']) }).safeParse(req.body);
+  if (!parsed.success) return fail(reply, 'BAD_ROLE', 'Role must be customer or provider');
+  const target = parsed.data.role.toUpperCase();
+  const rows = await q<{ role: string }>(`SELECT role FROM identity.users WHERE id=$1`, [a.sub]);
+  const current = String(rows[0]?.role ?? 'CUSTOMER');
+  if (current === 'PROVIDER' && target === 'CUSTOMER') return fail(reply, 'ROLE_IMMUTABLE', 'Provider accounts cannot become customers', 403);
+  if (current !== target) await q(`UPDATE identity.users SET role=$2 WHERE id=$1`, [a.sub, target]);
+  return { data: { role: target } };
+});
 app.post('/v1/auth/refresh', async (req) => {
   const { refresh } = z.object({ refresh: z.string() }).parse(req.body);
   const r = await identityService.refresh(refresh);

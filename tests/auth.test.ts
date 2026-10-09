@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { randomUUID } from 'node:crypto';
@@ -83,5 +84,47 @@ describe('unified login (account check + device history)', () => {
     assert.equal(me?.role, 'provider');
     const prov = await q(`SELECT id FROM provider.provider WHERE user_id=$1`, [session.user.id]);
     assert.equal(prov.length, 1);
+  });
+});
+
+describe('POST /v1/auth/role (post-signup role pick)', () => {
+  it('rejects unauthenticated requests', async () => {
+    const r = await app.inject({ method: 'POST', url: '/v1/auth/role', payload: { role: 'provider' } });
+    assert.equal(r.statusCode, 401);
+  });
+
+  it('rejects invalid role values', async () => {
+    const u = await realUser(`role-${randomUUID()}@kendibo.local`);
+    const r = await app.inject({ method: 'POST', url: '/v1/auth/role', payload: { role: 'admin' } , headers: auth(u) });
+    assert.equal(r.statusCode, 400);
+  });
+
+  it('upgrades CUSTOMER → PROVIDER and reports uppercase role', async () => {
+    const u = await realUser(`role-${randomUUID()}@kendibo.local`);
+    const before = await q<{ role: string }>(`SELECT role FROM identity.users WHERE id=$1`, [u]);
+    assert.equal(String(before[0]?.role), 'CUSTOMER');
+    const r = await app.inject({ method: 'POST', url: '/v1/auth/role', payload: { role: 'provider' }, headers: auth(u) });
+    assert.equal(r.statusCode, 200);
+    assert.equal(r.json().data.role, 'PROVIDER');
+    const after = await q<{ role: string }>(`SELECT role FROM identity.users WHERE id=$1`, [u]);
+    assert.equal(String(after[0]?.role), 'PROVIDER');
+  });
+
+  it('keeps CUSTOMER on repeat customer choice (no-op)', async () => {
+    const u = await realUser(`role-${randomUUID()}@kendibo.local`);
+    const r = await app.inject({ method: 'POST', url: '/v1/auth/role', payload: { role: 'customer' }, headers: auth(u) });
+    assert.equal(r.statusCode, 200);
+    assert.equal(r.json().data.role, 'CUSTOMER');
+    const after = await q<{ role: string }>(`SELECT role FROM identity.users WHERE id=$1`, [u]);
+    assert.equal(String(after[0]?.role), 'CUSTOMER');
+  });
+
+  it('rejects PROVIDER → CUSTOMER with ROLE_IMMUTABLE', async () => {
+    const u = await realUser(`role-${randomUUID()}@kendibo.local`);
+    await q(`UPDATE identity.users SET role='PROVIDER' WHERE id=$1`, [u]);
+    const r = await app.inject({ method: 'POST', url: '/v1/auth/role', payload: { role: 'customer' }, headers: auth(u) });
+    assert.equal(r.statusCode, 403);
+    const after = await q<{ role: string }>(`SELECT role FROM identity.users WHERE id=$1`, [u]);
+    assert.equal(String(after[0]?.role), 'PROVIDER');
   });
 });
