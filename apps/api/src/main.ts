@@ -568,14 +568,39 @@ app.post('/v1/quotes/:bookingId/accept', async (req) => {
 });
 
 // ---------- payments (Bachs primary, Flutterwave fallback) ----------
+// Server-authoritative charge amount: the accepted quote total when one exists
+// (quote flow), otherwise the frozen booking price snapshot. The client may only
+// CONFIRM this number — accepting a client-computed total would let the amount
+// charged drift away from what the pricing engine recorded on the booking.
+async function expectedChargeKobo(bookingId: string, booking: { priceKobo: string }): Promise<bigint> {
+  try {
+    const rows = await q<Record<string, unknown>>(
+      `SELECT total_kobo FROM booking.quote WHERE job_id=$1 AND status='accepted' ORDER BY version DESC LIMIT 1`,
+      [bookingId],
+    );
+    if (rows[0]) return BigInt(String(rows[0].total_kobo));
+  } catch (e: unknown) { observability.captureException(e); }
+  return BigInt(booking.priceKobo);
+}
+
 app.post('/v1/bookings/:id/payments', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   const idem = req.headers['idempotency-key'];
   if (typeof idem !== 'string') return fail(reply, 'IDEMPOTENCY_REQUIRED', 'Idempotency-Key header required');
-  const { amountKobo, email } = z.object({ amountKobo: z.string(), email: z.string().email() }).parse(req.body);
+  const parsed = z.object({ amountKobo: z.string(), email: z.string().email() }).safeParse(req.body);
+  if (!parsed.success) return fail(reply, 'BAD_PAYMENT', 'amountKobo (kobo string) and a valid email are required');
+  const bookingId = (req.params as { id: string }).id;
+  const booking = await bookingService.getRaw(bookingId);
+  if (!booking) return fail(reply, 'BOOKING_NOT_FOUND', 'Booking not found', 404);
+  if (booking.userId !== a.sub) return fail(reply, 'FORBIDDEN', 'Not your booking', 403);
+  const expected = await expectedChargeKobo(bookingId, booking);
+  let sent: bigint;
+  try { sent = BigInt(parsed.data.amountKobo); } catch { return fail(reply, 'BAD_AMOUNT', 'amountKobo must be an integer kobo amount'); }
+  if (sent !== expected) return fail(reply, 'AMOUNT_MISMATCH', `Amount must be ${expected} kobo`);
   try {
     const session = await payments.createCheckout({
-      bookingId: (req.params as { id: string }).id, amountKobo: BigInt(amountKobo),
-      customerEmail: email, reference: `bk_${(req.params as { id: string }).id}_${idem.slice(0, 24)}`, idempotencyKey: idem,
+      bookingId, amountKobo: sent,
+      customerEmail: parsed.data.email, reference: `bk_${bookingId}_${idem.slice(0, 24)}`, idempotencyKey: idem,
     });
     observability.track('booking.payment_initiated', { psp: session.psp });
     return { data: session };

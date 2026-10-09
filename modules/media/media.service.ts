@@ -35,7 +35,10 @@ export const mediaService = {
     await objectStore.putQuarantine(folder, assetId, bytes, mime);
     await objectStore.promote(folder, assetId, mime);
     const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
-    const url = await objectStore.signedUrl(assetId);
+    // This URL is persisted into profile/evidence rows and served by RN <Image>
+    // (which cannot attach an Authorization header), so it must outlive the
+    // default 1h TTL — otherwise avatars and evidence 404 a day after upload.
+    const url = await objectStore.signedUrl(assetId, 60 * 60 * 24 * 365 * 10);
     await q(`UPDATE media.asset SET sha256=$2, status='clean', url=$3, mime=$4 WHERE id=$1`, [assetId, sha256, url, mime]);
     emit('media.ingested', { assetId, mime, sha256, folder });
     return { id: assetId, sha256, status: 'clean', url, folder };

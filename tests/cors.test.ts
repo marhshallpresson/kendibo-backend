@@ -8,10 +8,13 @@ import assert from 'node:assert';
 
 type InjectOpts = { method: string; url: string; headers?: Record<string, string> };
 type InjectRes = { statusCode: number; headers: Record<string, string | string[] | undefined> };
+// Fastify's `inject` is overloaded (callback + promise forms); a narrow
+// structural type here rejects the instance, so the promise form is asserted.
 let app: {
   inject: (opts: InjectOpts) => Promise<InjectRes>;
   close?: () => Promise<void>;
 };
+const asApp = (instance: unknown): typeof app => instance as typeof app;
 
 const preflight = (origin: string): InjectOpts => ({
   method: 'OPTIONS',
@@ -28,7 +31,7 @@ before(async () => {
   process.env.NODE_ENV = 'test';
   process.env.DATABASE_URL = '';
   process.env.REDIS_URL = '';
-  ({ app } = await import('../apps/api/src/main.js'));
+  app = asApp((await import('../apps/api/src/main.js')).app);
   delete process.env.DATABASE_URL;
   delete process.env.REDIS_URL;
 });
