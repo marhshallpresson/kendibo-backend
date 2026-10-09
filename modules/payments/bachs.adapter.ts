@@ -43,8 +43,10 @@ export class BachsAdapter implements PaymentPort {
         pricing: { currency: input.currency ?? 'NGN', amount },
         customer: { email: input.customerEmail, name: input.customerName },
         reference: input.reference,
-        success_url: process.env.BACHS_SUCCESS_URL ?? 'kendibo://payment/callback',
-        cancel_url: process.env.BACHS_CANCEL_URL ?? 'kendibo://payment/callback',
+        // Live Bachs rejects non-http(s) schemes ("success_url must use http://
+        // or https:// scheme") — deep-link fallbacks belong on the https page.
+        success_url: process.env.BACHS_SUCCESS_URL ?? 'https://kendibo-app.pxxl.click/payment/callback',
+        cancel_url: process.env.BACHS_CANCEL_URL ?? 'https://kendibo-app.pxxl.click/payment/callback',
         metadata: { bookingId: input.bookingId, ...(input.metadata ?? {}) },
       }),
     });
