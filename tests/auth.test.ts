@@ -78,10 +78,12 @@ describe('unified login (account check + device history)', () => {
     });
     assert.equal(ver.statusCode, 200);
     const session = ver.json().data;
-    assert.equal(session.user.role, 'provider');
+    // Roles are echoed uppercase to match ROLE_PERMS/ADMIN_ROLES keys (consumers
+    // normalize case themselves, so this is the one canonical casing).
+    assert.equal(session.user.role, 'PROVIDER');
     assert.equal(session.user.name, 'Provider One');
     const me = await identityService.me(session.user.id);
-    assert.equal(me?.role, 'provider');
+    assert.equal(me?.role, 'PROVIDER');
     const prov = await q(`SELECT id FROM provider.provider WHERE user_id=$1`, [session.user.id]);
     assert.equal(prov.length, 1);
   });

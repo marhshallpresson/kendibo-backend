@@ -22,7 +22,7 @@ const fakePsp = {
 };
 (globalThis as Record<string, unknown>).__PSP__ = { bachs: fakePsp, flutterwave: fakePsp };
 
-let app: { inject: (opts: unknown) => Promise<{ statusCode: number; json: () => { error: { code: string }; data: { psp: string; balanceKobo: number; txns: { kind: string }[] } } }>; close?: () => Promise<void> };
+let app: { inject: (opts: unknown) => Promise<{ statusCode: number; json: () => Record<string, any> }>; close?: () => Promise<void> };
 before(async () => {
   // Isolate BEFORE main.js import (main loads dotenv + touches DB at import):
   // force test so main never listens on :3000, neutralize URLs to '' so
@@ -120,5 +120,106 @@ describe('wallet routes', () => {
       assert.equal(r.json().error.code, 'BAD_AMOUNT');
     }
     assert.equal(await walletService.getBalance(u), 0);
+  });
+});
+
+async function makeBooking(userId: string) {
+  const { q } = await import('../packages/database/db.js');
+  const svc = await q(`SELECT id FROM catalog.service LIMIT 1`);
+  if (!svc[0]) throw new Error('no catalog.service row available for wallet test');
+  const rows = await q<{ id: string; price_kobo: string | number }>(
+    `INSERT INTO booking.booking (user_id, service_id, address_id, status, price_kobo, price_snapshot, scheduled_at, idempotency_key)
+     VALUES ($1, $2, NULL, 'REQUESTED', 5000, '{}'::jsonb, now(), $3) RETURNING id, price_kobo`,
+    [userId, svc[0].id, `kt_${randomUUID()}`],
+  );
+  return { id: String(rows[0].id), priceKobo: Number(rows[0].price_kobo) };
+}
+
+describe('pay booking from wallet', () => {
+  it('requires auth', async () => {
+    const g = await app.inject({ method: 'POST', url: '/v1/bookings/x/pay-with-wallet' });
+    assert.equal(g.statusCode, 401);
+    assert.equal(g.json().error.code, 'UNAUTHENTICATED');
+  });
+
+  it('requires an Idempotency-Key header', async () => {
+    const u = await realUser();
+    const b = await makeBooking(u);
+    const r = await app.inject({ method: 'POST', url: `/v1/bookings/${b.id}/pay-with-wallet`, headers: auth(u) });
+    assert.equal(r.statusCode, 400);
+    assert.equal(r.json().error.code, 'IDEMPOTENCY_REQUIRED');
+  });
+
+  it('402 when balance is insufficient; balance untouched', async () => {
+    const u = await realUser();
+    const b = await makeBooking(u);
+    await walletService.credit(u, 1000, `TOPUP-${randomUUID()}`, 'topup');
+    const r = await app.inject({
+      method: 'POST', url: `/v1/bookings/${b.id}/pay-with-wallet`,
+      headers: { ...auth(u), ...idem() }, payload: {},
+    });
+    assert.equal(r.statusCode, 402);
+    assert.equal(r.json().error.code, 'INSUFFICIENT_FUNDS');
+    assert.equal(await walletService.getBalance(u), 1000);
+  });
+
+  it('debits wallet, charges the SERVER price, and is idempotent on retry', async () => {
+    const u = await realUser();
+    const b = await makeBooking(u);
+    await walletService.credit(u, b.priceKobo + 5000, `TOPUP-${randomUUID()}`, 'topup');
+    const key = `idem-${randomUUID()}`;
+
+    const first = await app.inject({
+      method: 'POST', url: `/v1/bookings/${b.id}/pay-with-wallet`,
+      headers: { ...auth(u), 'idempotency-key': key }, payload: { amountKobo: '1' },
+    });
+    assert.equal(first.statusCode, 200);
+    assert.equal(first.json().data.status, 'successful');
+    assert.equal(first.json().data.method, 'WALLET');
+    assert.equal(Number(first.json().data.amountKobo), b.priceKobo); // client-sent 1 is ignored
+    const afterFirst = b.priceKobo + 5000 - b.priceKobo;
+
+    // Retry with the SAME key must not charge again.
+    const second = await app.inject({
+      method: 'POST', url: `/v1/bookings/${b.id}/pay-with-wallet`,
+      headers: { ...auth(u), 'idempotency-key': key }, payload: {},
+    });
+    assert.equal(second.statusCode, 200);
+    assert.equal(second.json().data.reference, first.json().data.reference);
+    assert.equal(await walletService.getBalance(u), afterFirst);
+
+    const pays = await (await import('../packages/database/db.js')).q(
+      `SELECT count(*)::int AS n FROM payment.payment WHERE booking_id=$1 AND status='successful'`, [b.id],
+    );
+    assert.equal(pays[0].n, 1);
+  });
+
+  it('a different Idempotency-Key on an already-paid booking does not double charge', async () => {
+    const u = await realUser();
+    const b = await makeBooking(u);
+    await walletService.credit(u, b.priceKobo * 3, `TOPUP-${randomUUID()}`, 'topup');
+    const pay = async (key: string) => app.inject({
+      method: 'POST', url: `/v1/bookings/${b.id}/pay-with-wallet`,
+      headers: { ...auth(u), 'idempotency-key': key }, payload: {},
+    });
+    assert.equal((await pay(`idem-${randomUUID()}`)).statusCode, 200);
+    const balAfterFirst = await walletService.getBalance(u);
+    const retry = await pay(`idem-${randomUUID()}`);
+    assert.equal(retry.statusCode, 200); // settled booking replays as paid
+    assert.equal(await walletService.getBalance(u), balAfterFirst);
+  });
+
+  it("cannot pay someone else's booking", async () => {
+    const owner = await realUser();
+    const stranger = await realUser();
+    const b = await makeBooking(owner);
+    await walletService.credit(stranger, 100000, `TOPUP-${randomUUID()}`, 'topup');
+    const r = await app.inject({
+      method: 'POST', url: `/v1/bookings/${b.id}/pay-with-wallet`,
+      headers: { ...auth(stranger), ...idem() }, payload: {},
+    });
+    assert.equal(r.statusCode, 403);
+    assert.equal(r.json().error.code, 'FORBIDDEN');
+    assert.equal(await walletService.getBalance(stranger), 100000);
   });
 });

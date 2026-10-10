@@ -72,7 +72,8 @@ export function localDb(): IMemoryDb {
   run('018_service_request_category.sql');
   run('019_purge_demo_content.sql');
   run('021_provider_gallery.sql');
-  console.log('[localdb] pg-mem ready (001-019, 021)');
+  run('022_wallet_psp.sql');
+  console.log('[localdb] pg-mem ready (001-019, 021-022)');
   return mem;
 }
 

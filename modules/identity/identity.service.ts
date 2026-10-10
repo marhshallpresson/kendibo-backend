@@ -4,6 +4,7 @@ import { issueOtp, verifyOtp, signAccess, signRefresh, rotateRefresh, revokeAll 
 import { welcomeService } from '../notifications/welcome.js';
 import { q } from '../../packages/database/db.js';
 import { providerService } from '../providers/provider.service.js';
+import { isAdminRole, rolePerms } from '../authorization/rbac.js';
 import { sms, email } from '../notifications/channels.js';
 import { templates } from '../notifications/mail.templates.js';
 
@@ -18,7 +19,7 @@ const row = (r: Record<string, unknown>): User => ({
   name: (r.name as string) ?? undefined, nickname: (r.nickname as string) ?? undefined,
   dob: r.dob ? String(r.dob).slice(0, 10) : undefined,
   avatarUrl: (r.profile_image as string) ?? undefined,
-  role: String(r.role ?? 'customer').toLowerCase(), createdAt: String(r.created_at),
+  role: String(r.role ?? 'CUSTOMER').toUpperCase(), createdAt: String(r.created_at),
 });
 
 export const identityService = {
@@ -92,11 +93,31 @@ export const identityService = {
         user = upd[0];
       }
     }
+    // Admin bootstrap: signup can never mint an admin (the role argument is
+    // ignored for anything but provider), so a first console seat is claimed by
+    // listing your email/phone in ADMIN_BOOTSTRAP. Grants SUPER_ADMIN only to
+    // a plain CUSTOMER; an identity already holding any other role is never
+    // touched, so re-logging-in can't silently upgrade or demote anyone.
+    const bootstrap = process.env.ADMIN_BOOTSTRAP
+      ?.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean) ?? [];
+    if (bootstrap.includes(norm.value) && String(user.role).toUpperCase() === 'CUSTOMER') {
+      const upd = await q<Record<string, unknown>>(
+        `UPDATE identity.users SET role='SUPER_ADMIN', updated_at=now() WHERE id=$1 RETURNING *`, [user.id],
+      );
+      if (upd[0]) user = upd[0];
+    }
     if (String(user.role ?? '').toUpperCase() === 'PROVIDER') {
       await providerService.onboard(String(user.id));
     }
     const deviceId = `dev_${Date.now().toString(36)}`;
-    const access = signAccess(String(user.id), ['booking:create', 'booking:view:self']);
+    // Permissions are derived from the role the DB actually holds, not a
+    // hardcoded customer pair — an admin seat would otherwise mint a token
+    // with no admin grants and every /v1/admin call would 403.
+    const role = String(user.role ?? 'CUSTOMER').toUpperCase();
+    const permissions = isAdminRole(role)
+      ? [...rolePerms(role)]
+      : ['booking:create', 'booking:view:self', 'booking:cancel'];
+    const access = signAccess(String(user.id), permissions);
     const refresh = await signRefresh(String(user.id), deviceId);
     await this.logDevice(String(user.id), device ?? {});
     return { user: row(user), access, refresh: refresh.token, deviceId, isNew };

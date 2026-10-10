@@ -9,7 +9,7 @@ import { postCollection, postSettlement, trialBalance, openPeriod } from '../../
 import { transition, type JobStatus } from '../../../modules/job-engine/job.machine.js';
 import { observability } from '../../../packages/observability/watchup.adapter.js';
 import { identityService } from '../../../modules/identity/identity.service.js';
-import { authorize, type Permission } from '../../../modules/authorization/rbac.js';
+import { authorize, isAdminRole, adminCan, type Permission } from '../../../modules/authorization/rbac.js';
 import { propertyService, addressSchema } from '../../../modules/properties/property.service.js';
 import { catalogService } from '../../../modules/catalog/catalog.service.js';
 import { price } from '../../../modules/pricing/pricing.engine.js';
@@ -150,6 +150,22 @@ function authed(req: { headers: Record<string, string | undefined> }): { sub: st
   return verifyAccess(h.slice(7));
 }
 
+/**
+ * Resolve the caller for an admin route. The JWT carries permissions but not
+ * the role, so the role is read from identity.users — the DB is the source of
+ * truth for "who is an admin". Returns null when the token is missing/invalid
+ * or the identity no longer exists; returns a permission-denied sentinel when
+ * the identity exists but holds no admin role, so callers can 401 vs 403.
+ */
+async function adminActor(req: { headers: Record<string, string | undefined> }):
+  Promise<{ sub: string; role: string } | { denied: true } | null> {
+  const a = authed(req);
+  if (!a) return null;
+  const rows = await q<{ role: string }>(`SELECT role FROM identity.users WHERE id=$1`, [a.sub]);
+  const role = String(rows[0]?.role ?? '').toUpperCase();
+  return isAdminRole(role) ? { sub: a.sub, role } : { denied: true };
+}
+
 // ---------- health ----------
 // GET / answers platform probes + humans (Pxxl health checks default to /).
 app.get('/', async () => ({
@@ -169,8 +185,9 @@ app.get('/health/dependencies', async () => {
   };
 });
 app.get('/v1/admin/monitoring', async (req, reply) => {
-  const a = authed(req as never);
+  const a = await adminActor(req as never);
   if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a) return fail(reply, 'FORBIDDEN', 'Admin access required', 403);
   const w = watchupClient as unknown as {
     enabled: boolean; queueDepth: number; lastFlush: { at: string | null; ok: boolean | null };
     environment: string; release: string; service: string;
@@ -692,6 +709,66 @@ app.post('/v1/wallet/topup', async (req, reply) => {
   } catch (e: unknown) { observability.captureException(e); return fail(reply, 'PSP_UNAVAILABLE', 'Provider unavailable', 502, true); }
 });
 
+// Pay a booking from the customer's own wallet balance. No PSP session: the
+// money is already held in payment.wallet_txn, so this is an idempotent debit
+// that books the job as paid the same way the webhook does for a PSP charge.
+// amountKobo is accepted but IGNORED — the server's price snapshot is charged,
+// exactly like POST /v1/bookings/:id/payments (never trust the client's number).
+app.post('/v1/bookings/:id/pay-with-wallet', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const idem = req.headers['idempotency-key'];
+  if (typeof idem !== 'string' || !idem.trim()) return fail(reply, 'IDEMPOTENCY_REQUIRED', 'Idempotency-Key header required');
+  const bookingId = (req.params as { id: string }).id;
+  const booking = await bookingService.getRaw(bookingId);
+  if (!booking) return fail(reply, 'BOOKING_NOT_FOUND', 'Booking not found', 404);
+  if (booking.userId !== a.sub) return fail(reply, 'FORBIDDEN', 'Not your booking', 403);
+
+  const expected = await expectedChargeKobo(bookingId, booking);
+  const amountKobo = Number(expected);
+  if (!Number.isSafeInteger(amountKobo) || amountKobo <= 0) {
+    return fail(reply, 'BAD_AMOUNT', 'This booking has no payable amount yet', 400);
+  }
+  // Already settled? A fresh idempotency key mints a NEW bw_ ref, so replay
+  // safety cannot ride on the debit's per-ref dedupe (that only catches a retry
+  // of the SAME key). Check the booking first: if it is not in a pre-payment
+  // state and has no successful intent, refuse to charge again. A completed
+  // booking that DOES have a successful intent falls through and replays as paid.
+  const settled = await q(`SELECT 1 FROM payment.payment WHERE booking_id=$1 AND status='successful'`, [bookingId]);
+  if (booking.status !== 'REQUESTED' && booking.status !== 'PAYMENT_PENDING' && !settled[0]) {
+    return fail(reply, 'BOOKING_NOT_PAYABLE', `Booking is ${booking.status} and cannot be paid from wallet`, 409);
+  }
+
+  // Stable idempotency: the wallet txn ref doubles as the payment.reference, so
+  // a retry (or a double-tap) replays the SAME debit instead of charging twice.
+  const ref = `bw_${bookingId}_${idem.slice(0, 24)}`;
+  try {
+    const alreadyPaid = !!settled[0];
+    if (!alreadyPaid) {
+      await walletService.debit(a.sub, amountKobo, ref, 'payment', bookingId);
+      // Book the job as paid before the intent row: a crash here leaves an
+      // unpaid booking the user can retry (debit replays by ref), never a
+      // charged-but-unpaid job.
+      try { await postCollection(ref, expected, '2026-10'); } catch (e) { observability.captureException(e); }
+      await q(
+        `INSERT INTO payment.payment (booking_id, psp, reference, charge_id, amount_kobo, status)
+         VALUES ($1, 'wallet', $2, $2, $3, 'successful')
+         ON CONFLICT DO NOTHING`,
+        [bookingId, ref, amountKobo],
+      );
+      await q(`UPDATE payment.payment SET status='successful' WHERE reference=$1 AND status<>'successful'`, [ref]);
+    }
+    observability.track('booking.paid_from_wallet', { bookingId, amountKobo, ref, replayed: alreadyPaid });
+    return { data: { status: 'successful', reference: ref, amountKobo, method: 'WALLET' } };
+  } catch (e: unknown) {
+    const msg = (e as Error)?.message ?? '';
+    if (msg.includes('INSUFFICIENT_FUNDS')) {
+      return fail(reply, 'INSUFFICIENT_FUNDS', 'Your wallet balance is too low for this booking', 402);
+    }
+    observability.captureException(e);
+    return fail(reply, 'WALLET_PAY_FAILED', `Could not pay from wallet: ${(e as Error)?.message ?? e}`, 500);
+  }
+});
+
 // ---------- providers / dispatch / tracking / execution ----------
 // Hybrid dispatch lifecycle helpers (also driven by the SLA sweep below).
 async function advanceBookingAfterAccept(jobId: string): Promise<void> {
@@ -993,8 +1070,9 @@ app.post('/v1/reviews', async (req, reply) => {
 
 // ---------- admin (audited) ----------
 app.get('/v1/admin/dispatch/live', async (req, reply) => {
-  const a = authed(req as never);
-  if (!a || !authorize('OPERATIONS', 'booking:view:any')) return fail(reply, 'FORBIDDEN', 'Operations required', 403);
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'booking:view:any')) return fail(reply, 'FORBIDDEN', 'Operations access required', 403);
   await auditService.log(a.sub, 'dispatch.live.view');
   const online = await providerService.allOnline();
   return { data: { online: online.length } };
@@ -1146,8 +1224,7 @@ app.get('/v1/service-requests/:id/matches', async (req, reply) => {
 app.post('/v1/service-requests/:id/broadcast', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   const id = (req.params as { id: string }).id;
-  // NOTE: authorize('ROLE', perm) is a no-op globally (main.ts hard-codes the
-  // role literal, so it always returns true). Owner check is enforced here.
+  // Owner check only: any authenticated user may broadcast their own request.
   try {
     const r = await requestService.get(id, a.sub);
     if (!r) return fail(reply, 'NOT_FOUND', 'Request not found', 404);
@@ -1247,8 +1324,11 @@ app.post('/v1/provider/jobs/:id/quote', async (req) => {
 app.get('/v1/provider/earnings', async (req) => ({ data: earningsService.forProvider((req.query as { providerId: string }).providerId) }));
 app.get('/v1/provider/payouts', async (req) => ({ data: await payoutService.get((req.query as { id: string }).id) }));
 app.post('/v1/provider/verify-level', async (req, reply) => {
-  const a = authed(req as never);
-  if (!a || !authorize('TRUST_SAFETY', 'provider:verify')) return fail(reply, 'FORBIDDEN', 'Trust & Safety required', 403);
+  // Trust & Safety only: setting a verification level is an admin action, so it
+  // goes through adminActor (caller's role) like the /v1/admin routes.
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'provider:verify')) return fail(reply, 'FORBIDDEN', 'Trust & Safety access required', 403);
   const { providerId, level } = z.object({ providerId: z.string(), level: z.string() }).parse(req.body);
   const v = await verificationService.set(providerId, level as never);
   await auditService.log(a.sub, `provider.${providerId}.level=${level}`);
@@ -1285,76 +1365,88 @@ app.get('/v1/b2b/reports', async (req) => ({ data: await b2bService.report((req.
 
 // ---- ADMIN CONSOLE: full ops (PRD §54 + App C) ----
 app.get('/v1/admin/jobs', async (req, reply) => {
-  const a = authed(req as never);
-  if (!a || !authorize('OPERATIONS', 'booking:view:any')) return fail(reply, 'FORBIDDEN', 'Operations required', 403);
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'booking:view:any')) return fail(reply, 'FORBIDDEN', 'Operations access required', 403);
   return { data: await bookingService.list((req.query as { userId?: string }).userId ?? '') };
 });
 app.post('/v1/admin/jobs/:id/assign', async (req, reply) => {
-  const a = authed(req as never);
-  if (!a || !authorize('DISPATCHER', 'booking:override')) return fail(reply, 'FORBIDDEN', 'Dispatcher required', 403);
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'booking:override')) return fail(reply, 'FORBIDDEN', 'Dispatcher access required', 403);
   const { providerId } = z.object({ providerId: z.string() }).parse(req.body);
   await auditService.log(a.sub, `job.${(req.params as { id: string }).id}.assign=${providerId}`);
   return { data: await dispatchService.assign((req.params as { id: string }).id, providerId) };
 });
 app.post('/v1/admin/jobs/:id/flag', async (req, reply) => {
-  const a = authed(req as never);
-  if (!a || !authorize('OPERATIONS', 'booking:override')) return fail(reply, 'FORBIDDEN', 'Operations required', 403);
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'booking:override')) return fail(reply, 'FORBIDDEN', 'Operations access required', 403);
   const { flag: f, reason } = z.object({ flag: z.string(), reason: z.string().optional() }).parse(req.body);
   await auditService.log(a.sub, `job.${(req.params as { id: string }).id}.flag=${f}`);
   return { data: await flagJob((req.params as { id: string }).id, f as never, a.sub, reason) };
 });
 app.get('/v1/admin/jobs/:id/flags', async (req) => ({ data: await flagsOf((req.params as { id: string }).id) }));
 app.post('/v1/admin/providers/:id/approve', async (req, reply) => {
-  const a = authed(req as never);
-  if (!a || !authorize('TRUST_SAFETY', 'provider:verify')) return fail(reply, 'FORBIDDEN', 'Trust & Safety required', 403);
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'provider:verify')) return fail(reply, 'FORBIDDEN', 'Trust & Safety access required', 403);
   await auditService.log(a.sub, `provider.${(req.params as { id: string }).id}.approve`);
   await providerService.verifyKyc((req.params as { id: string }).id);
   return { data: await verificationService.set((req.params as { id: string }).id, 'verified') };
 });
 app.post('/v1/admin/providers/:id/suspend', async (req, reply) => {
-  const a = authed(req as never);
-  if (!a || !authorize('TRUST_SAFETY', 'provider:suspend')) return fail(reply, 'FORBIDDEN', 'Trust & Safety required', 403);
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'provider:suspend')) return fail(reply, 'FORBIDDEN', 'Trust & Safety access required', 403);
   const mc = await makerChecker.submit('suspension', (req.params as { id: string }).id, a.sub);
   await auditService.log(a.sub, `provider.${(req.params as { id: string }).id}.suspend.queued=${mc.id}`);
   const v = await verificationService.set((req.params as { id: string }).id, 'suspended');
   return { data: { ...v, checkerId: mc.id } };
 });
 app.get('/v1/admin/disputes', async (req, reply) => {
-  const a = authed(req as never);
-  if (!a || !authorize('CUSTOMER_SUPPORT', 'booking:view:any')) return fail(reply, 'FORBIDDEN', 'Support required', 403);
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'booking:view:any')) return fail(reply, 'FORBIDDEN', 'Support access required', 403);
   return { data: await disputeService.get((req.query as { id: string }).id) };
 });
 app.post('/v1/admin/refunds', async (req, reply) => {
-  const a = authed(req as never);
-  if (!a || !authorize('FINANCE', 'payment:refund')) return fail(reply, 'FORBIDDEN', 'Finance required', 403);
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'payment:refund')) return fail(reply, 'FORBIDDEN', 'Finance access required', 403);
   const { id, status } = z.object({ id: z.string(), status: z.string() }).parse(req.body);
   const mc = await makerChecker.submit('refund', id, a.sub);
   await auditService.log(a.sub, `refund.${id}=${status} checker=${mc.id}`);
   return { data: await refundService.mark(id, status as never) };
 });
 app.get('/v1/admin/ledger', async (req, reply) => {
-  const a = authed(req as never);
-  if (!a || !authorize('FINANCE', 'ledger:view')) return fail(reply, 'FORBIDDEN', 'Finance required', 403);
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'ledger:view')) return fail(reply, 'FORBIDDEN', 'Finance access required', 403);
   return { data: await trialBalance() };
 });
 app.get('/v1/admin/checker', async (req, reply) => {
-  const a = authed(req as never);
-  if (!a || !authorize('FINANCE', 'payout:approve')) return fail(reply, 'FORBIDDEN', 'Finance required', 403);
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'payout:approve')) return fail(reply, 'FORBIDDEN', 'Finance access required', 403);
   return { data: makerChecker.pending() };
 });
 app.get('/v1/admin/analytics', async (req, reply) => {
-  const a = authed(req as never);
+  const a = await adminActor(req as never);
   if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a) return fail(reply, 'FORBIDDEN', 'Admin access required', 403);
   return { data: analyticProps({ surface: 'admin' }) };
 });
 app.get('/v1/admin/audit', async (req, reply) => {
-  const a = authed(req as never);
-  if (!a || !authorize('TRUST_SAFETY', 'audit:view')) return fail(reply, 'FORBIDDEN', 'Audit view required', 403);
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'audit:view')) return fail(reply, 'FORBIDDEN', 'Audit view access required', 403);
   return { data: await auditService.list() };
 });
 app.post('/v1/admin/flags', async (req, reply) => {
-  const a = authed(req as never);
-  if (!a || !authorize('SUPER_ADMIN', 'configuration:edit')) return fail(reply, 'FORBIDDEN', 'Super admin required', 403);
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'configuration:edit')) return fail(reply, 'FORBIDDEN', 'Super admin access required', 403);
   const { key, value } = z.object({ key: z.string(), value: z.boolean() }).parse(req.body);
   await auditService.log(a.sub, `flag.${key}=${value}`);
   return { data: await configurationService.setFlag(key, value, a.sub) };
