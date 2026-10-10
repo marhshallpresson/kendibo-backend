@@ -140,7 +140,7 @@ export const templates = {
       <p style="${styles.p}">It expires in 5 minutes. Never share this code with anyone.</p>
     `;
     return {
-      html: renderLayout(content, 'Your Kendibo code', opts),
+      html: renderLayout(content, `Your Kendibo code - ${code}`, opts),
       text: `Your Kendibo verification code is: ${code}\nIt expires in 5 minutes.`,
     };
   },

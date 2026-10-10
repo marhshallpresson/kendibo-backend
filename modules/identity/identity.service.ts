@@ -1,6 +1,7 @@
 // Identity module — Postgres-backed users, device sessions, PIN, biometrics.
 import { createHash } from 'node:crypto';
 import { issueOtp, verifyOtp, signAccess, signRefresh, rotateRefresh, revokeAll } from '../../packages/auth/auth.js';
+import { welcomeService } from '../notifications/welcome.js';
 import { q } from '../../packages/database/db.js';
 import { providerService } from '../providers/provider.service.js';
 import { sms, email } from '../notifications/channels.js';
@@ -62,11 +63,20 @@ export const identityService = {
     const col = channel === 'phone' ? 'phone' : 'email';
     const rows = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE ${col}=$1`, [norm.value]);
     let user = rows[0];
+    let isNew = false;
     if (!user) {
+      isNew = true;
       const ins = await q<Record<string, unknown>>(
         `INSERT INTO identity.users (${col}, role, name) VALUES ($1,$2,$3) RETURNING *`, [norm.value, normalizedRole, name ?? null],
       );
       user = ins[0];
+      // Welcome in-app + email + push — best-effort, never blocks the login.
+      void welcomeService.send({
+        id: String(user.id),
+        name: (user.name as string | null) ?? null,
+        email: (user.email as string | null) ?? null,
+        phone: (user.phone as string | null) ?? null,
+      }).catch(() => {});
     } else {
       const sets: string[] = [];
       const vals: unknown[] = [];
@@ -89,7 +99,7 @@ export const identityService = {
     const access = signAccess(String(user.id), ['booking:create', 'booking:view:self']);
     const refresh = await signRefresh(String(user.id), deviceId);
     await this.logDevice(String(user.id), device ?? {});
-    return { user: row(user), access, refresh: refresh.token, deviceId };
+    return { user: row(user), access, refresh: refresh.token, deviceId, isNew };
   },
   refresh(token: string) { return rotateRefresh(token); },
   logoutAll(userId: string) { return revokeAll(userId); },
@@ -195,6 +205,13 @@ export const identityService = {
         );
         rows = ins;
         isNew = true;
+        // Welcome in-app + email + push — best-effort, never blocks the login.
+        void welcomeService.send({
+          id: String((ins[0] as { id?: unknown }).id),
+          name: String((claims as { name?: string }).name ?? email.split('@')[0]),
+          email,
+          phone: null,
+        }).catch(() => {});
       }
     }
     const user = row(rows[0]);

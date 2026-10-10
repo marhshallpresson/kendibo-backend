@@ -7,6 +7,7 @@ import { q } from '../../packages/database/db.js';
 export const TEMPLATES = [
   'booking.confirmed', 'provider.assigned', 'provider.en_route', 'provider.arrived',
   'quote.ready', 'payment.success', 'payment.failed', 'refund.completed', 'warranty.expiring',
+  'welcome',
 ] as const;
 export type Template = (typeof TEMPLATES)[number];
 

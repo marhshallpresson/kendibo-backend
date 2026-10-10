@@ -113,6 +113,47 @@ export const providerService = {
     const rows = await q<Record<string, unknown>>(`SELECT * FROM provider.provider WHERE user_id=$1 LIMIT 1`, [userId]);
     return rows[0] ? toProvider(rows[0]) : null;
   },
+  /** Storefront gallery, ordered for display. */
+  async gallery(providerId: string) {
+    const rows = await q<Record<string, unknown>>(
+      `SELECT id, asset_id, caption, position, created_at
+         FROM provider.gallery WHERE provider_id=$1
+        ORDER BY position ASC, created_at ASC`, [providerId],
+    );
+    return rows.map((r) => ({
+      id: String(r.id), assetId: String(r.asset_id), caption: r.caption ? String(r.caption) : null,
+      position: Number(r.position ?? 0), createdAt: String(r.created_at),
+    }));
+  },
+  /** Attach an already-clean media asset to the gallery. Idempotent per asset. */
+  async galleryAdd(providerId: string, assetId: string, caption?: string) {
+    const asset = await q<Record<string, unknown>>(`SELECT status FROM media.asset WHERE id=$1`, [assetId]);
+    if (!asset[0]) throw new Error('ASSET_NOT_FOUND');
+    if (String(asset[0].status) !== 'clean') throw new Error('ASSET_NOT_CLEAN');
+    const next = await q<{ pos: number | null }>(
+      `SELECT MAX(position) AS pos FROM provider.gallery WHERE provider_id=$1`, [providerId],
+    );
+    const position = (next[0]?.pos ?? -1) + 1;
+    try {
+      await q(
+        `INSERT INTO provider.gallery (provider_id, asset_id, caption, position)
+         VALUES ($1,$2,$3,$4)`,
+        [providerId, assetId, caption ?? null, position],
+      );
+    } catch {
+      return { duplicate: true }; // UNIQUE (provider_id, asset_id) — already attached
+    }
+    return this.gallery(providerId);
+  },
+  async galleryRemove(providerId: string, entryId: string) {
+    // Scoped by provider_id so a caller can only detach their own entries.
+    const rows = await q<{ id: string }>(
+      `DELETE FROM provider.gallery WHERE id=$1 AND provider_id=$2 RETURNING id`,
+      [entryId, providerId],
+    );
+    if (rows.length === 0) throw new Error('NOT_FOUND');
+    return { ok: true };
+  },
   async allOnline(): Promise<Provider[]> {
     const rows = await q<Record<string, unknown>>(`SELECT * FROM provider.provider WHERE online=TRUE`);
     return Promise.all(rows.map(toProvider));

@@ -739,6 +739,39 @@ async function providerActor(req: never, reply: FastifyReply): Promise<{ id: str
   if (!me) { void fail(reply, 'NOT_FOUND', 'Provider profile not found', 404); return null; }
   return { id: me.id };
 }
+// Storefront gallery: photos uploaded via the media pipeline, then referenced
+// here. Reads are public (customers view the storefront); writes are session-scoped.
+app.get('/v1/provider/gallery/mine', async (req, reply) => {
+  const me = await providerActor(req as never, reply);
+  if (!me) return reply;
+  return { data: await providerService.gallery(me.id) };
+});
+app.get('/v1/provider/:id/gallery', async (req) => ({
+  data: await providerService.gallery((req.params as { id: string }).id),
+}));
+app.post('/v1/provider/gallery', async (req, reply) => {
+  const me = await providerActor(req as never, reply);
+  if (!me) return reply;
+  const { assetId, caption } = z.object({ assetId: z.string(), caption: z.string().max(200).optional() }).parse(req.body ?? {});
+  try {
+    return { data: await providerService.galleryAdd(me.id, assetId, caption) };
+  } catch (e: unknown) {
+    const msg = (e as Error).message;
+    if (msg === 'ASSET_NOT_FOUND') return fail(reply, 'NOT_FOUND', 'Media asset not found', 404);
+    if (msg === 'ASSET_NOT_CLEAN') return fail(reply, 'NOT_CLEAN', 'Upload the photo through the media pipeline first', 409);
+    throw e;
+  }
+});
+app.delete('/v1/provider/gallery/:entryId', async (req, reply) => {
+  const me = await providerActor(req as never, reply);
+  if (!me) return reply;
+  try {
+    return { data: await providerService.galleryRemove(me.id, (req.params as { entryId: string }).entryId) };
+  } catch (e: unknown) {
+    if ((e as Error).message === 'NOT_FOUND') return fail(reply, 'NOT_FOUND', 'Gallery photo not found', 404);
+    throw e;
+  }
+});
 app.post('/v1/provider/kyc', async (req, reply) => {
   const me = await providerActor(req as never, reply);
   if (!me) return reply;
