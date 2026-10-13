@@ -113,6 +113,7 @@ export const earningsService = {
       [providerId, jobId, String(amountKobo), String(tipKobo)]);
   },
   async forProvider(providerId: string) {
-    return q(`SELECT * FROM provider.earning WHERE provider_id=$1 ORDER BY created_at DESC`, [providerId]);
+    // Capped: provider app earnings screen never paginates past recent rows.
+    return q(`SELECT * FROM provider.earning WHERE provider_id=$1 ORDER BY created_at DESC LIMIT 100`, [providerId]);
   },
 };

@@ -3,6 +3,31 @@
 import { q } from '../../packages/database/db.js';
 import { config as appConfig } from '../../packages/config/env.js';
 
+// checkZone/coverage run on every address save and booking start; zones and
+// cities are launch reference data (a handful of rows, change rarely). A short
+// memo removes two full-table scans per call against the cross-WAN Postgres.
+const ZONE_TTL_MS = 60_000;
+let zoneRowsCache: { at: number; rows: any[] } | null = null;
+let cityRowsCache: { at: number; rows: any[] } | null = null;
+
+async function zoneRows(): Promise<any[]> {
+  if (zoneRowsCache && Date.now() - zoneRowsCache.at < ZONE_TTL_MS) return zoneRowsCache.rows;
+  const rows = await q<any>(
+    `SELECT z.name as zone, c.id as city_id, c.name as city, z.radius_km AS "radiusKm", z.lat, z.lng
+       FROM geo.zone z JOIN geo.city c ON z.city_id = c.id`,
+  );
+  zoneRowsCache = { at: Date.now(), rows };
+  return rows;
+}
+async function cityRows(): Promise<any[]> {
+  if (cityRowsCache && Date.now() - cityRowsCache.at < ZONE_TTL_MS) return cityRowsCache.rows;
+  const rows = await q<any>(
+    `SELECT id, name, lat, lng, radius_km FROM geo.city WHERE lat IS NOT NULL AND lng IS NOT NULL ORDER BY name`,
+  );
+  cityRowsCache = { at: Date.now(), rows };
+  return rows;
+}
+
 export const geoService = {
   /** Cities allowed by GEOLOCK_CITY (empty lock = all). */
   allowed(): string[] {
@@ -23,10 +48,7 @@ export const geoService = {
       allowed.includes(id.toLowerCase()) ||
       allowed.includes(name.toLowerCase());
 
-    const zones = await q<any>(
-      `SELECT z.name as zone, c.id as city_id, c.name as city, z.radius_km AS "radiusKm", z.lat, z.lng
-         FROM geo.zone z JOIN geo.city c ON z.city_id = c.id`,
-    );
+    const zones = await zoneRows();
     for (const z of zones) {
       if (!inLock(String(z.city_id), String(z.city))) continue;
       const d = Math.hypot(lat - z.lat, lng - z.lng) * 111; // approx km
@@ -39,9 +61,7 @@ export const geoService = {
       }
     }
 
-    const cities = await q<any>(
-      `SELECT id, name, lat, lng, radius_km FROM geo.city WHERE lat IS NOT NULL AND lng IS NOT NULL`,
-    );
+    const cities = await cityRows();
     for (const c of cities) {
       if (!inLock(String(c.id), String(c.name))) continue;
       const d = Math.hypot(lat - c.lat, lng - c.lng) * 111;
@@ -67,13 +87,10 @@ export const geoService = {
       allowed.includes(id.toLowerCase()) ||
       allowed.includes(name.toLowerCase());
 
-    const cities = await q<any>(
-      `SELECT id, name, lat, lng, radius_km FROM geo.city WHERE lat IS NOT NULL AND lng IS NOT NULL ORDER BY name`,
-    );
-    const zones = await q<any>(
-      `SELECT z.name as zone, c.id as city_id, c.name as city, z.lat, z.lng, z.radius_km
-         FROM geo.zone z JOIN geo.city c ON z.city_id = c.id ORDER BY c.name, z.name`,
-    );
+    // zoneRows aliases radius_km AS "radiusKm" — the old inline SELECT did
+    // not, so coverage() z.radiusKm was undefined → NaN radiusKm payloads.
+    const cities = await cityRows();
+    const zones = await zoneRows();
 
     return cities
       .filter((c) => inLock(String(c.id), String(c.name)))

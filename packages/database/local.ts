@@ -43,7 +43,7 @@ export function localDb(): IMemoryDb {
         // dispatch tests exercise. Real Postgres applies 013 untouched.
         sql = sql.replace(/INSERT INTO geo\.city[\s\S]*?ON CONFLICT[\s\S]*?;/i, '');
       }
-      if (f === '021_provider_gallery.sql') {
+      if (f === '021_provider_gallery.sql' || f === '023_settings_kyc_perf.sql') {
         // pg-mem ignores ON DELETE/SET NULL cascade verbs but accepts them.
         sql = sql.replace(/ ON DELETE CASCADE/gi, '');
       }
@@ -73,7 +73,8 @@ export function localDb(): IMemoryDb {
   run('019_purge_demo_content.sql');
   run('021_provider_gallery.sql');
   run('022_wallet_psp.sql');
-  console.log('[localdb] pg-mem ready (001-019, 021-022)');
+  run('023_settings_kyc_perf.sql');
+  console.log('[localdb] pg-mem ready (001-019, 021-023)');
   return mem;
 }
 

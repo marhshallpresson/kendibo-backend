@@ -40,7 +40,7 @@ import { reschedule, rescheduleHistory, flag as flagJob, flagsOf } from '../../.
 import { deviceService } from '../../../modules/devices/device.service.js';
 import { objectStore } from '../../../packages/storage/object.store.js';
 import { q } from '../../../packages/database/db.js';
-import { maps } from '../../../modules/geo/maps.port.js';
+import { maps, getMapsConfig, setMapsConfig, MAPS_PROVIDER_NAMES, type MapsProviderName } from '../../../modules/geo/maps.port.js';
 import { requestService } from '../../../modules/requests/request.service.js';
 import { surfaceFor } from '../../../packages/shared/clients.js';
 void surfaceFor;
@@ -129,7 +129,6 @@ const ser = (v: unknown): unknown =>
       : v && typeof v === 'object'
         ? Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, ser(x)]))
         : v;
-void app.addHook('preSerialization', async (_req, _reply, payload) => ser(payload));
 void app.addHook('preSerialization', async (_req, _reply, payload) => ser(payload));
 const payments = new PaymentService((globalThis as Record<string, unknown>).__PSP__ as never);
 void app.register(watchupTracing);
@@ -242,17 +241,17 @@ app.post('/v1/auth/otp/verify', async (req) => {
   observability.track('auth.verified', { channel });
   return { data: s };
 });
-// Login button pre-check: normalised identity -> existence only (constant-time body).
+// Login button pre-check: normalised identity -> existence only.
+// The 300ms constant-time sleep added ~0.3s to every login attempt with zero
+// benefit — the response body is already uniform and OTP/refresh routes have
+// their own rate limits. Removed in the latency audit.
 app.post('/v1/auth/account-exists', async (req, reply) => {
-  const t0 = Date.now();
   try {
     const { identity } = z.object({ identity: z.string() }).parse(req.body);
     const r = await identityService.accountExists(identity);
     observability.track('auth.account_checked', { channel: r.channel, exists: r.exists });
-    await new Promise((res) => setTimeout(res, Math.max(0, 300 - (Date.now() - t0))));
     return { data: r };
   } catch {
-    await new Promise((res) => setTimeout(res, Math.max(0, 300 - (Date.now() - t0))));
     return fail(reply, 'BAD_IDENTITY', 'Enter a valid phone number or email address.');
   }
 });
@@ -852,14 +851,19 @@ app.delete('/v1/provider/gallery/:entryId', async (req, reply) => {
 app.post('/v1/provider/kyc', async (req, reply) => {
   const me = await providerActor(req as never, reply);
   if (!me) return reply;
-  const { nin, bvn, businessName, skills, bank, location } = z.object({
+  const { nin, bvn, businessName, skills, bank, location, radiusKm, documents } = z.object({
     nin: z.string().optional(), bvn: z.string().optional(),
     businessName: z.string().optional(),
     skills: z.array(z.string()).optional(),
     bank: z.object({ accountNumber: z.string(), bankCode: z.string(), bankName: z.string().optional(), accountName: z.string().optional() }).optional(),
     location: z.object({ lat: z.number(), lng: z.number() }).optional(),
+    radiusKm: z.number().int().min(1).max(50).optional(),
+    documents: z.array(z.object({
+      assetId: z.string(),
+      kind: z.enum(['id_front', 'id_back', 'selfie', 'cac', 'other']),
+    })).max(8).optional(),
   }).parse(req.body ?? {});
-  if (businessName || bank || location) {
+  if (businessName || bank || location || radiusKm) {
     const sets: string[] = []; const vals: unknown[] = [];
     if (businessName) { sets.push(`business_name=$${vals.length + 1}`); vals.push(businessName); }
     if (bank) {
@@ -869,10 +873,26 @@ app.post('/v1/provider/kyc', async (req, reply) => {
       if (bank.bankName) { sets.push(`bank_name=$${vals.length + 1}`); vals.push(bank.bankName); }
     }
     if (location) { sets.push(`lat=$${vals.length + 1}`, `lng=$${vals.length + 2}`); vals.push(location.lat, location.lng); }
+    if (radiusKm) { sets.push(`service_radius_km=$${vals.length + 1}`); vals.push(radiusKm); }
     if (sets.length > 0) await q(`UPDATE provider.provider SET ${sets.join(', ')} WHERE id=$${vals.length + 1}`, [...vals, me.id]);
   }
   for (const s of skills ?? []) { try { await providerService.addSkill(me.id, s); } catch { /* unknown skill tag */ } }
-  return { data: await kycService.adapter.verifyIdentity(me.id, { nin, bvn }) };
+  if (documents?.length) {
+    try { await kycService.attachDocuments(me.id, documents); }
+    catch (e: unknown) {
+      const msg = (e as Error).message;
+      if (msg === 'ASSET_NOT_FOUND') return fail(reply, 'NOT_FOUND', 'Media asset not found — upload through the media pipeline first', 404);
+      if (msg === 'ASSET_NOT_CLEAN') return fail(reply, 'NOT_CLEAN', 'Document upload still in moderation', 409);
+      throw e;
+    }
+  }
+  // Any complete application (identity docs and/or NIN/BVN) goes to manual
+  // review so it lands in the admin KYC queue instead of a silent dead end.
+  if (documents?.length || nin || bvn) {
+    if (nin || bvn) await kycService.adapter.verifyIdentity(me.id, { nin, bvn }).catch(() => undefined);
+    return { data: await kycService.submitForReview(me.id) };
+  }
+  return { data: await kycService.status(me.id) };
 });
 app.post('/v1/provider/skills', async (req, reply) => {
   const me = await providerActor(req as never, reply);
@@ -884,6 +904,16 @@ app.post('/v1/provider/online', async (req, reply) => {
   const me = await providerActor(req as never, reply);
   if (!me) return reply;
   const { online, lat, lng } = z.object({ online: z.boolean(), lat: z.number().optional(), lng: z.number().optional() }).parse(req.body);
+  if (online) {
+    // Accepting live work requires an approved account — dispatch candidates,
+    // customer provider strips and payout rails all assume VERIFIED/active.
+    const rows = await q<{ kyc_status: string; status: string; verify_level: string }>(
+      `SELECT kyc_status, status, verify_level FROM provider.provider WHERE id=$1`, [me.id]);
+    const r = rows[0];
+    if (!r || String(r.kyc_status) !== 'VERIFIED' || String(r.status) !== 'active' || String(r.verify_level) === 'suspended') {
+      return fail(reply, 'KYC_REQUIRED', 'Complete identity verification before going online', 403);
+    }
+  }
   return { data: await providerService.setOnline(me.id, online, lat, lng) };
 });
 app.get('/v1/provider/offers', async (req, reply) => {
@@ -956,12 +986,21 @@ app.post('/v1/jobs/:id/transition', async (req, reply) => {
   let from = fromParam as JobStatus | undefined;
   if (!from) {
     // Derive the current status from the event log (server-authoritative).
-    // pg-mem misses constant TEXT lookups, so filter recent rows in JS — same
-    // pattern as provider.service offer reactivation.
-    const events = await q<{ job_id: string; to_status: string }>(
-      `SELECT job_id, to_status FROM booking.job_event ORDER BY created_at DESC LIMIT 200`,
-    );
-    const latest = events.find((e) => String(e.job_id) === jobId);
+    // Fast path: indexed job_id lookup (real Postgres). Fallback: scan recent
+    // rows in JS — pg-mem misses constant TEXT lookups, same pattern as
+    // provider.service offer reactivation.
+    let latest: { to_status: string } | undefined;
+    try {
+      const scoped = await q<{ to_status: string }>(
+        `SELECT to_status FROM booking.job_event WHERE job_id=$1 ORDER BY created_at DESC LIMIT 1`, [jobId]);
+      latest = scoped[0];
+    } catch { latest = undefined; }
+    if (!latest) {
+      const events = await q<{ job_id: string; to_status: string }>(
+        `SELECT job_id, to_status FROM booking.job_event ORDER BY created_at DESC LIMIT 200`,
+      );
+      latest = events.find((e) => String(e.job_id) === jobId);
+    }
     if (!latest) return fail(reply, 'NOT_FOUND', 'No job events for this job', 404);
     from = latest.to_status as JobStatus;
   }
@@ -1182,10 +1221,15 @@ app.get('/v1/geo/reverse-geocode', async (req) => {
   const query = req.query as { lat?: string; lng?: string };
   return { data: await maps.reverse(Number(query.lat), Number(query.lng)) };
 });
-app.get('/v1/provider/kyc/status', async (req) => {
-  const query = req.query as { providerId?: string };
-  if (!query.providerId) return { error: { code: 'BAD_REQUEST', message: 'providerId required', retryable: false } };
-  return { data: { ...(await kycService.status(query.providerId)), provider: kycService.activeProvider } };
+app.get('/v1/provider/kyc/status', async (req, reply) => {
+  // Session-scoped: providers read their own status. A client-supplied
+  // providerId used to make this endpoint an unauthenticated PII/status
+  // oracle — removed (admin detail lives behind /v1/admin/providers/:id).
+  const a = authed(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const me = await providerService.byUserId(a.sub);
+  if (!me) return fail(reply, 'NOT_FOUND', 'Provider profile not found', 404);
+  return { data: { ...(await kycService.status(me.id)), providerId: me.id, provider: kycService.activeProvider } };
 });
 // ---- ON-DEMAND service requests (Bolt-style broadcast + accept) ----
 app.post('/v1/service-requests', async (req, reply) => {
@@ -1368,7 +1412,10 @@ app.get('/v1/admin/jobs', async (req, reply) => {
   const a = await adminActor(req as never);
   if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   if ('denied' in a || !adminCan(a.role, 'booking:view:any')) return fail(reply, 'FORBIDDEN', 'Operations access required', 403);
-  return { data: await bookingService.list((req.query as { userId?: string }).userId ?? '') };
+  const userId = (req.query as { userId?: string }).userId;
+  // userId filter → one customer's history; absent → recent jobs across users
+  // (the old `list('')` always matched nothing, so the console showed an empty table).
+  return { data: userId ? await bookingService.list(userId) : await bookingService.listAll() };
 });
 app.post('/v1/admin/jobs/:id/assign', async (req, reply) => {
   const a = await adminActor(req as never);
@@ -1386,23 +1433,153 @@ app.post('/v1/admin/jobs/:id/flag', async (req, reply) => {
   await auditService.log(a.sub, `job.${(req.params as { id: string }).id}.flag=${f}`);
   return { data: await flagJob((req.params as { id: string }).id, f as never, a.sub, reason) };
 });
-app.get('/v1/admin/jobs/:id/flags', async (req) => ({ data: await flagsOf((req.params as { id: string }).id) }));
+app.get('/v1/admin/jobs/:id/flags', async (req, reply) => {
+  // Auth gap: was public — flag reasons can contain customer PII/dispute detail.
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'booking:view:any')) return fail(reply, 'FORBIDDEN', 'Operations access required', 403);
+  return { data: await flagsOf((req.params as { id: string }).id) };
+});
 app.post('/v1/admin/providers/:id/approve', async (req, reply) => {
   const a = await adminActor(req as never);
   if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   if ('denied' in a || !adminCan(a.role, 'provider:verify')) return fail(reply, 'FORBIDDEN', 'Trust & Safety access required', 403);
-  await auditService.log(a.sub, `provider.${(req.params as { id: string }).id}.approve`);
-  await providerService.verifyKyc((req.params as { id: string }).id);
-  return { data: await verificationService.set((req.params as { id: string }).id, 'verified') };
+  const id = (req.params as { id: string }).id;
+  const existing = await providerService.byId(id);
+  if (!existing) return fail(reply, 'NOT_FOUND', 'Provider not found', 404);
+  await auditService.log(a.sub, `provider.${id}.approve`, id);
+  await providerService.verifyKyc(id);
+  await kycService.markApproved(id, a.sub);
+  return { data: await verificationService.set(id, 'verified') };
+});
+app.post('/v1/admin/providers/:id/reject', async (req, reply) => {
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'provider:verify')) return fail(reply, 'FORBIDDEN', 'Trust & Safety access required', 403);
+  const id = (req.params as { id: string }).id;
+  const { reason } = z.object({ reason: z.string().min(3).max(500) }).parse(req.body);
+  const existing = await providerService.byId(id);
+  if (!existing) return fail(reply, 'NOT_FOUND', 'Provider not found', 404);
+  return { data: await kycService.reject(id, reason, a.sub) };
 });
 app.post('/v1/admin/providers/:id/suspend', async (req, reply) => {
   const a = await adminActor(req as never);
   if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   if ('denied' in a || !adminCan(a.role, 'provider:suspend')) return fail(reply, 'FORBIDDEN', 'Trust & Safety access required', 403);
-  const mc = await makerChecker.submit('suspension', (req.params as { id: string }).id, a.sub);
-  await auditService.log(a.sub, `provider.${(req.params as { id: string }).id}.suspend.queued=${mc.id}`);
-  const v = await verificationService.set((req.params as { id: string }).id, 'suspended');
+  const id = (req.params as { id: string }).id;
+  const existing = await providerService.byId(id);
+  if (!existing) return fail(reply, 'NOT_FOUND', 'Provider not found', 404);
+  // Fully suspend: status drives /v1/providers/approved + dispatch candidates,
+  // verify_level drives badges/online; online=false stops the location poller.
+  const mc = await makerChecker.submit('suspension', id, a.sub);
+  await q(`UPDATE provider.provider SET status='suspended', verify_level='suspended', online=FALSE WHERE id=$1`, [id]);
+  await auditService.log(a.sub, `provider.${id}.suspend.queued=${mc.id}`, id);
+  const v = await verificationService.set(id, 'suspended');
   return { data: { ...v, checkerId: mc.id } };
+});
+// Admin KYC review queue + detail (documents travel via media file URLs).
+app.get('/v1/admin/providers', async (req, reply) => {
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'provider:verify')) return fail(reply, 'FORBIDDEN', 'Trust & Safety access required', 403);
+  const status = (req.query as { status?: string }).status ?? 'UNDER_REVIEW';
+  const allowed = ['PENDING', 'UNDER_REVIEW', 'VERIFIED', 'REJECTED'];
+  const st = allowed.includes(status) ? status : 'UNDER_REVIEW';
+  const rows = await q<Record<string, unknown>>(
+    `SELECT p.id, p.kyc_status, p.kyc_submitted_at, p.business_name, p.rating, p.status, p.created_at,
+            u.name, u.phone, u.email,
+            (SELECT COUNT(*) FROM kyc.submission_document d WHERE d.provider_id = p.id) AS doc_count
+       FROM provider.provider p JOIN identity.users u ON u.id = p.user_id
+      WHERE p.kyc_status = $1
+      ORDER BY p.kyc_submitted_at DESC NULLS LAST, p.created_at DESC
+      LIMIT 100`, [st]);
+  return {
+    data: rows.map((r) => ({
+      id: String(r.id), name: String(r.name ?? 'Provider'), phone: r.phone ? String(r.phone) : null,
+      email: r.email ? String(r.email) : null, businessName: r.business_name ? String(r.business_name) : null,
+      kycStatus: String(r.kyc_status), status: String(r.status), rating: Number(r.rating ?? 0),
+      submittedAt: r.kyc_submitted_at ? String(r.kyc_submitted_at) : null,
+      createdAt: String(r.created_at), documentCount: Number(r.doc_count ?? 0),
+    })),
+  };
+});
+app.get('/v1/admin/providers/:id', async (req, reply) => {
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'provider:verify')) return fail(reply, 'FORBIDDEN', 'Trust & Safety access required', 403);
+  const id = (req.params as { id: string }).id;
+  const rows = await q<Record<string, unknown>>(
+    `SELECT p.*, u.name, u.phone, u.email
+       FROM provider.provider p JOIN identity.users u ON u.id = p.user_id WHERE p.id=$1`, [id]);
+  const r = rows[0];
+  if (!r) return fail(reply, 'NOT_FOUND', 'Provider not found', 404);
+  const documents = await kycService.documentsFor(id);
+  const docUrls = await Promise.all(documents.map(async (d) => {
+    const asset = await mediaService.get(d.assetId).catch(() => null);
+    return { ...d, url: asset?.url ?? null, moderation: asset?.status ?? null };
+  }));
+  return {
+    data: {
+      id: String(r.id), userId: String(r.user_id), name: String(r.name ?? 'Provider'),
+      phone: r.phone ? String(r.phone) : null, email: r.email ? String(r.email) : null,
+      businessName: r.business_name ? String(r.business_name) : null,
+      kycStatus: String(r.kyc_status), rejectionReason: r.kyc_rejection_reason ? String(r.kyc_rejection_reason) : null,
+      submittedAt: r.kyc_submitted_at ? String(r.kyc_submitted_at) : null,
+      reviewedAt: r.kyc_reviewed_at ? String(r.kyc_reviewed_at) : null,
+      reviewedBy: r.kyc_reviewed_by ? String(r.kyc_reviewed_by) : null,
+      status: String(r.status), verifyLevel: String(r.verify_level ?? 'pending'),
+      rating: Number(r.rating ?? 0), lat: r.lat ?? null, lng: r.lng ?? null,
+      serviceRadiusKm: r.service_radius_km != null ? Number(r.service_radius_km) : null,
+      bankName: r.bank_name ? String(r.bank_name) : null,
+      accountNumber: r.account_number ? String(r.account_number) : null,
+      bankCode: r.bank_code ? String(r.bank_code) : null,
+      documents: docUrls,
+      createdAt: String(r.created_at),
+    },
+  };
+});
+// Runtime map-provider switch (chain always terminates on keyless OSM).
+app.get('/v1/admin/maps/config', async (req, reply) => {
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'configuration:edit')) return fail(reply, 'FORBIDDEN', 'Super admin access required', 403);
+  const cfg = await getMapsConfig();
+  return { data: { provider: cfg.provider, fallbacks: cfg.fallbacks, availability: cfg.availability } };
+});
+app.put('/v1/admin/maps/config', async (req, reply) => {
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'configuration:edit')) return fail(reply, 'FORBIDDEN', 'Super admin access required', 403);
+  const enumNames = MAPS_PROVIDER_NAMES as [MapsProviderName, ...MapsProviderName[]];
+  const { provider, fallbacks } = z.object({
+    provider: z.enum(enumNames).optional(),
+    fallbacks: z.array(z.enum(enumNames)).max(3).optional(),
+  }).parse(req.body ?? {});
+  const cfg = await setMapsConfig({ provider, fallbacks });
+  await auditService.log(a.sub, `maps.provider=${cfg.provider} fallbacks=${cfg.fallbacks.join('|')}`);
+  return { data: { provider: cfg.provider, fallbacks: cfg.fallbacks, availability: cfg.availability } };
+});
+// Maker-checker decide (refund/suspension/etc. queue actions).
+app.post('/v1/admin/checker/:id/decide', async (req, reply) => {
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'payout:approve')) return fail(reply, 'FORBIDDEN', 'Finance access required', 403);
+  const { approve } = z.object({ approve: z.boolean() }).parse(req.body);
+  try {
+    const item = await makerChecker.decide((req.params as { id: string }).id, a.sub, approve);
+    await auditService.log(a.sub, `checker.${item.id}=${item.status}`, item.refId);
+    // Approved suspensions apply for real (submission only queued the record).
+    if (item.kind === 'suspension' && item.status === 'approved') {
+      await q(`UPDATE provider.provider SET status='suspended', verify_level='suspended', online=FALSE WHERE id=$1`, [item.refId]);
+      await auditService.log(a.sub, `provider.${item.refId}.suspend.applied`, item.refId);
+    }
+    return { data: item };
+  } catch (e: unknown) {
+    const msg = (e as Error).message;
+    if (msg === 'CHECKER_GONE') return fail(reply, 'CHECKER_GONE', 'Decision already recorded', 409);
+    if (msg === 'MAKER_CANNOT_CHECK') return fail(reply, 'MAKER_CANNOT_CHECK', 'Another admin must review this item', 403);
+    throw e;
+  }
 });
 app.get('/v1/admin/disputes', async (req, reply) => {
   const a = await adminActor(req as never);
@@ -1468,6 +1645,9 @@ app.get('/v1/mobile/config', async () => ({
     priceBook: await configurationService.priceBook(),
     flags: await configurationService.flags(),
     cities: await cityService.list(),
+    // Active map provider + fallbacks so the web/native layers render the
+    // right tiles (admin-switchable without redeploy; no secrets exposed).
+    maps: (async () => { const c = await getMapsConfig(); return { provider: c.provider, fallbacks: c.fallbacks }; })(),
     surfaces: ['user_app', 'provider_b2b_app', 'admin_console'],
   },
 }));

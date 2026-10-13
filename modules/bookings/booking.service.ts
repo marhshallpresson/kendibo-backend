@@ -64,6 +64,12 @@ export const bookingService = {
     void cursor;
     return { items: items.slice(0, 20), nextCursor: items.length > 20 ? items[19].id : null };
   },
+  /** Admin console: recent bookings across all users (was `list('')` → empty). */
+  async listAll(limit = 50) {
+    const rows = await q<Record<string, unknown>>(
+      `SELECT * FROM booking.booking ORDER BY created_at DESC LIMIT $1`, [Math.min(limit, 200)]);
+    return { items: rows.map(toBooking) };
+  },
   async listForProvider(providerId: string) {
     const rows = await q<Record<string, unknown>>(
       `SELECT b.* FROM booking.booking b

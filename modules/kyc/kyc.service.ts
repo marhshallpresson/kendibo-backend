@@ -6,7 +6,16 @@ import { q } from '../../packages/database/db.js';
 import { emit } from '../../packages/observability/emit.js';
 
 export type KycStatus = 'PENDING' | 'UNDER_REVIEW' | 'VERIFIED' | 'REJECTED';
-export interface KycResult { providerId: string; status: KycStatus; checks: Record<string, boolean> }
+export type KycDocumentKind = 'id_front' | 'id_back' | 'selfie' | 'cac' | 'other';
+export interface KycDocument { id: string; assetId: string; kind: KycDocumentKind; createdAt: string }
+export interface KycResult {
+  providerId: string;
+  status: KycStatus;
+  checks: Record<string, boolean>;
+  rejectionReason?: string | null;
+  submittedAt?: string | null;
+  documentCount?: number;
+}
 export interface KycPort {
   readonly name: string;
   readonly enabled: boolean;
@@ -31,7 +40,11 @@ export class StubKycAdapter implements KycPort {
     return persist(providerId, hasId ? 'UNDER_REVIEW' : 'PENDING', { document: hasId, liveness: false, manualReview: true });
   }
   async verifyBankAccount(accountNumber: string, _bankCode: string) {
-    return { ok: accountNumber.length === 10, name: 'Unverified (stub)' };
+    // No fabrication: the stub cannot resolve bank ownership. Callers route
+    // real resolution through /v1/payouts/resolve-account (Bachs); anything
+    // that still lands here must see a negative result, never a fake name.
+    void accountNumber;
+    return { ok: false as const };
   }
 }
 
@@ -102,8 +115,75 @@ export const kycService = {
   get activeProvider(): string { return dojah.enabled ? 'dojah' : 'stub'; },
   dojah, // exported for admin visibility; guard blocks use while disabled
   async status(providerId: string): Promise<KycResult> {
-    const rows = await q<{ kyc_status: string }>(`SELECT kyc_status FROM provider.provider WHERE id=$1`, [providerId]);
-    const s = (rows[0]?.kyc_status as KycStatus) ?? 'PENDING';
-    return { providerId, status: ['PENDING', 'UNDER_REVIEW', 'VERIFIED', 'REJECTED'].includes(s) ? s : 'PENDING', checks: {} };
+    const rows = await q<{
+      kyc_status: string; kyc_rejection_reason: string | null;
+      kyc_submitted_at: string | null; doc_count: string | number | null;
+    }>(
+      `SELECT p.kyc_status, p.kyc_rejection_reason, p.kyc_submitted_at,
+              (SELECT COUNT(*) FROM kyc.submission_document d WHERE d.provider_id = p.id) AS doc_count
+         FROM provider.provider p WHERE p.id=$1`,
+      [providerId],
+    );
+    if (!rows[0]) return { providerId, status: 'PENDING', checks: {} };
+    const s = (rows[0].kyc_status as KycStatus) ?? 'PENDING';
+    return {
+      providerId,
+      status: (['PENDING', 'UNDER_REVIEW', 'VERIFIED', 'REJECTED'] as string[]).includes(s) ? s : 'PENDING',
+      checks: {},
+      rejectionReason: rows[0].kyc_rejection_reason,
+      submittedAt: rows[0].kyc_submitted_at,
+      documentCount: Number(rows[0].doc_count ?? 0),
+    };
+  },
+  /** Attach already-clean media assets to the provider's KYC application. */
+  async attachDocuments(providerId: string, docs: Array<{ assetId: string; kind: KycDocumentKind }>): Promise<KycDocument[]> {
+    for (const d of docs) {
+      const asset = await q<{ status: string }>(`SELECT status FROM media.asset WHERE id=$1`, [d.assetId]);
+      if (!asset[0]) throw new Error('ASSET_NOT_FOUND');
+      if (String(asset[0].status) !== 'clean') throw new Error('ASSET_NOT_CLEAN');
+      try {
+        await q(`INSERT INTO kyc.submission_document (provider_id, asset_id, kind) VALUES ($1,$2,$3)`,
+          [providerId, d.assetId, d.kind]);
+      } catch { /* UNIQUE (provider_id, asset_id) — idempotent re-submit */ }
+    }
+    return this.documentsFor(providerId);
+  },
+  async documentsFor(providerId: string): Promise<KycDocument[]> {
+    const rows = await q<{ id: string; asset_id: string; kind: string; created_at: string }>(
+      `SELECT id, asset_id, kind, created_at FROM kyc.submission_document WHERE provider_id=$1 ORDER BY created_at ASC`,
+      [providerId],
+    );
+    return rows.map((r) => ({
+      id: String(r.id), assetId: String(r.asset_id), kind: r.kind as KycDocumentKind, createdAt: String(r.created_at),
+    }));
+  },
+  /**
+   * Full application received (docs and/or NIN/BVN) → queue for manual review.
+   * This is the transition that makes the admin KYC queue reachable.
+   */
+  async submitForReview(providerId: string): Promise<KycResult> {
+    await q(`UPDATE provider.provider SET kyc_status='UNDER_REVIEW', kyc_submitted_at=now(),
+                    kyc_rejection_reason=NULL WHERE id=$1`, [providerId]);
+    await q(`INSERT INTO audit.log (actor, action, entity_type, entity_id) VALUES ($1,$2,$3,$4)`,
+      [providerId, 'kyc.submitted', 'provider', providerId]);
+    emit('kyc.submitted', { providerId });
+    return this.status(providerId);
+  },
+  /** Admin rejection: reason is mandatory so the provider can act on it. */
+  async reject(providerId: string, reason: string, adminId: string): Promise<KycResult> {
+    await q(`UPDATE provider.provider SET kyc_status='REJECTED', kyc_rejection_reason=$2,
+                    kyc_reviewed_at=now(), kyc_reviewed_by=$3 WHERE id=$1`,
+      [providerId, reason, adminId]);
+    // verify_level back to pending so a resubmission can be approved cleanly.
+    await q(`UPDATE provider.provider SET verify_level='pending' WHERE id=$1 AND verify_level<>'verified'`, [providerId]);
+    await q(`INSERT INTO audit.log (actor, action, entity_type, entity_id, after) VALUES ($1,$2,$3,$4,$5::jsonb)`,
+      [adminId, 'kyc.rejected', 'provider', providerId, JSON.stringify({ reason })]);
+    emit('kyc.completed', { providerId, status: 'REJECTED', reason });
+    return this.status(providerId);
+  },
+  /** Admin approval timestamps alongside the verifyKyc status write. */
+  async markApproved(providerId: string, adminId: string): Promise<void> {
+    await q(`UPDATE provider.provider SET kyc_reviewed_at=now(), kyc_reviewed_by=$2,
+                    kyc_rejection_reason=NULL WHERE id=$1`, [providerId, adminId]);
   },
 };

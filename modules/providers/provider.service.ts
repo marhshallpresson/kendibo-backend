@@ -102,7 +102,10 @@ export const providerService = {
     return { ...o, status: 'declined' };
   },
   async offersFor(providerId: string) {
-    const rows = await q<Record<string, unknown>>(`SELECT * FROM dispatch.assignment WHERE provider_id=$1 ORDER BY created_at DESC`, [providerId]);
+    // Capped + indexed (idx_assignment_provider_status): the provider app
+    // polls this every 5s — unbounded history made every poll heavier.
+    const rows = await q<Record<string, unknown>>(
+      `SELECT * FROM dispatch.assignment WHERE provider_id=$1 ORDER BY created_at DESC LIMIT 50`, [providerId]);
     return rows;
   },
   async byId(id: string) {
