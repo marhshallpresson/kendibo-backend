@@ -33,6 +33,12 @@ const schema = z.object({
   WATCHUP_RELEASE: z.string().default('dev'),
   KYC_PROVIDER: z.string().default('stub'),
   DOJAH_API_KEY: z.string().default(''),
+  // Prembly (IdentityPass) — https://docs.prembly.com. Sandbox keys use the
+  // same base URL. PREMBLY_APP_ID is required for document/face endpoints.
+  PREMBLY_API_KEY: z.string().default(''),
+  PREMBLY_APP_ID: z.string().default(''),
+  PREMBLY_BASE_URL: z.string().default('https://api.prembly.com'),
+  PREMBLY_COUNTRY: z.string().default('NG'),
   ALLOW_OTP_DEBUG: z.string().default('false'),
 });
 export type AppConfig = z.infer<typeof schema>;
@@ -47,7 +53,8 @@ if (config.NODE_ENV === 'production') {
   }
   if (config.ALLOW_OTP_DEBUG === 'true') throw new Error('REFUSED TO BOOT — ALLOW_OTP_DEBUG must never be true in production');
   for (const [k, v] of [['BACHS_API_KEY', config.BACHS_API_KEY], ['TERMII_API_KEY', config.TERMII_API_KEY],
-      ['SMTP_HOST', config.SMTP_HOST], ['WATCHUP_API_KEY', config.WATCHUP_API_KEY]] as const) {
+      ['SMTP_HOST', config.SMTP_HOST], ['WATCHUP_API_KEY', config.WATCHUP_API_KEY],
+      ['PREMBLY_API_KEY', config.PREMBLY_API_KEY]] as const) {
     if (!v) console.warn(`[config] production running without ${k} (related feature degrades safely)`);
   }
 }

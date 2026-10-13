@@ -116,16 +116,22 @@ export const providerService = {
     const rows = await q<Record<string, unknown>>(`SELECT * FROM provider.provider WHERE user_id=$1 LIMIT 1`, [userId]);
     return rows[0] ? toProvider(rows[0]) : null;
   },
-  /** Storefront gallery, ordered for display. */
+  /** Storefront gallery, ordered for display. Includes the asset's signed URL
+   *  (ingest persists a long-lived signed URL) so clients never build an
+   *  unsigned /v1/media/:id/file path, which the local driver rejects. */
   async gallery(providerId: string) {
     const rows = await q<Record<string, unknown>>(
-      `SELECT id, asset_id, caption, position, created_at
-         FROM provider.gallery WHERE provider_id=$1
-        ORDER BY position ASC, created_at ASC`, [providerId],
+      `SELECT g.id, g.asset_id, g.caption, g.position, g.created_at, a.url, a.status AS asset_status
+         FROM provider.gallery g
+         LEFT JOIN media.asset a ON a.id = g.asset_id
+        WHERE g.provider_id=$1
+        ORDER BY g.position ASC, g.created_at ASC`, [providerId],
     );
     return rows.map((r) => ({
       id: String(r.id), assetId: String(r.asset_id), caption: r.caption ? String(r.caption) : null,
       position: Number(r.position ?? 0), createdAt: String(r.created_at),
+      url: r.url ? String(r.url) : null,
+      moderation: r.asset_status ? String(r.asset_status) : null,
     }));
   },
   /** Attach an already-clean media asset to the gallery. Idempotent per asset. */

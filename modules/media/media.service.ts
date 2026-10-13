@@ -11,6 +11,27 @@ export interface MediaAsset { id: string; sha256: string; status: 'quarantined' 
 
 const ALLOWED_MIME = ['image/jpeg', 'image/png', 'video/mp4', 'application/pdf'];
 
+/**
+ * Magic-byte sniff — a client-declared MIME is untrusted. Returns true when
+ * the buffer actually starts with the expected format's signature.
+ */
+function magicBytesMatch(bytes: Buffer, mime: string): boolean {
+  if (bytes.length < 8) return false;
+  switch (mime) {
+    case 'image/jpeg':
+      return bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+    case 'image/png':
+      return bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47;
+    case 'video/mp4':
+      // ISO BMFF: bytes 4..7 == 'ftyp'
+      return bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70;
+    case 'application/pdf':
+      return bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
+    default:
+      return false;
+  }
+}
+
 export const mediaService = {
   async presign(kind: MediaKind): Promise<{ uploadUrl: string; assetId: string; folder: MediaFolder }> {
     const id = newId('med');
@@ -28,7 +49,7 @@ export const mediaService = {
       await q(`UPDATE media.asset SET status='rejected' WHERE id=$1`, [assetId]);
       return { id: assetId, sha256: '', status: 'rejected', folder };
     }
-    if (!ALLOWED_MIME.includes(mime)) {
+    if (!ALLOWED_MIME.includes(mime) || !magicBytesMatch(bytes, mime)) {
       await q(`UPDATE media.asset SET status='rejected' WHERE id=$1`, [assetId]);
       return { id: assetId, sha256: '', status: 'rejected', folder };
     }

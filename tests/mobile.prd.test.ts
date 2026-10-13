@@ -50,9 +50,14 @@ describe('batch location ingest (Android tracker)', () => {
 describe('media ingest (evidence pipeline)', () => {
   it('accepts jpeg, rejects oversize/exe', async () => {
     const pre = await mediaService.presign('photo');
-    const ok = await mediaService.ingest(pre.assetId, Buffer.alloc(1024), 'image/jpeg');
+    // Real JPEG magic bytes (SOI + APP0/JFIF marker) — ingest sniffs content,
+    // a zero-filled buffer declared image/jpeg must be rejected.
+    const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(1024)]);
+    const ok = await mediaService.ingest(pre.assetId, jpeg, 'image/jpeg');
     assert.equal(ok.status, 'clean');
     assert.ok(ok.sha256.length === 64);
+    const pre0 = await mediaService.presign('photo');
+    assert.equal((await mediaService.ingest(pre0.assetId, Buffer.alloc(1024), 'image/jpeg')).status, 'rejected');
     const pre2 = await mediaService.presign('photo');
     assert.equal((await mediaService.ingest(pre2.assetId, Buffer.alloc(10), 'application/x-msdownload')).status, 'rejected');
   });

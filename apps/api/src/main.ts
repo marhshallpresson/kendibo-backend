@@ -851,8 +851,9 @@ app.delete('/v1/provider/gallery/:entryId', async (req, reply) => {
 app.post('/v1/provider/kyc', async (req, reply) => {
   const me = await providerActor(req as never, reply);
   if (!me) return reply;
-  const { nin, bvn, businessName, skills, bank, location, radiusKm, documents } = z.object({
+  const { nin, bvn, rcNumber, businessName, skills, bank, location, radiusKm, documents } = z.object({
     nin: z.string().optional(), bvn: z.string().optional(),
+    rcNumber: z.string().optional(),
     businessName: z.string().optional(),
     skills: z.array(z.string()).optional(),
     bank: z.object({ accountNumber: z.string(), bankCode: z.string(), bankName: z.string().optional(), accountName: z.string().optional() }).optional(),
@@ -860,7 +861,7 @@ app.post('/v1/provider/kyc', async (req, reply) => {
     radiusKm: z.number().int().min(1).max(50).optional(),
     documents: z.array(z.object({
       assetId: z.string(),
-      kind: z.enum(['id_front', 'id_back', 'selfie', 'cac', 'other']),
+      kind: z.enum(['id_front', 'id_back', 'selfie', 'cac', 'address', 'other']),
     })).max(8).optional(),
   }).parse(req.body ?? {});
   if (businessName || bank || location || radiusKm) {
@@ -886,13 +887,51 @@ app.post('/v1/provider/kyc', async (req, reply) => {
       throw e;
     }
   }
-  // Any complete application (identity docs and/or NIN/BVN) goes to manual
-  // review so it lands in the admin KYC queue instead of a silent dead end.
-  if (documents?.length || nin || bvn) {
-    if (nin || bvn) await kycService.adapter.verifyIdentity(me.id, { nin, bvn }).catch(() => undefined);
-    return { data: await kycService.submitForReview(me.id) };
+  // Tiered vendor checks (NIN/BVN -> doc+face -> CAC/address). Tier >=
+  // platform kyc.auto_verify_min_tier grants VERIFIED immediately; anything
+  // else lands UNDER_REVIEW in the admin queue. No inputs -> status only.
+  if (documents?.length || nin || bvn || rcNumber) {
+    const outcome = await kycService.runTierChecks('provider', me.id, {
+      nin, bvn, rcNumber, businessName,
+      documents: documents ?? [],
+    });
+    return { data: await kycService.applyProviderTier(me.id, outcome) };
   }
   return { data: await kycService.status(me.id) };
+});
+// ── USER (customer) KYC — session-scoped tiered verification ────────────────
+// Same 3-tier ladder as providers; customer rows live in kyc.customer.
+app.get('/v1/user/kyc', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  return { data: await kycService.userStatus(a.sub) };
+});
+app.post('/v1/user/kyc', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const { nin, bvn, rcNumber, businessName, documents } = z.object({
+    nin: z.string().optional(), bvn: z.string().optional(),
+    rcNumber: z.string().optional(), businessName: z.string().optional(),
+    documents: z.array(z.object({
+      assetId: z.string(),
+      kind: z.enum(['id_front', 'id_back', 'selfie', 'cac', 'address', 'other']),
+    })).max(8).optional(),
+  }).parse(req.body ?? {});
+  if (documents?.length) {
+    try { await kycService.attachUserDocuments(a.sub, documents); }
+    catch (e: unknown) {
+      const msg = (e as Error).message;
+      if (msg === 'ASSET_NOT_FOUND') return fail(reply, 'NOT_FOUND', 'Media asset not found — upload through the media pipeline first', 404);
+      if (msg === 'ASSET_NOT_CLEAN') return fail(reply, 'NOT_CLEAN', 'Document upload still in moderation', 409);
+      throw e;
+    }
+  }
+  if (documents?.length || nin || bvn || rcNumber) {
+    return {
+      data: await kycService.submitUserApplication(a.sub, {
+        nin, bvn, rcNumber, businessName, documents: documents ?? [],
+      }),
+    };
+  }
+  return { data: await kycService.userStatus(a.sub) };
 });
 app.post('/v1/provider/skills', async (req, reply) => {
   const me = await providerActor(req as never, reply);
@@ -1030,7 +1069,9 @@ app.post('/v1/notify', async (req, reply) => {
   const { template, to, vars } = z.object({ template: z.enum(TEMPLATES as unknown as [string, ...string[]]), to: z.object({ push: z.string().optional(), phone: z.string().optional() }), vars: z.record(z.string(), z.string()).optional() }).parse(req.body);
   return await notificationService.dispatch(template as (typeof TEMPLATES)[number], to, vars as Record<string, string>);
 });
-app.post('/v1/media/presign', async (req) => {
+app.post('/v1/media/presign', async (req, reply) => {
+  // Session-scoped: presign mints an upload slot + storage URL. Was public.
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   const { kind } = z.object({ kind: z.enum(['avatar', 'photo', 'video', 'doc']) }).parse(req.body);
   return { data: await mediaService.presign(kind) };
 });
@@ -1462,6 +1503,66 @@ app.post('/v1/admin/providers/:id/reject', async (req, reply) => {
   if (!existing) return fail(reply, 'NOT_FOUND', 'Provider not found', 404);
   return { data: await kycService.reject(id, reason, a.sub) };
 });
+// ── ADMIN: customer KYC queue — same Trust & Safety gate (provider:verify) ──
+app.get('/v1/admin/users/kyc', async (req, reply) => {
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'provider:verify')) return fail(reply, 'FORBIDDEN', 'Trust & Safety access required', 403);
+  const status = (req.query as { status?: string }).status ?? 'UNDER_REVIEW';
+  const allowed = ['PENDING', 'UNDER_REVIEW', 'VERIFIED', 'REJECTED'];
+  const st = allowed.includes(status) ? status : 'UNDER_REVIEW';
+  const rows = await q<Record<string, unknown>>(
+    `SELECT c.user_id, c.status, c.tier, c.submitted_at, u.name, u.phone, u.email,
+            (SELECT COUNT(*) FROM kyc.customer_document d WHERE d.user_id = c.user_id) AS doc_count
+       FROM kyc.customer c JOIN identity.users u ON u.id = c.user_id
+      WHERE c.status = $1
+      ORDER BY c.submitted_at DESC NULLS LAST
+      LIMIT 100`, [st]);
+  return {
+    data: rows.map((r) => ({
+      userId: String(r.user_id), name: String(r.name ?? 'Customer'),
+      phone: r.phone ? String(r.phone) : null, email: r.email ? String(r.email) : null,
+      status: String(r.status), tier: Number(r.tier ?? 0),
+      submittedAt: r.submitted_at ? String(r.submitted_at) : null,
+      documentCount: Number(r.doc_count ?? 0),
+    })),
+  };
+});
+app.get('/v1/admin/users/kyc/:userId', async (req, reply) => {
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'provider:verify')) return fail(reply, 'FORBIDDEN', 'Trust & Safety access required', 403);
+  const userId = (req.params as { userId: string }).userId;
+  const status = await kycService.userStatus(userId);
+  const docs = await kycService.userDocumentsFor(userId);
+  const docUrls = await Promise.all(docs.map(async (d) => {
+    const asset = await mediaService.get(d.assetId).catch(() => null);
+    return { ...d, url: asset?.url ?? null, moderation: asset?.status ?? null };
+  }));
+  const checks = await kycService.checksFor('user', userId);
+  return { data: { ...status, documents: docUrls, checks } };
+});
+app.post('/v1/admin/users/kyc/:userId/approve', async (req, reply) => {
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'provider:verify')) return fail(reply, 'FORBIDDEN', 'Trust & Safety access required', 403);
+  const userId = (req.params as { userId: string }).userId;
+  const status = await kycService.userStatus(userId);
+  if (!status.submittedAt && status.status === 'PENDING') return fail(reply, 'NOT_FOUND', 'No KYC application for this customer', 404);
+  await kycService.userApprove(userId, a.sub);
+  return { data: await kycService.userStatus(userId) };
+});
+app.post('/v1/admin/users/kyc/:userId/reject', async (req, reply) => {
+  const a = await adminActor(req as never);
+  if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  if ('denied' in a || !adminCan(a.role, 'provider:verify')) return fail(reply, 'FORBIDDEN', 'Trust & Safety access required', 403);
+  const userId = (req.params as { userId: string }).userId;
+  const { reason } = z.object({ reason: z.string().min(3).max(500) }).parse(req.body);
+  const status = await kycService.userStatus(userId);
+  if (!status.submittedAt && status.status === 'PENDING') return fail(reply, 'NOT_FOUND', 'No KYC application for this customer', 404);
+  await kycService.userReject(userId, reason, a.sub);
+  return { data: await kycService.userStatus(userId) };
+});
 app.post('/v1/admin/providers/:id/suspend', async (req, reply) => {
   const a = await adminActor(req as never);
   if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
@@ -1486,7 +1587,8 @@ app.get('/v1/admin/providers', async (req, reply) => {
   const allowed = ['PENDING', 'UNDER_REVIEW', 'VERIFIED', 'REJECTED'];
   const st = allowed.includes(status) ? status : 'UNDER_REVIEW';
   const rows = await q<Record<string, unknown>>(
-    `SELECT p.id, p.kyc_status, p.kyc_submitted_at, p.business_name, p.rating, p.status, p.created_at,
+    `SELECT p.id, p.kyc_status, p.kyc_submitted_at, p.kyc_tier, p.kyc_provider, p.nin_masked,
+            p.business_name, p.rating, p.status, p.created_at,
             u.name, u.phone, u.email,
             (SELECT COUNT(*) FROM kyc.submission_document d WHERE d.provider_id = p.id) AS doc_count
        FROM provider.provider p JOIN identity.users u ON u.id = p.user_id
@@ -1498,6 +1600,8 @@ app.get('/v1/admin/providers', async (req, reply) => {
       id: String(r.id), name: String(r.name ?? 'Provider'), phone: r.phone ? String(r.phone) : null,
       email: r.email ? String(r.email) : null, businessName: r.business_name ? String(r.business_name) : null,
       kycStatus: String(r.kyc_status), status: String(r.status), rating: Number(r.rating ?? 0),
+      tier: Number(r.kyc_tier ?? 0), kycProvider: r.kyc_provider ? String(r.kyc_provider) : null,
+      ninMasked: r.nin_masked ? String(r.nin_masked) : null,
       submittedAt: r.kyc_submitted_at ? String(r.kyc_submitted_at) : null,
       createdAt: String(r.created_at), documentCount: Number(r.doc_count ?? 0),
     })),
@@ -1524,6 +1628,8 @@ app.get('/v1/admin/providers/:id', async (req, reply) => {
       phone: r.phone ? String(r.phone) : null, email: r.email ? String(r.email) : null,
       businessName: r.business_name ? String(r.business_name) : null,
       kycStatus: String(r.kyc_status), rejectionReason: r.kyc_rejection_reason ? String(r.kyc_rejection_reason) : null,
+      tier: Number(r.kyc_tier ?? 0), kycProvider: r.kyc_provider ? String(r.kyc_provider) : null,
+      ninMasked: r.nin_masked ? String(r.nin_masked) : null,
       submittedAt: r.kyc_submitted_at ? String(r.kyc_submitted_at) : null,
       reviewedAt: r.kyc_reviewed_at ? String(r.kyc_reviewed_at) : null,
       reviewedBy: r.kyc_reviewed_by ? String(r.kyc_reviewed_by) : null,
@@ -1534,6 +1640,7 @@ app.get('/v1/admin/providers/:id', async (req, reply) => {
       accountNumber: r.account_number ? String(r.account_number) : null,
       bankCode: r.bank_code ? String(r.bank_code) : null,
       documents: docUrls,
+      checks: await kycService.checksFor('provider', id),
       createdAt: String(r.created_at),
     },
   };
@@ -1673,12 +1780,22 @@ app.post('/v1/provider/location/batch', async (req, reply) => {
 // Media ingest writes through the object store (quarantine -> promote).
 // Preferred mobile flow is direct PUT to the presigned uploadUrl.
 app.post('/v1/media/:id/ingest', async (req, reply) => {
+  // Session-scoped: ingest writes bytes into the object store. Was public.
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   try {
     const { dataBase64, mime } = z.object({ dataBase64: z.string(), mime: z.string() }).parse(req.body);
     const bytes = Buffer.from(dataBase64, 'base64');
     if (bytes.length === 0) return fail(reply, 'EMPTY_UPLOAD', 'No bytes received');
     return { data: await mediaService.ingest((req.params as { id: string }).id, bytes, mime) };
   } catch (e: unknown) { return fail(reply, 'INGEST_FAILED', (e as Error).message); }
+});
+// Asset status polling — clients (e.g. KYC doc uploads) poll until the
+// moderation scan settles so they know when an asset is safe to submit.
+app.get('/v1/media/:id', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const asset = await mediaService.get((req.params as { id: string }).id);
+  if (!asset) return fail(reply, 'NOT_FOUND', 'Asset not found', 404);
+  return { data: { id: asset.id, status: asset.status, mime: asset.mime ?? null } };
 });
 // Signed file delivery. Local driver serves bytes; s3 driver redirects to the
 // bucket-signed URL (Pxxl CDN Storage / R2 / MinIO).

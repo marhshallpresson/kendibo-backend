@@ -43,9 +43,17 @@ export function localDb(): IMemoryDb {
         // dispatch tests exercise. Real Postgres applies 013 untouched.
         sql = sql.replace(/INSERT INTO geo\.city[\s\S]*?ON CONFLICT[\s\S]*?;/i, '');
       }
-      if (f === '021_provider_gallery.sql' || f === '023_settings_kyc_perf.sql') {
+      if (f === '021_provider_gallery.sql' || f === '023_settings_kyc_perf.sql' || f === '024_kyc_tiers.sql') {
         // pg-mem ignores ON DELETE/SET NULL cascade verbs but accepts them.
         sql = sql.replace(/ ON DELETE CASCADE/gi, '');
+      }
+      if (f === '024_kyc_tiers.sql') {
+        // pg-mem can't DROP/ADD CHECK constraints; keep the 023 kind list.
+        // Real Postgres applies the full file — 'address' works in prod.
+        sql = sql
+          .split('\n')
+          .filter((l) => !/submission_document_kind_check/i.test(l))
+          .join('\n');
       }
       mem!.public.none(sql);
     } catch (e) {
@@ -74,7 +82,8 @@ export function localDb(): IMemoryDb {
   run('021_provider_gallery.sql');
   run('022_wallet_psp.sql');
   run('023_settings_kyc_perf.sql');
-  console.log('[localdb] pg-mem ready (001-019, 021-023)');
+  run('024_kyc_tiers.sql');
+  console.log('[localdb] pg-mem ready (001-019, 021-024)');
   return mem;
 }
 
