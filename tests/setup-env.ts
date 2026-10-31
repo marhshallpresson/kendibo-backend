@@ -10,7 +10,7 @@ const HERMETIC: Record<string, string> = {
   // Third-party credentials: blank so no real SMS, email, WhatsApp, push,
   // payment, KYC, AI or telemetry call can leave the machine.
   BACHS_API_KEY: '', BACHS_WEBHOOK_SECRET: '', BACHS_ACCOUNT_ID: '',
-  RESEND_API_KEY: '', SMTP_HOST: '', SMTP_USER: '', SMTP_PASS: '',
+  SMTP_HOST: '', SMTP_USER: '', SMTP_PASS: '',
   SLING_API_TOKEN: '', SLING_WEBHOOK_SECRET: '',
   WHATSAPP_ACCESS_TOKEN: '', WHATSAPP_PHONE_NUMBER_ID: '',
   PREMBLY_API_KEY: '', PREMBLY_SECRET_KEY: '', PREMBLY_PUBLIC_KEY: '', PREMBLY_APP_ID: '', DOJAH_SECRET_KEY: '',

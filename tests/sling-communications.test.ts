@@ -253,4 +253,51 @@ describe('Sling Omnichannel, AI-Assisted CTA Retainers & Bulk Campaigns', () => 
     assert.ok(Array.isArray(statusRes.json().data.automationRules));
     assert.ok(statusRes.json().data.automationRules.length >= 8);
   });
+
+  it('respects promo opt-outs, never markets to unknown numbers, and launches only once', async () => {
+    const optedOut = await createCustomer('Opted Out', '+2348061110001');
+    const reachable = await createCustomer('Still In', '+2348061110002');
+    await q(`INSERT INTO notification.user_preference (user_id, promo_enabled) VALUES ($1, false)`, [optedOut]);
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/admin/campaigns',
+      headers: adminHeaders(),
+      payload: {
+        name: 'Consent check',
+        kind: 'bulk_promotional',
+        channels: ['sms', 'inapp'],
+        targetSegment: 'custom_numbers',
+        messageBody: 'Deep cleaning is 10% off this week.',
+        aiAssisted: false,
+      },
+    });
+    assert.equal(created.statusCode, 200);
+    const id = created.json().data.campaign.id;
+    assert.equal(created.json().data.campaign.status, 'draft');
+
+    const launch = () => app.inject({
+      method: 'POST',
+      url: `/v1/admin/campaigns/${id}/launch`,
+      headers: adminHeaders(),
+      payload: { customNumbers: ['+2348061110001', '08061110002', '+2348069999999'] },
+    });
+    const first = await launch();
+    assert.equal(first.statusCode, 200);
+    const stats = first.json().data.stats;
+    assert.equal(stats.targeted, 1, 'only the customer who has not opted out');
+    assert.equal(stats.skippedOptOut, 1);
+    assert.equal(stats.skippedNoConsent, 1, 'a number with no account gets no promotion');
+    assert.equal(stats.channels.sms, 'sent');
+    assert.equal(first.json().data.status, 'completed');
+
+    const inbox = await q<{ user_id: string }>(
+      `SELECT user_id FROM notification.delivery_log WHERE campaign_id = $1 AND channel = 'inapp'`, [id],
+    );
+    assert.deepEqual(inbox.map((r) => String(r.user_id)), [reachable]);
+
+    const again = await launch();
+    assert.equal(again.statusCode, 409);
+    assert.equal(again.json().error.code, 'CAMPAIGN_ALREADY_LAUNCHED');
+  });
 });

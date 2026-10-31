@@ -1680,12 +1680,18 @@ app.post('/v1/admin/campaigns', async (req) => {
   return { data: created };
 });
 app.post('/v1/admin/campaigns/:id/launch', async (req, reply) => {
+  const body = z.object({ customNumbers: z.array(z.string()).max(50_000).optional() }).safeParse(req.body ?? {});
+  if (!body.success) return fail(reply, 'VALIDATION', 'customNumbers must be a list of phone numbers', 400);
   try {
-    const body = z.object({ customNumbers: z.array(z.string()).optional() }).parse(req.body ?? {});
-    const launched = await slingAutomationService.launchCampaign((req.params as { id: string }).id, body.customNumbers);
+    const launched = await slingAutomationService.launchCampaign((req.params as { id: string }).id, body.data.customNumbers);
     return { data: launched };
   } catch (e: unknown) {
-    return fail(reply, 'CAMPAIGN_NOT_FOUND', (e as Error).message, 404);
+    const code = (e as Error).message;
+    if (code === 'CAMPAIGN_ALREADY_LAUNCHED') {
+      return fail(reply, code, 'This campaign has already gone out. Only a failed campaign can be launched again, and then only what failed is re-sent.', 409);
+    }
+    if (code === 'CAMPAIGN_NOT_FOUND') return fail(reply, code, 'Campaign not found', 404);
+    throw e;
   }
 });
 app.get('/v1/admin/sling/status', async () => {

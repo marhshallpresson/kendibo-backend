@@ -50,9 +50,20 @@ export interface BulkCampaignRecord {
   scheduledAt?: string | null;
   status: 'draft' | 'scheduled' | 'running' | 'completed' | 'failed';
   slingCampaignId?: string | null;
-  stats: { targeted: number; sent: number; delivered: number; failed: number };
+  stats: {
+    targeted: number; sent: number; delivered: number; failed: number;
+    skippedOptOut?: number; skippedNoConsent?: number;
+    /** Per-channel outcome of the last launch; a relaunch only re-sends what failed. */
+    channels?: Record<string, 'sent' | 'failed' | 'skipped'>;
+  };
   createdBy: string;
   createdAt: string;
+}
+
+interface AudienceRow {
+  id: string; phone: string | null; email: string | null; name: string | null;
+  promo_enabled: boolean | null; sms_enabled: boolean | null; whatsapp_enabled: boolean | null;
+  rcs_enabled: boolean | null; push_enabled: boolean | null; email_enabled: boolean | null;
 }
 
 function computeNextRunIso(cadence: RetainerCadence, from: Date = new Date()): string {
@@ -513,7 +524,8 @@ export class SlingAutomationService {
     const subject = input.subject || aiVariant?.emailSubject || input.name;
     const ctaLabel = input.ctaLabel || aiVariant?.ctaLabel || 'Open KENDIBO';
     const ctaUrl = input.ctaUrl || aiVariant?.ctaUrl || 'https://kendibo.com';
-    const status: BulkCampaignRecord['status'] = input.scheduledAt ? 'scheduled' : 'draft';
+    // 'scheduled' means handed to Sling with send_on; until it is launched it stays a draft.
+    const status: BulkCampaignRecord['status'] = 'draft';
 
     await q(
       `INSERT INTO notification.campaign
@@ -569,71 +581,128 @@ export class SlingAutomationService {
   }
 
   /**
-   * Launches a Bulk Campaign across Sling (`mode: "campaign"`) + FCM Push + In-App Inbox.
+   * Launches a campaign across Sling (`mode: "campaign"`), email, push and the in-app inbox.
+   *
+   * One-shot: the row is claimed atomically (draft → running), so a double click or a
+   * retried request can't send it twice. A failed campaign can be launched again and only
+   * what failed goes out: Sling channels that failed, and per-person sends with no
+   * successful delivery_log row for this campaign.
+   *
+   * Audience: active accounts only. Every send skips channels the person turned off;
+   * promotional kinds also skip anyone who turned promotions off (or replied STOP), and
+   * never go to numbers that don't belong to an account (no consent to market to them,
+   * NDPA 2023). A Sling group can't be filtered by our opt-outs, so promotional sends
+   * always use the filtered number list.
    */
   public async launchCampaign(campaignId: string, customNumbers?: string[]): Promise<BulkCampaignRecord> {
-    const rows = await q<Record<string, unknown>>(`SELECT * FROM notification.campaign WHERE id = $1`, [campaignId]);
-    const row = rows[0];
-    if (!row) throw new Error(`Campaign ${campaignId} not found`);
-
-    const campaign = this.mapCampaignRow(row);
-    const roleFilter =
-      campaign.targetSegment === 'all_providers'
-        ? `WHERE role = 'PROVIDER'`
-        : campaign.targetSegment === 'all_customers'
-          ? `WHERE role != 'PROVIDER'`
-          : '';
-    const users = await q<{ id: string; phone: string | null; email: string | null; name: string | null }>(
-      `SELECT id::text, phone, email, name FROM identity.users ${roleFilter}`,
-    ).catch(() => [] as { id: string; phone: string | null; email: string | null; name: string | null }[]);
-
-    const phones = customNumbers?.length
-      ? customNumbers.map(normalizeNigerianPhone).filter(Boolean)
-      : users.map((u) => normalizeNigerianPhone(u.phone || '')).filter(Boolean);
-
-    const msgType = campaign.kind === 'comms_alert' ? 'transactional' : 'promotional';
-    let slingCampaignId = campaign.slingCampaignId ?? `slg_cmp_${campaign.id.slice(0, 8)}`;
-    let sentCount = 0;
-    let failedCount = 0;
-
-    // 1. Dispatch bulk Sling channels (sms, whatsapp, rcs, truecaller, email) via Sling v2 campaign mode
-    const slingChannels = campaign.channels.filter((c): c is SlingChannel =>
-      ['sms', 'whatsapp', 'rcs', 'truecaller', 'email'].includes(c),
+    const claimed = await q<Record<string, unknown>>(
+      `UPDATE notification.campaign SET status = 'running', updated_at = now()
+       WHERE id = $1 AND status IN ('draft', 'failed') RETURNING *`,
+      [campaignId],
     );
-    for (const ch of slingChannels) {
+    if (!claimed[0]) {
+      const exists = await q<{ status: string }>(`SELECT status FROM notification.campaign WHERE id = $1`, [campaignId]);
+      throw new Error(exists[0] ? 'CAMPAIGN_ALREADY_LAUNCHED' : 'CAMPAIGN_NOT_FOUND');
+    }
+    const campaign = this.mapCampaignRow(claimed[0]);
+    const promotional = campaign.kind !== 'comms_alert';
+    const msgType = promotional ? 'promotional' : 'transactional';
+    const before = campaign.stats.channels ?? {};
+
+    const segment =
+      campaign.targetSegment === 'all_providers' ? `AND u.role = 'PROVIDER'`
+        : campaign.targetSegment === 'all_customers' ? `AND u.role <> 'PROVIDER'`
+          : campaign.targetSegment === 'active_retainers'
+            ? `AND u.id::text IN (SELECT user_id FROM notification.retainer_schedule WHERE status = 'active')`
+            : '';
+    const people = await q<AudienceRow>(
+      `SELECT u.id::text AS id, u.phone, u.email, u.name, p.promo_enabled, p.sms_enabled,
+              p.whatsapp_enabled, p.rcs_enabled, p.push_enabled, p.email_enabled
+       FROM identity.users u LEFT JOIN notification.user_preference p ON p.user_id = u.id::text
+       WHERE COALESCE(u.status, 'active') = 'active' ${segment}`,
+    );
+
+    let skippedOptOut = 0;
+    let skippedNoConsent = 0;
+    let audience: AudienceRow[] = people;
+    const strangers: string[] = []; // numbers with no account: operational alerts only
+    if (customNumbers?.length || campaign.targetSegment === 'custom_numbers') {
+      const byPhone = new Map<string, AudienceRow>();
+      for (const p of people) {
+        const n = normalizeNigerianPhone(p.phone || '');
+        if (n) byPhone.set(n, p);
+      }
+      audience = [];
+      for (const n of new Set((customNumbers ?? []).map(normalizeNigerianPhone).filter(Boolean))) {
+        const p = byPhone.get(n);
+        if (p) audience.push(p);
+        else if (promotional) skippedNoConsent++;
+        else strangers.push(n);
+      }
+    }
+    if (promotional) {
+      const all = audience.length;
+      audience = audience.filter((p) => p.promo_enabled !== false);
+      skippedOptOut = all - audience.length;
+    }
+    const allows = (p: AudienceRow, ch: NotificationChannel) =>
+      ({ sms: p.sms_enabled, truecaller: p.sms_enabled, whatsapp: p.whatsapp_enabled, rcs: p.rcs_enabled,
+        push: p.push_enabled, email: p.email_enabled, inapp: true } as Record<string, boolean | null>)[ch] !== false;
+
+    const channels: Record<string, 'sent' | 'failed' | 'skipped'> = { ...before };
+    let slingCampaignId = campaign.slingCampaignId ?? null;
+    let sent = 0;
+    let failed = 0;
+
+    // 1. Sling bulk channels: one campaign send per channel.
+    for (const ch of campaign.channels) {
+      if (!['sms', 'whatsapp', 'rcs', 'truecaller'].includes(ch) || before[ch] === 'sent') continue;
+      const numbers = [...new Set([
+        ...audience.filter((p) => allows(p, ch)).map((p) => normalizeNigerianPhone(p.phone || '')).filter(Boolean),
+        ...strangers,
+      ])];
+      const viaGroup = !promotional && !!campaign.slingGroupId && !customNumbers?.length;
+      if (!numbers.length && !viaGroup) { channels[ch] = 'skipped'; continue; }
       try {
         const res = await this.sling.sendUniversal({
-          channel: ch,
+          channel: ch as SlingChannel,
           mode: 'campaign',
           campaign_name: campaign.name,
           type: msgType,
           message: campaign.messageBody,
           subject: campaign.subject || campaign.name,
-          group: campaign.slingGroupId || 'kendibo-customers',
-          numbers: !campaign.slingGroupId && phones.length ? phones.join('\n') : undefined,
+          ...(viaGroup ? { group: campaign.slingGroupId! } : { numbers: numbers.join('\n') }),
           send_on: campaign.scheduledAt || undefined,
           reference: `cmp_${campaign.id.slice(0, 8)}_${ch}`,
         });
         slingCampaignId = res.message_id;
-        sentCount += Math.max(phones.length, 1);
+        sent += viaGroup ? 0 : numbers.length;
+        channels[ch] = 'sent';
       } catch {
-        failedCount++;
+        failed += numbers.length;
+        channels[ch] = 'failed';
       }
     }
 
-    // 2. Dispatch Push / In-App notifications to matched Kendibo users
-    if (campaign.channels.includes('push') || campaign.channels.includes('inapp')) {
-      for (const u of users) {
+    // 2. Email, push and in-app go person by person (sendOmnichannel re-checks preferences).
+    const perPerson = campaign.channels.filter((c) => (c === 'email' || c === 'push' || c === 'inapp') && before[c] !== 'sent');
+    if (perPerson.length) {
+      const done = new Set(
+        (await q<{ user_id: string; channel: string }>(
+          `SELECT user_id, channel FROM notification.delivery_log WHERE campaign_id = $1 AND status = 'sent'`, [campaign.id],
+        )).map((r) => `${r.user_id}:${r.channel}`),
+      );
+      const outcome: Record<string, { ok: number; bad: number }> = {};
+      for (const c of perPerson) outcome[c] = { ok: 0, bad: 0 };
+      for (const u of audience) {
+        const chs = perPerson.filter((c) => allows(u, c) && !done.has(`${u.id}:${c}`) && (c !== 'email' || !!u.email));
+        if (!chs.length) continue;
         const res = await this.notifications.sendOmnichannel({
           recipientId: u.id,
-          channels: campaign.channels.filter((c) => c === 'push' || c === 'inapp'),
+          channels: chs,
           template: 'ai.retainer.cta',
-          vars: {
-            name: u.name || 'there',
-            title: campaign.subject || campaign.name,
-            body: campaign.messageBody,
-          },
-          category: campaign.kind === 'comms_alert' ? 'order' : 'promo',
+          vars: { name: u.name || 'there', title: campaign.subject || campaign.name, body: campaign.messageBody },
+          category: promotional ? 'promo' : 'order',
           msgType,
           ctaLabel: campaign.ctaLabel || undefined,
           ctaUrl: campaign.ctaUrl || undefined,
@@ -641,31 +710,31 @@ export class SlingAutomationService {
           aiAssisted: campaign.aiAssisted,
           campaignId: campaign.id,
         });
-        sentCount += res.results.length;
+        for (const n of res.results) {
+          if (n.status === 'failed') { outcome[n.channel].bad++; failed++; }
+          else { outcome[n.channel].ok++; sent++; }
+        }
       }
+      for (const c of perPerson) channels[c] = outcome[c].bad ? 'failed' : outcome[c].ok ? 'sent' : 'skipped';
     }
 
-    const stats = {
-      targeted: Math.max(users.length, phones.length, 1),
-      sent: Math.max(sentCount, 1),
-      delivered: Math.max(sentCount - failedCount, 1),
-      failed: failedCount,
+    const stats: BulkCampaignRecord['stats'] = {
+      targeted: audience.length + strangers.length,
+      sent: campaign.stats.sent + sent, // a relaunch adds to what already went out
+      delivered: campaign.stats.delivered,
+      failed,
+      skippedOptOut,
+      skippedNoConsent,
+      channels,
     };
-    const finalStatus: BulkCampaignRecord['status'] = campaign.scheduledAt ? 'scheduled' : 'completed';
-
+    const finalStatus: BulkCampaignRecord['status'] = Object.values(channels).includes('failed')
+      ? 'failed'
+      : campaign.scheduledAt ? 'scheduled' : 'completed';
     await q(
-      `UPDATE notification.campaign
-       SET status = $1, sling_campaign_id = $2, stats = $3, updated_at = now()
-       WHERE id = $4`,
+      `UPDATE notification.campaign SET status = $1, sling_campaign_id = $2, stats = $3, updated_at = now() WHERE id = $4`,
       [finalStatus, slingCampaignId, JSON.stringify(stats), campaign.id],
     );
-
-    return {
-      ...campaign,
-      status: finalStatus,
-      slingCampaignId,
-      stats,
-    };
+    return { ...campaign, status: finalStatus, slingCampaignId, stats };
   }
 
   public async listCampaigns(): Promise<BulkCampaignRecord[]> {
@@ -777,6 +846,9 @@ export class SlingAutomationService {
         sent: Number(rawStats?.sent ?? 0),
         delivered: Number(rawStats?.delivered ?? 0),
         failed: Number(rawStats?.failed ?? 0),
+        skippedOptOut: Number(rawStats?.skippedOptOut ?? 0),
+        skippedNoConsent: Number(rawStats?.skippedNoConsent ?? 0),
+        channels: rawStats?.channels && typeof rawStats.channels === 'object' ? rawStats.channels : undefined,
       },
       createdBy: String(row.created_by || 'admin'),
       createdAt: row.created_at ? new Date(String(row.created_at)).toISOString() : new Date().toISOString(),

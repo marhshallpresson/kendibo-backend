@@ -84,9 +84,9 @@ export const INTEGRATIONS: Integration[] = [
     ],
   },
   {
-    id: 'fallback_comms', name: 'Resend / FCM', purpose: 'Email fallback and push', docs: '',
+    id: 'fallback_comms', name: 'SMTP / FCM', purpose: 'Email (SMTP first, Sling email next) and push', docs: '',
     keys: [
-      { env: 'RESEND_API_KEY', exposure: 'secret', requiredInProd: false, note: 'Email fallback' },
+      { env: 'SMTP_PASS', exposure: 'secret', requiredInProd: false, note: 'SMTP relay password (with SMTP_HOST / SMTP_USER); without SMTP, email goes through Sling' },
       { env: 'FIREBASE_SERVICE_ACCOUNT_JSON', exposure: 'secret', requiredInProd: false, note: 'FCM HTTP v1 (the legacy server key API is retired)' },
     ],
   },

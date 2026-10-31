@@ -1,5 +1,5 @@
 // Real notification channel adapters — Sling (HelloSling / SlingAfrica) primary omnichannel
-// engine across SMS, WhatsApp, RCS, Truecaller & Email + FCM HTTP v1 push + SMTP/Resend email fallbacks.
+// engine across SMS, WhatsApp, RCS, Truecaller & Email + FCM HTTP v1 push; SMTP is the first email route.
 // Every adapter falls back cleanly to structured log in local dev when keys are unset.
 import nodemailer, { type Transporter } from 'nodemailer';
 import {
@@ -130,16 +130,14 @@ export class SlingTruecallerAdapter implements TruecallerPort {
  * Email adapter:
  *   1. Direct SMTP via Nodemailer when `SMTP_HOST` + `SMTP_USER` + `SMTP_PASS` are set
  *   2. Sling Email (`POST /api/v2/send-email`) when `SLING_API_TOKEN` is set
- *   3. Resend HTTP API when `RESEND_API_KEY` is set
- *   4. Structured console log in local dev
+ *   3. Local dev only: a log line (subject, never the body). Production refuses instead.
  */
-export class ResendEmailAdapter implements EmailPort {
+export class EmailAdapter implements EmailPort {
   private readonly smtpHost = process.env.SMTP_HOST || '';
   private readonly smtpPort = Number(process.env.SMTP_PORT || 465);
   private readonly smtpSecure = (process.env.SMTP_SECURE ?? 'true') !== 'false';
   private readonly smtpUser = process.env.SMTP_USER || '';
   private readonly smtpPass = process.env.SMTP_PASS || '';
-  private readonly resendKey = process.env.RESEND_API_KEY || '';
   private readonly from = process.env.EMAIL_FROM || (this.smtpUser ? `KENDIBO <${this.smtpUser}>` : 'KENDIBO <hello@kendibo.com>');
   private transporter: Transporter | null = null;
 
@@ -170,16 +168,7 @@ export class ResendEmailAdapter implements EmailPort {
       const res = await this.sling.sendEmail({ to, subject, message: html, reference: opts?.reference });
       return { id: res.message_id, provider: 'sling-email', reference: res.reference };
     }
-    if (this.resendKey) {
-      const r = await fetch('https://api.resend.com/emails', {
-        method: 'POST', signal: AbortSignal.timeout(10_000),
-        headers: { authorization: `Bearer ${this.resendKey}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ from: this.from, to: [to], subject, html }),
-      });
-      const j = (await r.json().catch(() => ({}))) as Record<string, unknown>;
-      if (!r.ok) throw new Error(String(j.message ?? `Resend HTTP ${r.status}`));
-      return { id: String(j.id ?? ''), provider: 'resend', reference: opts?.reference };
-    }
+    if (process.env.NODE_ENV === 'production') throw new Error('EMAIL_NOT_CONFIGURED');
     console.log(`[email:dev] -> ${to} | ${subject}`);
     return { id: `dev_email_${Date.now()}`, provider: 'email-dev', reference: opts?.reference };
   }
@@ -246,6 +235,6 @@ export const sms: SmsPort = new SlingSmsAdapter();
 export const whatsapp: WhatsAppPort = new SlingWhatsAppAdapter();
 export const rcs: RcsPort = new SlingRcsAdapter();
 export const truecaller: TruecallerPort = new SlingTruecallerAdapter();
-export const email: EmailPort = new ResendEmailAdapter();
+export const email: EmailPort = new EmailAdapter();
 export const push: PushPort = new FcmPushAdapter();
 

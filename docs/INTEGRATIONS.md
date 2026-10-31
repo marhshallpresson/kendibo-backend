@@ -34,7 +34,7 @@ production.
 | Prembly | `PREMBLY_SECRET_KEY` (sent as `x-api-key`), `PREMBLY_APP_ID` (sent as `app-id`) | `PREMBLY_ENVIRONMENT` (`sandbox`/`live`), `KYC_COST_*_KOBO`, `KYC_*_BUDGET_KOBO`, `KYC_MAX_ATTEMPTS_PER_DAY`, `KYC_CACHE_DAYS`, `KYC_FEE_PASSTHROUGH` | `PREMBLY_PUBLIC_KEY` (widget/SDK only; unused today) | — |
 | WhatsApp Cloud API | `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_VERIFY_TOKEN` | `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_GRAPH_VERSION` | — | `<API>/webhooks/whatsapp` (subscribe to `messages`) |
 | Sling (only SMS provider) | `SLING_API_TOKEN`, `SLING_WEBHOOK_SECRET` | `SLING_*_SENDER` | — | `<API>/webhooks/sling` |
-| Resend (email fallback) | `RESEND_API_KEY` | `EMAIL_FROM` | — | — |
+| Email (SMTP first, then Sling email) | `SMTP_PASS` | `SMTP_HOST`, `SMTP_USER`, `SMTP_PORT`, `EMAIL_FROM` | — | — |
 | FCM push | `FIREBASE_SERVICE_ACCOUNT_JSON` or `GOOGLE_APPLICATION_CREDENTIALS` | — | `google-services.json` (EAS secret file) | — |
 | Gemini | `GEMINI_API_KEY` | `GEMINI_MODEL` | — | — |
 | Storage | `STORAGE_ACCESS_KEY`, `STORAGE_SECRET_KEY`, `FTP_PASS` | `STORAGE_DRIVER`, `STORAGE_ENDPOINT`, `STORAGE_BUCKET` | — | — |

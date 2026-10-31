@@ -22,7 +22,6 @@ const schema = z.object({
   BACHS_WEBHOOK_SECRET: z.string().default(''),
   BACHS_ACCOUNT_ID: z.string().default(''),
   SMTP_HOST: z.string().default(''),
-  RESEND_API_KEY: z.string().default(''),
   WATCHUP_API_KEY: z.string().default(''),
   WATCHUP_ENV: z.string().default('development'),
   WATCHUP_RELEASE: z.string().default('dev'),
@@ -74,5 +73,6 @@ if (config.NODE_ENV === 'production') {
       ['PREMBLY_APP_ID', config.PREMBLY_APP_ID]] as const) {
     if (!v) console.warn(`[config] production running without ${k} (related feature degrades safely)`);
   }
+  if (config.KYC_PROVIDER === 'stub') console.warn('[config] KYC_PROVIDER=stub: identity checks are simulated, nobody is really verified');
   if (config.PREMBLY_ENVIRONMENT !== 'live') console.warn('[config] PREMBLY_ENVIRONMENT is not "live": identity checks are using sandbox keys');
 }

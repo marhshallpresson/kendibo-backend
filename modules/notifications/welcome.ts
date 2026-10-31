@@ -72,7 +72,7 @@ export const welcomeService = {
         .catch(() => {});
     }
 
-    // 3) Email via the existing channel port (SMTP relay, Sling Email, or Resend).
+    // 3) Email via the existing channel port (SMTP relay or Sling Email).
     if (user.email) {
       void emailPort.send(user.email, SUBJECT, welcomeHtml(name)).catch((e) => {
         console.warn('[welcome] email failed', (e as Error).message);

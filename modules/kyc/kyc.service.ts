@@ -645,6 +645,8 @@ export const premblySecret = () => (process.env.PREMBLY_SECRET_KEY || process.en
 
 export function selectKycAdapter(): KycAdapter {
   const pref = (process.env.KYC_PROVIDER || 'prembly').toLowerCase();
+  // An explicit stub means no provider calls at all, even when keys are present.
+  if (pref === 'stub') return new PremblySandboxAdapter();
   if (pref === 'prembly' && premblySecret()) {
     return new PremblyKycAdapter(premblySecret(), process.env.PREMBLY_APP_ID || '');
   }

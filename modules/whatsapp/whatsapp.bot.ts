@@ -141,6 +141,28 @@ export async function handleInbound(m: InboundMessage, profileName?: string): Pr
   const user = await userFor(to, profileName);
   s.userId = user.id;
 
+  // Marketing opt-out (Meta policy, NDPA 2023): STOP turns promotions off on every
+  // channel; START turns them back on for someone who opted out. Booking updates
+  // still go out, because the customer asked for those.
+  if (!id && /^(stop|unsubscribe|stop promos?|stop promotions?)$/.test(lower)) {
+    const { notificationService } = await import('../notifications/notification.service.js');
+    await notificationService.updateUserPreferences(user.id, { promo: false });
+    emit('whatsapp.opt_out', { userId: user.id });
+    s.state = 'MENU'; s.data = {};
+    await saveSession(s);
+    await wa.text(to, "Done. You won't get offers or promotions from Kendibo. You'll still get messages about your own bookings. Reply START to get offers again.");
+    return;
+  }
+  if (!id && lower === 'start') {
+    const { notificationService } = await import('../notifications/notification.service.js');
+    if (!(await notificationService.getUserPreferences(user.id)).promo) {
+      await notificationService.updateUserPreferences(user.id, { promo: true });
+      emit('whatsapp.opt_in', { userId: user.id });
+      await wa.text(to, "You're back on Kendibo offers. Reply STOP any time to opt out.");
+      return;
+    }
+  }
+
   // ── AI agent path ────────────────────────────────────────────────────────
   const { aiConfigured, runAgent, addPhotoToDraft } = await import('./agent.js');
   if (aiConfigured()) {
@@ -211,7 +233,7 @@ export async function handleInbound(m: InboundMessage, profileName?: string): Pr
     // AI failed (outage/timeout): fall through to the deterministic menu flow.
   }
 
-  if (!id && ['hi', 'hello', 'menu', 'start', 'restart', 'cancel', 'stop'].includes(lower)) {
+  if (!id && ['hi', 'hello', 'menu', 'start', 'restart', 'cancel'].includes(lower)) {
     s.state = 'MENU'; s.data = {};
     await saveSession(s);
     return sendMenu(to, profileName);
