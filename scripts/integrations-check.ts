@@ -106,12 +106,34 @@ async function main() {
   });
 
   await check('WhatsApp Cloud API (Meta)', ['WHATSAPP_ACCESS_TOKEN', 'WHATSAPP_PHONE_NUMBER_ID'], async () => {
-    const v = env('WHATSAPP_GRAPH_VERSION') || 'v21.0';
+    const v = env('WHATSAPP_GRAPH_VERSION') || 'v26.0';
     const j = await json(await fetch(`https://graph.facebook.com/${v}/${env('WHATSAPP_PHONE_NUMBER_ID')}?fields=display_phone_number,verified_name,quality_rating`, {
       headers: { Authorization: `Bearer ${env('WHATSAPP_ACCESS_TOKEN')}` }, signal: timeout(),
     }), 'phone number');
+    const dbg = await json(await fetch(`https://graph.facebook.com/${v}/debug_token?input_token=${encodeURIComponent(env('WHATSAPP_ACCESS_TOKEN'))}&access_token=${encodeURIComponent(env('WHATSAPP_ACCESS_TOKEN'))}`, { signal: timeout() }), 'token check');
+    const exp = Number((dbg.data as { expires_at?: number } | undefined)?.expires_at ?? 0);
     return `${String(j.verified_name ?? '?')} ${String(j.display_phone_number ?? '')}, quality ${String(j.quality_rating ?? '?')}`
-      + `${env('WHATSAPP_APP_SECRET') ? '' : '; WHATSAPP_APP_SECRET is not set (webhooks are refused in production)'}`;
+      + `; token ${exp === 0 ? 'never expires' : `EXPIRES ${new Date(exp * 1000).toISOString()} (use a permanent System User token)`}`
+      + `${env('WHATSAPP_APP_SECRET') ? '' : '; WHATSAPP_APP_SECRET is not set (webhooks are refused in production)'}`
+      + `${/^v2[0-1]\./.test(v) ? `; ${v} is retiring, set WHATSAPP_GRAPH_VERSION=v26.0` : ''}`;
+  });
+
+  await check('WhatsApp message templates', ['WHATSAPP_ACCESS_TOKEN', 'WHATSAPP_BUSINESS_ACCOUNT_ID'], async () => {
+    const v = env('WHATSAPP_GRAPH_VERSION') || 'v26.0';
+    const j = await json(await fetch(`https://graph.facebook.com/${v}/${env('WHATSAPP_BUSINESS_ACCOUNT_ID')}/message_templates?fields=name,status&limit=100`, {
+      headers: { Authorization: `Bearer ${env('WHATSAPP_ACCESS_TOKEN')}` }, signal: timeout(),
+    }), 'template list');
+    const list = (j.data as { name: string; status: string }[] | undefined) ?? [];
+    const ours = ['kendibo_job_offer', 'kendibo_vendor_accepted', 'kendibo_request_update']
+      .map((n) => `${n}: ${list.find((t) => t.name === n)?.status ?? 'not submitted'}`);
+    return `${list.length} template(s) on the account; ${ours.join(', ')}`;
+  });
+
+  await check('Facebook Login (same Meta app)', ['FACEBOOK_APP_ID', 'FACEBOOK_APP_SECRET|WHATSAPP_APP_SECRET'], async () => {
+    const v = env('WHATSAPP_GRAPH_VERSION') || 'v26.0';
+    const appToken = `${env('FACEBOOK_APP_ID')}|${env('FACEBOOK_APP_SECRET') || env('WHATSAPP_APP_SECRET')}`;
+    const j = await json(await fetch(`https://graph.facebook.com/${v}/${env('FACEBOOK_APP_ID')}?fields=name&access_token=${encodeURIComponent(appToken)}`, { signal: timeout() }), 'app check');
+    return `app id and secret accepted (${String(j.name ?? 'app')})`;
   });
 
   await check('Anthropic (WhatsApp AI)', ['ANTHROPIC_API_KEY'], async () => {

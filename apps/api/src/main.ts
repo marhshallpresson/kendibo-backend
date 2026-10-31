@@ -75,6 +75,10 @@ const app = Fastify({
   genReqId: () => `req_${Date.now().toString(36)}${Math.floor(Math.random() * 1e6)}`,
   trustProxy: PROD, // Pxxl edge terminates TLS ahead of the container
 });
+// Meta posts Facebook data-deletion / deauthorize callbacks as form bodies.
+app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string', bodyLimit: 16_384 }, (_req, body, done) => {
+  try { done(null, Object.fromEntries(new URLSearchParams(String(body)))); } catch (e) { done(e as Error, undefined); }
+});
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 
@@ -190,6 +194,11 @@ const ROUTE_POLICY: Record<string, RoutePolicy> = {
   'POST /v1/auth/otp/verify': 'public',
   'POST /v1/auth/account-exists': 'public',
   'POST /v1/auth/google': 'public',
+  'POST /v1/auth/facebook': 'public',
+  // Meta callbacks: authenticated by the HMAC on signed_request, checked in the handler.
+  'POST /v1/auth/facebook/data-deletion': 'public',
+  'POST /v1/auth/facebook/deauthorize': 'public',
+  'GET /w/facebook-deletion': 'public',
   'POST /v1/auth/refresh': 'public',
   'GET /v1/config': 'public',
   'GET /v1/config/flags': 'public',
@@ -396,6 +405,55 @@ app.post('/v1/auth/google', async (req, reply) => {
     }
     return fail(reply, 'GOOGLE_FAILED', 'Google sign-in unavailable. Try OTP instead.', 502, true);
   }
+});
+// Facebook Login (same Meta app as WhatsApp): the app sends the user access token.
+app.post('/v1/auth/facebook', async (req, reply) => {
+  const body = z.object({
+    accessToken: z.string().min(20).max(2000),
+    device: z.object({
+      fp: z.string().optional(), platform: z.string().optional(), model: z.string().optional(),
+      os: z.string().optional(), appVersion: z.string().optional(), city: z.string().optional(),
+    }).optional(),
+  }).safeParse(req.body ?? {});
+  if (!body.success) return fail(reply, 'FACEBOOK_REJECTED', 'Facebook sign-in failed. Try again.', 401);
+  try {
+    const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip;
+    const s = await identityService.facebookVerify(body.data.accessToken, { ...body.data.device, ip });
+    observability.track('auth.facebook_verified', { isNew: s.isNew });
+    return { data: s };
+  } catch (e: unknown) {
+    const code = String((e as Error).message);
+    if (code === 'FACEBOOK_NOT_CONFIGURED') return fail(reply, code, 'Facebook sign-in is not set up yet. Use your phone number instead.', 503);
+    if (['BAD_FACEBOOK_TOKEN', 'BAD_FACEBOOK_APP', 'FACEBOOK_TOKEN_EXPIRED'].includes(code)) return fail(reply, 'FACEBOOK_REJECTED', 'Facebook sign-in failed. Try again.', 401);
+    return fail(reply, 'FACEBOOK_FAILED', 'Facebook sign-in is unavailable right now. Try your phone number instead.', 502, true);
+  }
+});
+// Meta "Data Deletion Request Callback": unlink the Facebook id, answer with a status URL + code.
+const facebookCallback = (kind: 'data-deletion' | 'deauthorize') => async (req: { body?: unknown; headers: Record<string, unknown>; protocol: string; hostname: string }, reply: Parameters<typeof fail>[0]) => {
+  const { parseSignedRequest } = await import('../../../modules/identity/facebook.js');
+  const signed = String((req.body as { signed_request?: string } | undefined)?.signed_request ?? '');
+  const data = parseSignedRequest(signed);
+  if (!data) return fail(reply, 'BAD_SIGNED_REQUEST', 'Invalid signed_request', 400);
+  const { code } = await identityService.facebookDataDeletion(data.user_id);
+  observability.track(`auth.facebook_${kind}`, {});
+  const base = (process.env.WHATSAPP_WEB_BASE_URL || process.env.STOREFRONT_BASE_URL || `${req.protocol}://${req.hostname}`).replace(/\/+$/, '');
+  return { url: `${base}/w/facebook-deletion?code=${encodeURIComponent(code)}`, confirmation_code: code };
+};
+app.post('/v1/auth/facebook/data-deletion', facebookCallback('data-deletion') as never);
+app.post('/v1/auth/facebook/deauthorize', facebookCallback('deauthorize') as never);
+app.get('/w/facebook-deletion', async (req, reply) => {
+  const code = String((req.query as { code?: string }).code ?? '').slice(0, 40);
+  const rows = /^fbdel_[0-9a-f]{20}$/.test(code)
+    ? await q<{ status: string; created_at: string }>(`SELECT status, created_at FROM identity.facebook_deletion WHERE code=$1`, [code]).catch(() => [])
+    : [];
+  const done = rows[0];
+  const esc = (s: string) => s.replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]!));
+  reply.header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'").type('text/html; charset=utf-8');
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kendibo · Facebook data</title>
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:560px;margin:48px auto;padding:0 16px;color:#14212b}h1{font-size:20px}code{background:#eef1f4;padding:2px 6px;border-radius:4px}</style></head><body>
+<h1>${done ? 'Your Facebook data has been removed' : 'Request not found'}</h1>
+<p>${done ? `We unlinked your Facebook account from Kendibo and deleted the profile photo we got from Facebook on ${esc(new Date(String(done.created_at)).toUTCString())}. Bookings, payments and your phone number were not obtained from Facebook; to close your Kendibo account, use Settings in the app or write to support.` : 'Check the confirmation code and try again.'}</p>
+<p>Confirmation code: <code>${esc(code || '-')}</code></p></body></html>`;
 });
 // Role selection after Google sign-up ("You're joining as…"). New Google
 // accounts default to CUSTOMER (column default); this upgrades to PROVIDER

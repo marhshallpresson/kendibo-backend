@@ -10,8 +10,11 @@ const cfg = () => ({
   phoneNumberId: (process.env.WHATSAPP_PHONE_NUMBER_ID ?? '').trim(),
   appSecret: (process.env.WHATSAPP_APP_SECRET ?? '').trim(),
   verifyToken: (process.env.WHATSAPP_VERIFY_TOKEN ?? '').trim(),
-  version: (process.env.WHATSAPP_GRAPH_VERSION ?? 'v21.0').trim(),
+  version: (process.env.WHATSAPP_GRAPH_VERSION ?? 'v26.0').trim(),
 });
+
+/** Send-time values for a template's buttons: a quick-reply payload, or the URL button's variable suffix. */
+export type TemplateButton = { index: number; payload: string } | { index: number; urlSuffix: string };
 
 export const whatsappConfigured = () => !!(cfg().token && cfg().phoneNumberId);
 
@@ -39,10 +42,27 @@ export function verifySignature(rawBody: string, header: string | undefined): bo
 // list rows ≤10 per section (title ≤24, description ≤72), body ≤1024.
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
-async function send(to: string, payload: Record<string, unknown>): Promise<void> {
+// Every message we send is also recorded as an assistant turn (support inbox,
+// AI memory). The bot registers the recorder; the client stays storage-free.
+type SentHook = (to: string, summary: string) => Promise<void> | void;
+let sentHook: SentHook | null = null;
+export function onMessageSent(fn: SentHook | null) { sentHook = fn; }
+function summarise(p: Record<string, unknown>): string {
+  const i = p.interactive as { type?: string; body?: { text?: string }; action?: { buttons?: { reply: { title: string } }[]; button?: string; parameters?: { display_text?: string } } } | undefined;
+  if (p.type === 'text') return String((p.text as { body?: string })?.body ?? '');
+  if (p.type === 'template') return `[template ${String((p.template as { name?: string })?.name ?? '')}]`;
+  if (!i) return `(${String(p.type)})`;
+  const extras = i.action?.buttons?.map((b) => b.reply.title) ?? (i.action?.parameters?.display_text ? [i.action.parameters.display_text] : i.action?.button ? [i.action.button] : []);
+  return `${i.body?.text ?? ''}${extras.length ? ` [${extras.join(' | ')}]` : ''}`;
+}
+
+async function send(to: string, payload: Record<string, unknown>, record = true): Promise<void> {
   const c = cfg();
   if (!c.token || !c.phoneNumberId) {
-    if (process.env.NODE_ENV !== 'production') console.log(`[whatsapp:dev] -> ${to.slice(0, 6)}… ${JSON.stringify(payload).slice(0, 200)}`);
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[whatsapp:dev] -> ${to.slice(0, 6)}… ${JSON.stringify(payload).slice(0, 200)}`);
+      if (record) await sentHook?.(to, summarise(payload));
+    }
     return;
   }
   const res = await fetch(`https://graph.facebook.com/${c.version}/${c.phoneNumberId}/messages`, {
@@ -52,10 +72,12 @@ async function send(to: string, payload: Record<string, unknown>): Promise<void>
     body: JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', to, ...payload }),
   });
   if (!res.ok) throw new Error(`WHATSAPP_SEND_${res.status}`);
+  if (record) await sentHook?.(to, summarise(payload));
 }
 
 export const wa = {
-  text: (to: string, body: string) => send(to, { type: 'text', text: { preview_url: false, body: clip(body, 4096) } }),
+  /** `record: false` when the caller stores the turn itself (support replies are kept as "[team] …"). */
+  text: (to: string, body: string, opts: { record?: boolean } = {}) => send(to, { type: 'text', text: { preview_url: false, body: clip(body, 4096) } }, opts.record ?? true),
 
   buttons: (to: string, body: string, buttons: { id: string; title: string }[]) => send(to, {
     type: 'interactive',
@@ -81,6 +103,21 @@ export const wa = {
   ctaUrl: (to: string, body: string, label: string, url: string) => send(to, {
     type: 'interactive',
     interactive: { type: 'cta_url', body: { text: clip(body, 1024) }, action: { name: 'cta_url', parameters: { display_text: clip(label, 20), url } } },
+  }),
+
+  /** Approved template: the only thing we may send outside the 24h window. */
+  template: (to: string, name: string, params: string[], buttons: TemplateButton[] = [], language = (process.env.WHATSAPP_TEMPLATE_LANG ?? 'en').trim()) => send(to, {
+    type: 'template',
+    template: {
+      name,
+      language: { code: language },
+      components: [
+        ...(params.length ? [{ type: 'body', parameters: params.map((t) => ({ type: 'text', text: clip(t, 1000) })) }] : []),
+        ...buttons.map((b) => ('payload' in b
+          ? { type: 'button', sub_type: 'quick_reply', index: String(b.index), parameters: [{ type: 'payload', payload: clip(b.payload, 256) }] }
+          : { type: 'button', sub_type: 'url', index: String(b.index), parameters: [{ type: 'text', text: clip(b.urlSuffix, 2000) }] })),
+      ],
+    },
   }),
 
   locationRequest: (to: string, body: string) => send(to, {

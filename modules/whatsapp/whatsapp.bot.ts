@@ -1,24 +1,37 @@
-// WhatsApp booking assistant — the second front door next to the app.
+// WhatsApp booking assistant: the second front door next to the app.
 //
-// Customer path (all server-authoritative, same rules as the app):
-//   MENU → pick trade → pick service → share location → pick day + window →
-//   confirm (price from the pricing engine, or "get quotes" for quote-only work)
-//   → secure Bachs checkout link. Payment is confirmed by the
-//   PSP webhook, never by anything typed in the chat.
-// Vendor path: offer notifications carry Accept / Decline buttons; the tap is
-//   matched to the vendor who owns the WhatsApp number and re-checked against
-//   category rules before it counts.
+// Every inbound message goes through one router:
+//   1. Receipt: dedupe by message id and keep the payload until it has been
+//      processed (a crash mid-turn is retried by the sweeper); one turn at a
+//      time per customer, so two quick messages can't race on the same draft.
+//   2. Gates: vendor offer taps, STOP / START, the abuse limit, human hand-off.
+//   3. Taps on our buttons and lists drive the booking flow (flow.ts).
+//   4. A shared location or photo is saved to the job draft.
+//   5. Text goes to the understanding layer (nlu/): intent, scope, trade,
+//      budget, day and time. Off-topic requests are declined without an LLM
+//      call; common questions get the official answers (facts.ts); booking
+//      details fill the draft and the next step is asked. Only text the
+//      classifier is unsure about goes to the AI fallback (agent.ts), within
+//      a daily budget.
+// Each customer text is logged, redacted, with what the router did. Ops label
+// those lines in the admin console and the intent model retrains on them.
 //
-// Identity: Meta verifies the sender's phone number, so wa_id links to the
-// account with that number (or creates a CUSTOMER account). Money and personal
-// data never travel through message text beyond what the user typed.
+// Identity: Meta verifies the sender's number, so wa_id links to the account
+// with that number (or creates a CUSTOMER account). Payment is confirmed by
+// the PSP webhook, never by anything typed in the chat.
 import { q } from '../../packages/database/db.js';
 import { emit } from '../../packages/observability/emit.js';
 import { observability } from '../../packages/observability/watchup.adapter.js';
-import { wa } from './whatsapp.client.js';
+import { wa, onMessageSent } from './whatsapp.client.js';
+import { understand, logTurn, type Understanding } from './nlu/index.js';
+import { currentDraft, openDraft, patchDraft, addPhotoToDraft, saveDraftLocation, cancelDraft, submitDraft, type Draft } from './draft.js';
+import { nextStep, sendStep, handleFlowTap, patchFromUnderstanding, acknowledge, tradeName, type Asked, type Step } from './flow.js';
+import { FACTS, priceLines } from './facts.js';
+import { OPT_IN, OPT_OUT, llmAllowed, sendBusinessInitiated, notifyCustomer } from './policy.js';
+import { payToken } from './links.js';
 
-type State = 'MENU' | 'HUMAN' | 'PICK_CATEGORY' | 'PICK_SERVICE' | 'ASK_LOCATION' | 'ASK_DAY' | 'ASK_WINDOW' | 'CONFIRM';
-interface Session { waId: string; userId: string | null; state: State; data: Record<string, unknown>; updatedAt: number }
+type State = 'BOT' | 'HUMAN';
+interface Session { waId: string; userId: string | null; state: State; data: Asked; updatedAt: number }
 
 export interface InboundMessage {
   id: string; from: string; type: string;
@@ -35,18 +48,44 @@ interface Deps {
 let deps: Deps | null = null;
 export function configureWhatsappBot(d: Deps) { deps = d; }
 
-const SESSION_TTL_MS = 30 * 60_000;
-const WINDOWS: Record<string, string> = { morning: '08:00-12:00', afternoon: '12:00-16:00', evening: '16:00-19:00' };
+const HUMAN_MODE_MS = 12 * 3600_000;
+const DRAFT_STALE_MS = 48 * 3600_000;
+const RETRY_AFTER_MS = 10 * 60_000;
 const naira = (kobo: bigint | string | number) => `₦${(Number(kobo) / 100).toLocaleString('en-NG', { maximumFractionDigits: 0 })}`;
 const e164 = (waId: string) => `+${waId.replace(/\D/g, '')}`;
+const firstName = (n?: string) => (n ? n.trim().split(/\s+/)[0] : '');
+const MENU_BUTTONS = [
+  { id: 'menu:book', title: 'Book a service' },
+  { id: 'menu:bookings', title: 'My bookings' },
+  { id: 'menu:help', title: 'Talk to a person' },
+];
+const DISCLOSURE = 'I\'m Kendibo\'s automated assistant. Type "agent" any time to reach a person.';
+const EMPTY_DRAFT: Draft = {
+  id: '', need: null, category_id: null, service_id: null, budget_kobo: null, photo_asset_ids: [], lat: null, lng: null,
+  address_text: null, landmark: null, scheduled_date: null, time_window: null, request_id: null,
+};
+
+// Bot messages are kept as assistant turns: the support inbox shows them and
+// the AI fallback reads them as conversation history.
+onMessageSent(async (to, summary) => {
+  if (!summary.trim()) return;
+  await q(`INSERT INTO messaging.whatsapp_turn (wa_id, role, content) VALUES ($1,'assistant',$2)`, [to, summary.slice(0, 2000)]).catch(() => undefined);
+});
+
+// One turn at a time per customer (single API instance; a shared queue replaces this when we scale out).
+const chains = new Map<string, Promise<void>>();
+function runSerially(key: string, fn: () => Promise<void>): Promise<void> {
+  const prev = chains.get(key) ?? Promise.resolve();
+  const next = prev.then(fn, fn).finally(() => { if (chains.get(key) === next) chains.delete(key); });
+  chains.set(key, next);
+  return next;
+}
 
 async function loadSession(waId: string): Promise<Session> {
-  const rows = await q<Record<string, unknown>>(`SELECT * FROM messaging.whatsapp_session WHERE wa_id=$1`, [waId]);
-  const r = rows[0];
-  if (!r) return { waId, userId: null, state: 'MENU', data: {}, updatedAt: 0 };
-  const s: Session = { waId, userId: r.user_id ? String(r.user_id) : null, state: String(r.state) as State, data: (r.data ?? {}) as Record<string, unknown>, updatedAt: new Date(String(r.updated_at)).getTime() };
-  if (Date.now() - s.updatedAt > SESSION_TTL_MS) { s.state = 'MENU'; s.data = {}; }
-  return s;
+  const r = (await q<Record<string, unknown>>(`SELECT * FROM messaging.whatsapp_session WHERE wa_id=$1`, [waId]))[0];
+  if (!r) return { waId, userId: null, state: 'BOT', data: {}, updatedAt: 0 };
+  const data = (typeof r.data === 'string' ? JSON.parse(r.data) : (r.data ?? {})) as Asked;
+  return { waId, userId: r.user_id ? String(r.user_id) : null, state: String(r.state) === 'HUMAN' ? 'HUMAN' : 'BOT', data, updatedAt: new Date(String(r.updated_at)).getTime() };
 }
 async function saveSession(s: Session) {
   await q(`DELETE FROM messaging.whatsapp_session WHERE wa_id=$1`, [s.waId]);
@@ -66,29 +105,81 @@ async function userFor(waId: string, profileName?: string): Promise<{ id: string
   return { id: String(created[0].id), role: 'CUSTOMER', email: null };
 }
 
-function replyId(m: InboundMessage): string {
-  return m.interactive?.button_reply?.id ?? m.interactive?.list_reply?.id ?? m.button?.payload ?? '';
+const replyId = (m: InboundMessage) => m.interactive?.button_reply?.id ?? m.interactive?.list_reply?.id ?? m.button?.payload ?? '';
+const replyText = (m: InboundMessage) =>
+  (m.text?.body ?? m.image?.caption ?? m.interactive?.button_reply?.title ?? m.interactive?.list_reply?.title ?? m.button?.text ?? '').trim();
+
+// ── Replies ──────────────────────────────────────────────────────────────────
+async function sendWelcome(to: string, name?: string) {
+  await wa.buttons(to, `${firstName(name) ? `Hi ${firstName(name)}! ` : 'Hi! '}I'm Kendibo's automated assistant. I can book a verified pro for cleaning, AC, plumbing, electrical, generator, appliance and pest jobs, and check your bookings. Type "agent" any time to reach a person.\n\nTo book, tell me what needs doing. A photo, your budget and when you want it done all help.`, MENU_BUTTONS);
 }
-function replyText(m: InboundMessage): string {
-  return (m.text?.body ?? m.image?.caption ?? m.interactive?.button_reply?.title ?? m.interactive?.list_reply?.title ?? m.button?.text ?? '').trim();
+const sendMenu = (to: string, body = 'What would you like to do?') => wa.buttons(to, body, MENU_BUTTONS);
+
+async function handOff(s: Session, userId: string, to: string, summary: string) {
+  const { supportService } = await import('../warranties/warranty.service.js');
+  const t = await supportService.open(userId, `whatsapp: ${summary.slice(0, 200)}`);
+  s.state = 'HUMAN';
+  emit('whatsapp.handoff', { ticketId: (t as { id?: string }).id ?? null });
+  await wa.text(to, 'Okay. Someone from the Kendibo team will reply in this chat (8am–8pm daily). Type "bot" to go back to the assistant.');
 }
 
-async function sendMenu(to: string, name?: string) {
-  await wa.buttons(to, `${name ? `Hi ${name.split(' ')[0]}, ` : 'Hi, '}this is Kendibo. Verified cleaners, electricians, plumbers and more, booked and paid safely. What would you like to do?`, [
-    { id: 'menu:book', title: 'Book a service' },
-    { id: 'menu:bookings', title: 'My bookings' },
-    { id: 'menu:help', title: 'Talk to a person' },
-  ]);
+async function sendStatus(to: string, userId: string, draft: Draft | null) {
+  const b = await q<{ name: string | null; service_id: string; status: string; scheduled_at: string | null }>(
+    `SELECT s.name, b.service_id, b.status, b.scheduled_at FROM booking.booking b LEFT JOIN catalog.service s ON s.id = b.service_id
+      WHERE b.user_id=$1 ORDER BY b.created_at DESC LIMIT 3`, [userId],
+  ).catch(() => []);
+  const r = await q<{ title: string; status: string }>(
+    `SELECT title, status FROM booking.service_request WHERE user_id=$1 ORDER BY created_at DESC LIMIT 3`, [userId],
+  ).catch(() => []);
+  const lines = [
+    ...b.map((x) => `• ${x.name ?? x.service_id}: ${String(x.status).replace(/_/g, ' ').toLowerCase()}${x.scheduled_at ? `, ${new Date(String(x.scheduled_at)).toLocaleDateString('en-NG', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'Africa/Lagos' })}` : ''}`),
+    ...r.map((x) => `• Request "${String(x.title).slice(0, 60)}": ${String(x.status).replace(/_/g, ' ').toLowerCase()}`),
+  ];
+  const body = lines.length ? `Your latest:\n${lines.join('\n')}` : 'You have no bookings yet.';
+  if (draft) await wa.buttons(to, `${body}\n\nYou also have a request in progress.`, [{ id: 'flow:resume', title: 'Continue it' }, { id: 'menu:help', title: 'Talk to a person' }]);
+  else await wa.buttons(to, body, [{ id: 'menu:book', title: 'Book a service' }, { id: 'menu:help', title: 'Talk to a person' }]);
 }
 
-async function sendCategories(to: string) {
-  const cats = await q<{ id: string; name: string; description: string | null }>(
-    `SELECT id, name, description FROM catalog.category WHERE active ORDER BY sort_order LIMIT 10`,
-  );
-  await wa.list(to, 'Which kind of job is it?', 'Choose a service', cats.map((c) => ({ id: `cat:${c.id}`, title: String(c.name), description: c.description ? String(c.description) : undefined })));
+async function factAnswer(u: Understanding, text: string, draft: Draft | null): Promise<string> {
+  switch (u.intent) {
+    case 'payment': return /refund|money back|cancel/i.test(text) ? FACTS.refunds : FACTS.payments;
+    case 'pricing': {
+      const cat = u.trade ?? draft?.category_id ?? null;
+      const lines = cat ? await priceLines(cat) : null;
+      return lines ? `${FACTS.pricing}\n\n${await tradeName(cat)}:\n${lines}` : FACTS.pricing;
+    }
+    case 'coverage': return FACTS.coverage;
+    case 'trust':
+      if (/warrant|guarantee|fail|break/i.test(text)) return FACTS.warranty;
+      if (/what is kendibo|how does (this|it|kendibo) work|legit/i.test(text)) return FACTS.about;
+      return FACTS.safety;
+    case 'vendor_join': return FACTS.become_a_pro;
+    default: return FACTS.about;
+  }
 }
 
-/** Vendor tapped Accept/Decline on an offer notification. */
+/** Accept a pin (shared location or typed address) if we cover it. */
+async function useLocation(to: string, s: Session, userId: string, loc: { lat: number; lng: number; address: string }): Promise<boolean> {
+  const { geoService } = await import('../geo/geo.service.js');
+  const zone = await geoService.checkZone(loc.lat, loc.lng);
+  if (!zone.serviceable) {
+    await wa.text(to, "Sorry, we don't cover that spot yet. We're live in Uyo first, then Lagos and Abuja.");
+    return false;
+  }
+  const d = await openDraft(to, userId);
+  await saveDraftLocation(to, d.id, loc);
+  await sendStep(to, (await currentDraft(to)) ?? d, s.data, 'Location saved.');
+  return true;
+}
+
+async function tryAgent(to: string, s: Session, userId: string, text: string, u: Understanding, step: Step | null, images: { mime: string; base64: string }[]): Promise<boolean> {
+  const { aiConfigured, runAgent } = await import('./agent.js');
+  if (!aiConfigured() || !(await llmAllowed(to))) return false;
+  await saveSession(s); // talk_to_human can switch the stored state mid-turn
+  return runAgent({ waId: to, userId, text, images, hints: { intent: u.intent, confidence: u.confidence, step } });
+}
+
+// ── Vendor offer taps ──────────────────────────────────────────────────────
 async function handleOfferTap(waId: string, offerId: string, accept: boolean) {
   const user = await q<{ id: string }>(`SELECT id FROM identity.users WHERE phone=$1`, [e164(waId)]);
   const prov = user[0] ? await q<{ id: string }>(`SELECT id FROM provider.provider WHERE user_id=$1`, [String(user[0].id)]) : [];
@@ -103,7 +194,7 @@ async function handleOfferTap(waId: string, offerId: string, accept: boolean) {
   if (accept) {
     const { vendorEligibilityService } = await import('../vendors/eligibility.service.js');
     if (!(await vendorEligibilityService.allowed(providerId, offer[0].category_id))) {
-      await wa.text(waId, 'You can\'t accept jobs in this trade yet. Open the Kendibo app to finish your verification.');
+      await wa.text(waId, "You can't accept jobs in this trade yet. Open the Kendibo app to finish your verification.");
       return;
     }
   }
@@ -116,23 +207,52 @@ async function handleOfferTap(waId: string, offerId: string, accept: boolean) {
   }
 }
 
+/** Job offer to a vendor: buttons inside the 24h window, else a template or SMS. */
 export async function notifyProviderOfOffer(providerPhone: string, offerId: string, summary: string) {
-  await wa.buttons(providerPhone.replace(/^\+/, ''), `New job near you: ${summary}`, [
-    { id: `offer:${offerId}:accept`, title: 'Accept' },
-    { id: `offer:${offerId}:decline`, title: 'Decline' },
-  ]).catch((e) => observability.captureException(e));
+  const waId = providerPhone.replace(/\D/g, '');
+  await sendBusinessInitiated({
+    waId,
+    whatsapp: () => wa.buttons(waId, `New job near you: ${summary}`, [
+      { id: `offer:${offerId}:accept`, title: 'Accept' },
+      { id: `offer:${offerId}:decline`, title: 'Decline' },
+    ]),
+    template: {
+      key: 'job_offer',
+      params: [summary.slice(0, 200)],
+      buttons: [{ index: 0, payload: `offer:${offerId}:accept` }, { index: 1, payload: `offer:${offerId}:decline` }],
+    },
+    sms: `New Kendibo job near you: ${summary.slice(0, 100)}. Open the Kendibo app to accept it.`,
+  }).catch((e) => observability.captureException(e));
 }
 
+// ── Inbound ──────────────────────────────────────────────────────────────────
 export async function handleInbound(m: InboundMessage, profileName?: string): Promise<void> {
   // At-least-once delivery: the message id is the idempotency key.
-  try { await q(`INSERT INTO messaging.whatsapp_inbound (message_id, wa_id) VALUES ($1,$2)`, [m.id, m.from]); }
-  catch { return; }
+  try {
+    await q(`INSERT INTO messaging.whatsapp_inbound (message_id, wa_id, payload, profile_name) VALUES ($1,$2,$3,$4)`,
+      [m.id, m.from, JSON.stringify(m), profileName ?? null]);
+  } catch { return; }
   void wa.markRead(m.id);
+  await runSerially(m.from, () => processAndMark(m, profileName));
+}
 
+async function processAndMark(m: InboundMessage, profileName?: string) {
+  await q(`UPDATE messaging.whatsapp_inbound SET started_at=now(), attempts=attempts+1 WHERE message_id=$1`, [m.id]).catch(() => undefined);
+  try {
+    await processInbound(m, profileName);
+  } catch (e) {
+    observability.captureException(e);
+    await wa.text(m.from, 'Something went wrong on our side. Please try again in a moment, or type "agent" to reach a person.').catch(() => undefined);
+  }
+  // Processed (or answered with an apology): the sweeper only retries turns a crash cut short.
+  await q(`UPDATE messaging.whatsapp_inbound SET processed_at=now() WHERE message_id=$1`, [m.id]).catch(() => undefined);
+}
+
+async function processInbound(m: InboundMessage, profileName?: string): Promise<void> {
   const to = m.from;
   const id = replyId(m);
   const text = replyText(m);
-  const lower = text.toLowerCase();
+  const lower = text.toLowerCase().trim();
 
   const offerTap = id.match(/^offer:([0-9a-f-]{36}):(accept|decline)$/i);
   if (offerTap) return handleOfferTap(to, offerTap[1], offerTap[2] === 'accept');
@@ -140,20 +260,23 @@ export async function handleInbound(m: InboundMessage, profileName?: string): Pr
   const s = await loadSession(to);
   const user = await userFor(to, profileName);
   s.userId = user.id;
+  const firstContact = !(await q(`SELECT 1 FROM messaging.whatsapp_turn WHERE wa_id=$1 LIMIT 1`, [to]).catch(() => []))[0];
+  await q(`INSERT INTO messaging.whatsapp_turn (wa_id, role, content) VALUES ($1,'user',$2)`, [to, (text || `(${m.type})`).slice(0, 2000)]).catch(() => undefined);
 
-  // Marketing opt-out (Meta policy, NDPA 2023): STOP turns promotions off on every
-  // channel; START turns them back on for someone who opted out. Booking updates
-  // still go out, because the customer asked for those.
-  if (!id && /^(stop|unsubscribe|stop promos?|stop promotions?)$/.test(lower)) {
+  // Marketing opt-out (Meta policy, NDPA 2023): STOP turns promotions off on
+  // every channel; START turns them back on. Booking updates still go out.
+  if (!id && OPT_OUT.test(lower)) {
     const { notificationService } = await import('../notifications/notification.service.js');
     await notificationService.updateUserPreferences(user.id, { promo: false });
     emit('whatsapp.opt_out', { userId: user.id });
-    s.state = 'MENU'; s.data = {};
+    const d = await currentDraft(to);
+    if (d) await cancelDraft(d.id);
+    s.data = {};
     await saveSession(s);
     await wa.text(to, "Done. You won't get offers or promotions from Kendibo. You'll still get messages about your own bookings. Reply START to get offers again.");
     return;
   }
-  if (!id && lower === 'start') {
+  if (!id && OPT_IN.test(lower)) {
     const { notificationService } = await import('../notifications/notification.service.js');
     if (!(await notificationService.getUserPreferences(user.id)).promo) {
       await notificationService.updateUserPreferences(user.id, { promo: true });
@@ -163,241 +286,219 @@ export async function handleInbound(m: InboundMessage, profileName?: string): Pr
     }
   }
 
-  // ── AI agent path ────────────────────────────────────────────────────────
-  const { aiConfigured, runAgent, addPhotoToDraft } = await import('./agent.js');
-  if (aiConfigured()) {
-    // Abuse / cost guard: at most 40 inbound messages per number per hour.
-    const recent = await q<{ n: string }>(
-      `SELECT COUNT(*) AS n FROM messaging.whatsapp_inbound WHERE wa_id=$1 AND received_at > $2`, [to, new Date(Date.now() - 3600_000).toISOString()],
-    ).catch(() => [{ n: '0' }]);
-    if (Number(recent[0]?.n ?? 0) > 40) return;
+  // Abuse / cost guard: at most 40 inbound messages per number per hour.
+  const recent = await q<{ n: string }>(
+    `SELECT COUNT(*) AS n FROM messaging.whatsapp_inbound WHERE wa_id=$1 AND received_at > $2`, [to, new Date(Date.now() - 3600_000).toISOString()],
+  ).catch(() => [{ n: '0' }]);
+  if (Number(recent[0]?.n ?? 0) > 40) return;
 
-    // Human hand-off: the team owns the chat until it goes quiet for 12h or the customer types "bot".
-    if (s.state === ('HUMAN' as State) && Date.now() - s.updatedAt < 12 * 3600_000 && lower !== 'bot') {
-      const { supportService } = await import('../warranties/warranty.service.js');
-      void supportService; // messages are visible to agents in the support inbox via whatsapp_turn
-      await q(`INSERT INTO messaging.whatsapp_turn (wa_id, role, content) VALUES ($1,'user',$2)`, [to, text.slice(0, 2000) || `(${m.type})`]).catch(() => undefined);
-      return;
+  // Human hand-off: the team owns the chat while the customer keeps talking
+  // (12h of quiet hands it back) or until they type "bot".
+  if (s.state === 'HUMAN') {
+    if (Date.now() - s.updatedAt < HUMAN_MODE_MS && !['bot', 'menu'].includes(lower)) {
+      await q(`UPDATE messaging.whatsapp_session SET updated_at=now() WHERE wa_id=$1`, [to]).catch(() => undefined);
+      return; // the message is already in the support inbox
     }
+    s.state = 'BOT';
+  }
 
-    const images: { mime: string; base64: string }[] = [];
-    if (m.type === 'image' && (m as { image?: { id?: string } }).image?.id) {
-      const media = await wa.downloadMedia(String((m as { image?: { id?: string } }).image!.id)).catch(() => null);
-      if (media) {
-        const { mediaService } = await import('../media/media.service.js');
-        const { assetId } = await mediaService.presign('photo');
-        const done = await mediaService.ingest(assetId, media.bytes, media.mime).catch(() => null);
-        if (done && (done as { status?: string }).status === 'clean') {
-          await addPhotoToDraft(to, user.id, assetId);
-          images.push({ mime: media.mime, base64: media.bytes.toString('base64') });
-        }
-      }
-    }
+  // A draft untouched for two days starts over instead of resuming a stale job.
+  await q(`UPDATE messaging.whatsapp_job_draft SET status='abandoned' WHERE wa_id=$1 AND status='collecting' AND updated_at < $2`,
+    [to, new Date(Date.now() - DRAFT_STALE_MS).toISOString()]).catch(() => undefined);
+  let draft = await currentDraft(to);
+  if (!draft) s.data = { lang: s.data.lang };
 
-    let event: string | undefined;
-    if (m.type === 'location' && m.location) {
-      // Shared WhatsApp location is an alternative to the map page.
-      const { geoService } = await import('../geo/geo.service.js');
-      const zone = await geoService.checkZone(m.location.latitude, m.location.longitude);
-      const rows = await q<{ id: string }>(`SELECT id FROM messaging.whatsapp_job_draft WHERE wa_id=$1 AND status='collecting' ORDER BY created_at DESC LIMIT 1`, [to]);
-      if (rows[0] && zone.serviceable) {
-        const { saveDraftLocation } = await import('./agent.js');
-        await saveDraftLocation(to, String(rows[0].id), { lat: m.location.latitude, lng: m.location.longitude, address: m.location.address || m.location.name || 'Shared location' });
-        event = 'location_saved (shared from WhatsApp)';
+  // ── Taps ──────────────────────────────────────────────────────────────────
+  if (id && !id.startsWith('ai:')) {
+    try {
+      if (id === 'menu:book') {
+        await sendStep(to, draft ?? (await openDraft(to, user.id)), s.data);
+      } else if (id === 'menu:bookings') {
+        await sendStatus(to, user.id, draft);
+      } else if (id === 'menu:help') {
+        await handOff(s, user.id, to, 'asked for a person from the menu');
+      } else if (id === 'flow:resume') {
+        if (draft) await sendStep(to, draft, s.data); else await sendMenu(to);
+      } else if (id === 'flow:confirm' && !draft) {
+        await sendMenu(to, 'That request has already been sent. Want to do something else?');
+      } else if (id.startsWith('flow:') || id.startsWith('cat:')) {
+        draft ??= await openDraft(to, user.id);
+        const r = await handleFlowTap(id, { waId: to, userId: user.id, d: draft, a: s.data });
+        s.data = r.a;
+        if (!r.sent) await sendStep(to, r.d, s.data);
       } else {
-        event = zone.serviceable ? 'location shared but no open job draft' : 'location_outside_coverage';
+        await sendMenu(to);
       }
+    } catch (e) {
+      if ((e as Error).message !== 'DRAFT_INCOMPLETE' || !draft) throw e;
+      await sendStep(to, draft, s.data, 'A few details are still missing.');
     }
-
-    // First contact: a fixed, fast welcome with the format we need.
-    const seen = await q(`SELECT 1 FROM messaging.whatsapp_turn WHERE wa_id=$1 LIMIT 1`, [to]).catch(() => []);
-    if (!seen[0] && !id && ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening', 'start', 'menu', ''].includes(lower)) {
-      await wa.buttons(to, `${profileName ? `Hi ${profileName.split(' ')[0]}! ` : 'Hi! '}I'm Kendibo's assistant. Tell me what needs fixing or cleaning, and if you can:\n\n1. Send a photo of the problem\n2. Your budget (optional)\n3. When you want it done\n\nI'll find verified vendors near you.`, [
-        { id: 'menu:book', title: 'Book a service' }, { id: 'menu:bookings', title: 'My bookings' }, { id: 'menu:help', title: 'Talk to a person' },
-      ]);
-      await q(`INSERT INTO messaging.whatsapp_turn (wa_id, role, content) VALUES ($1,'user',$2), ($1,'assistant','(welcome with format + menu buttons)')`, [to, text || 'hi']).catch(() => undefined);
-      await saveSession(s);
-      return;
-    }
-
-    const asText = id === 'menu:book' ? 'I want to book a service'
-      : id === 'menu:bookings' ? 'Show my bookings'
-        : id === 'menu:help' ? 'I want to talk to a person'
-          : text;
-    // Persist BEFORE the agent runs: talk_to_human flips the stored state to
-    // HUMAN mid-turn, and saving afterwards would overwrite it.
-    if (lower === 'bot' || s.state === ('HUMAN' as State)) s.state = 'MENU';
     await saveSession(s);
-    const ok = await runAgent({ waId: to, userId: user.id, text: asText, images, event });
-    if (ok) return;
-    // AI failed (outage/timeout): fall through to the deterministic menu flow.
-  }
-
-  if (!id && ['hi', 'hello', 'menu', 'start', 'restart', 'cancel'].includes(lower)) {
-    s.state = 'MENU'; s.data = {};
-    await saveSession(s);
-    return sendMenu(to, profileName);
-  }
-
-  try {
-    switch (true) {
-      case id === 'menu:book': {
-        s.state = 'PICK_CATEGORY'; s.data = {};
-        await sendCategories(to);
-        break;
-      }
-      case id === 'menu:bookings': {
-        const rows = await q<{ id: string; status: string; service_id: string; scheduled_at: string | null }>(
-          `SELECT id, status, service_id, scheduled_at FROM booking.booking WHERE user_id=$1 ORDER BY created_at DESC LIMIT 3`, [user.id],
-        );
-        await wa.text(to, rows.length
-          ? rows.map((b) => `• ${String(b.service_id)} — ${String(b.status).replace(/_/g, ' ').toLowerCase()}${b.scheduled_at ? `, ${new Date(String(b.scheduled_at)).toDateString()}` : ''}`).join('\n')
-          : 'You have no bookings yet. Reply "menu" to book one.');
-        break;
-      }
-      case id === 'menu:help': {
-        const { supportService } = await import('../warranties/warranty.service.js');
-        await supportService.open(user.id, 'whatsapp_handoff');
-        await wa.text(to, 'Thanks — someone from the Kendibo team will reply here shortly (8am–8pm daily).');
-        s.state = 'MENU';
-        break;
-      }
-      case id.startsWith('cat:'): {
-        const categoryId = id.slice(4);
-        const svcs = await q<{ id: string; name: string; base_price_kobo: string; booking_type: string }>(
-          `SELECT id, name, base_price_kobo, booking_type FROM catalog.service WHERE category_id=$1 AND active ORDER BY name LIMIT 10`, [categoryId],
-        );
-        s.data = { categoryId };
-        if (!svcs.length) {
-          s.data.quoteOnly = true; s.state = 'ASK_LOCATION';
-          await wa.locationRequest(to, 'We\'ll get you quotes from verified pros. Where is the job? Share your location, or type the address.');
-          break;
-        }
-        s.state = 'PICK_SERVICE';
-        await wa.list(to, 'Pick the closest match. You can add details later.', 'Choose', svcs.map((v) => ({
-          id: `svc:${v.id}`, title: String(v.name),
-          description: String(v.booking_type) === 'quote' ? 'Priced after inspection' : `From ${naira(v.base_price_kobo)}`,
-        })));
-        break;
-      }
-      case id.startsWith('svc:'): {
-        s.data.serviceId = id.slice(4);
-        s.state = 'ASK_LOCATION';
-        await wa.locationRequest(to, 'Where is the job? Tap "Send location", or type the address with a landmark.');
-        break;
-      }
-      case s.state === 'ASK_LOCATION' && (m.type === 'location' || text.length >= 6): {
-        const { geoService } = await import('../geo/geo.service.js');
-        let lat = m.location?.latitude; let lng = m.location?.longitude;
-        let label = m.location?.address || m.location?.name || text;
-        if (lat === undefined || lng === undefined) {
-          const { maps } = await import('../geo/maps.port.js');
-          const g = await maps.geocode(text).catch(() => null);
-          if (!g) { await wa.text(to, 'I couldn\'t find that address. Try adding the area and a landmark, or send your location.'); break; }
-          lat = g.lat; lng = g.lng; label = g.formatted || text;
-        }
-        const zone = await geoService.checkZone(lat, lng);
-        if (!zone.serviceable) { await wa.text(to, 'Sorry, we don\'t cover that area yet. Reply "menu" to start again.'); s.state = 'MENU'; break; }
-        s.data = { ...s.data, lat, lng, address: String(label).slice(0, 160), city: (zone as { city?: string }).city ?? '' };
-        s.state = 'ASK_DAY';
-        await wa.buttons(to, 'When should the pro come?', [
-          { id: 'day:0', title: 'Today' }, { id: 'day:1', title: 'Tomorrow' }, { id: 'day:2', title: 'In 2 days' },
-        ]);
-        break;
-      }
-      case id.startsWith('day:'): {
-        s.data.dayOffset = Math.min(Math.max(Number(id.slice(4)) || 0, 0), 6);
-        s.state = 'ASK_WINDOW';
-        await wa.buttons(to, 'What time suits you?', [
-          { id: 'win:morning', title: 'Morning 8–12' }, { id: 'win:afternoon', title: 'Afternoon 12–4' }, { id: 'win:evening', title: 'Evening 4–7' },
-        ]);
-        break;
-      }
-      case id.startsWith('win:') && !!WINDOWS[id.slice(4)]: {
-        s.data.window = id.slice(4);
-        s.state = 'CONFIRM';
-        const when = new Date(Date.now() + Number(s.data.dayOffset ?? 0) * 86_400_000);
-        const whenText = `${when.toDateString()}, ${WINDOWS[String(s.data.window)]}`;
-        if (s.data.quoteOnly || !s.data.serviceId) {
-          await wa.buttons(to, `Quote request\n${String(s.data.address)}\n${whenText}\n\nVerified pros near you will send prices. You only pay after you accept one.`, [
-            { id: 'confirm:yes', title: 'Request quotes' }, { id: 'menu:book', title: 'Change' },
-          ]);
-          break;
-        }
-        const { price } = await import('../pricing/pricing.engine.js');
-        try {
-          const p = await price({ serviceId: String(s.data.serviceId) }); // same inputs bookingService.create prices with
-          s.data.quotedKobo = String(p.totalKobo);
-          await wa.buttons(to, `Booking summary\n${String(s.data.address)}\n${whenText}\nTotal: ${naira(p.totalKobo)}\n\nYour money is held by Kendibo until the job is done.`, [
-            { id: 'confirm:yes', title: 'Confirm and pay' }, { id: 'menu:book', title: 'Change' },
-          ]);
-        } catch (e) {
-          if ((e as Error).message !== 'QUOTE_REQUIRED') throw e;
-          s.data.quoteOnly = true;
-          await wa.buttons(to, `This job is priced after inspection.\n${String(s.data.address)}\n${whenText}`, [
-            { id: 'confirm:yes', title: 'Request quotes' }, { id: 'menu:book', title: 'Change' },
-          ]);
-        }
-        break;
-      }
-      case id === 'confirm:yes' && s.state === 'CONFIRM': {
-        await confirmBooking(s, user, to, m.id);
-        s.state = 'MENU'; s.data = {};
-        break;
-      }
-      default:
-        await sendMenu(to, profileName);
-        s.state = 'MENU';
-    }
-  } catch (e) {
-    observability.captureException(e);
-    await wa.text(to, 'Something went wrong on our side. Reply "menu" to try again.').catch(() => undefined);
-    s.state = 'MENU'; s.data = {};
-  }
-  await saveSession(s);
-}
-
-async function confirmBooking(s: Session, user: { id: string; email: string | null }, to: string, messageId: string) {
-  const { propertyService } = await import('../properties/property.service.js');
-  const address = await propertyService.createAddress(user.id, {
-    houseNumber: '-', street: String(s.data.address ?? 'Shared location'), city: String(s.data.city || 'Unknown'),
-    state: String(s.data.city || 'Unknown'), contactPhone: e164(to), latitude: Number(s.data.lat), longitude: Number(s.data.lng),
-    landmark: 'Added from WhatsApp',
-  });
-  const when = new Date(Date.now() + Number(s.data.dayOffset ?? 0) * 86_400_000);
-  const scheduledDate = when.toISOString().slice(0, 10);
-
-  if (s.data.quoteOnly || !s.data.serviceId) {
-    const { requestService } = await import('../requests/request.service.js');
-    const r = await requestService.create(user.id, {
-      categoryId: s.data.categoryId ? String(s.data.categoryId) : undefined,
-      title: 'WhatsApp quote request', addressId: address.id, scheduledDate, timeWindow: WINDOWS[String(s.data.window)],
-      contactPhone: e164(to), idempotencyKey: `wa_${messageId}`, source: 'whatsapp',
-    });
-    emit('whatsapp.request_created', { requestId: r.id });
-    await wa.text(to, 'Request sent. We\'ll message you here as soon as verified pros reply with prices.');
     return;
   }
 
-  const { bookingService } = await import('../bookings/booking.service.js');
-  const booking = await bookingService.create(user.id, {
-    serviceId: String(s.data.serviceId), addressId: address.id,
-    scheduledAt: `${scheduledDate}T${WINDOWS[String(s.data.window)].slice(0, 5)}:00+01:00`,
-    customerNotes: 'Booked on WhatsApp', idempotencyKey: `wa_${messageId}`,
-  });
-  if (!deps) throw new Error('WHATSAPP_PAYMENTS_NOT_CONFIGURED');
-  const amount = BigInt(String((booking as unknown as { priceKobo: string }).priceKobo ?? s.data.quotedKobo ?? '0'));
-  const session = await deps.createCheckout({
-    bookingId: booking.id, amountKobo: amount,
-    customerEmail: user.email || `wa${to.replace(/\D/g, '')}@customers.kendibo.ng`,
-    reference: `bk_${booking.id}_wa`, idempotencyKey: `wa_${messageId}`,
-  });
-  emit('whatsapp.booking_created', { bookingId: booking.id, psp: session.psp ?? 'unknown' });
-  if (session.checkoutUrl) {
-    await wa.ctaUrl(to, `Booking created. Pay ${naira(amount)} to confirm — we match your pro as soon as payment clears.`, 'Pay securely', session.checkoutUrl);
-  } else {
-    await wa.text(to, 'Booking created. Open the Kendibo app to pay and confirm it.');
+  // ── Shared location ─────────────────────────────────────────────────────────
+  if (m.type === 'location' && m.location) {
+    await useLocation(to, s, user.id, { lat: m.location.latitude, lng: m.location.longitude, address: m.location.address || m.location.name || 'Shared location' });
+    await saveSession(s);
+    return;
   }
+
+  // ── Photo (its caption, if any, is read as text below) ──────────────────────
+  const images: { mime: string; base64: string }[] = [];
+  if (m.type === 'image' && m.image?.id) {
+    const media = await wa.downloadMedia(m.image.id).catch(() => null);
+    let saved = false;
+    if (media) {
+      const { mediaService } = await import('../media/media.service.js');
+      const { assetId } = await mediaService.presign('photo');
+      const done = await mediaService.ingest(assetId, media.bytes, media.mime).catch(() => null);
+      if (done?.status === 'clean') {
+        draft = await addPhotoToDraft(to, user.id, assetId);
+        images.push({ mime: media.mime, base64: media.bytes.toString('base64') });
+        saved = true;
+      }
+    }
+    if (!text) {
+      const d = draft ?? (await openDraft(to, user.id));
+      await sendStep(to, d, s.data, saved ? 'Photo added.' : "I couldn't save that photo. You can send it again, or carry on without it.");
+      await saveSession(s);
+      return;
+    }
+  }
+
+  if (!text) {
+    if (draft) await sendStep(to, draft, s.data); else await sendMenu(to);
+    await saveSession(s);
+    return;
+  }
+
+  // ── Text ──────────────────────────────────────────────────────────────────
+  const step: Step | null = draft ? nextStep(draft, s.data) : null;
+  const u = await understand(text, { expectingBudget: step === 'budget' });
+  s.data.lang = u.language === 'pcm' ? 'pcm' : (s.data.lang ?? 'en');
+  let route = 'flow';
+  const lead = (x: string) => (firstContact ? `${DISCLOSURE}\n\n${x}`.trim() : x);
+
+  if (u.intent === 'human') {
+    route = 'human';
+    await handOff(s, user.id, to, text);
+  } else if (u.intent === 'out_of_scope' && u.sure) {
+    // Meta's terms bar general-purpose AI assistants: decline, with no LLM call.
+    route = 'refuse';
+    const no = 'I can only help with Kendibo home services: booking a job, your bookings, payments and support.';
+    if (draft) await sendStep(to, draft, s.data, lead(no)); else await sendMenu(to, lead(no));
+  } else if (u.intent === 'greeting') {
+    route = 'menu';
+    if (firstContact && !draft) await sendWelcome(to, profileName);
+    else if (draft) await sendStep(to, draft, s.data, lead("Welcome back. Let's finish your request."));
+    else await sendMenu(to, `${firstName(profileName) ? `Hi ${firstName(profileName)}! ` : 'Hi! '}What would you like to do?`);
+  } else if (u.intent === 'status') {
+    route = 'facts';
+    await sendStatus(to, user.id, draft);
+  } else if (u.intent === 'cancel') {
+    if (draft) {
+      await cancelDraft(draft.id);
+      s.data = { lang: s.data.lang };
+      await sendMenu(to, 'Cancelled. Nothing was sent to vendors.');
+    } else {
+      await sendMenu(to, 'To cancel a booking that is already confirmed, open the Kendibo app and go to Bookings, or type "agent" and we\'ll do it for you.');
+    }
+  } else if (['payment', 'pricing', 'coverage', 'trust', 'vendor_join'].includes(u.intent) && u.sure) {
+    route = 'facts';
+    const answer = lead(await factAnswer(u, text, draft));
+    if (draft) await sendStep(to, draft, s.data, `${answer}\n\nBack to your request:`);
+    else await sendMenu(to, answer);
+  } else if (u.intent === 'thanks' && u.sure) {
+    route = 'menu';
+    if (draft) await sendStep(to, draft, s.data, "You're welcome."); else await wa.text(to, 'You\'re welcome! Reply "menu" any time.');
+  } else if (draft && step === 'confirm' && u.intent === 'affirm') {
+    await submitDraft(to, user.id, draft);
+    s.data = { lang: s.data.lang };
+  } else if (draft && (step === 'photo' || step === 'budget') && u.intent === 'deny' && !u.budgetKobo) {
+    if (step === 'photo') s.data.photo = true; else s.data.budget = true;
+    await sendStep(to, draft, s.data);
+  } else if (draft && step === 'location' && text.length >= 6 && !u.when.date && !u.budgetKobo && ['details', 'book', 'affirm', 'deny', 'out_of_scope'].includes(u.intent)) {
+    // A typed address: geocode it, then the same coverage check as a pin.
+    const { maps } = await import('../geo/maps.port.js');
+    const city = (process.env.GEOLOCK_CITY ?? 'uyo').split(',')[0].trim() || 'uyo';
+    const g = await maps.geocode(text, city).catch(() => null);
+    if (g) await useLocation(to, s, user.id, { lat: g.lat, lng: g.lng, address: (g.formatted || text).slice(0, 160) });
+    else { route = 'clarify'; await sendStep(to, draft, s.data, "I couldn't find that address. Add the area and a landmark, or tap the button to pin it on the map."); }
+  } else {
+    const patch = await patchFromUnderstanding(draft ?? EMPTY_DRAFT, u, text, step ?? 'need');
+    if (Object.keys(patch).length || (u.intent === 'book' && u.sure)) {
+      const d = draft ?? (await openDraft(to, user.id));
+      await patchDraft(d.id, patch);
+      if (patch.scheduled_date) s.data.dayPick = false;
+      await sendStep(to, { ...d, ...patch } as Draft, s.data, lead(await acknowledge(patch)));
+    } else if (await tryAgent(to, s, user.id, text, u, step, images)) {
+      await logTurn(to, text, u, 'llm', step);
+      return; // the agent replied and may have changed the session (hand-off)
+    } else {
+      route = 'clarify';
+      const sorry = "Sorry, I didn't catch that.";
+      if (draft) await sendStep(to, draft, s.data, sorry);
+      else await sendMenu(to, lead(`${sorry} I can book a home-service pro, check your bookings, or get you a person.`));
+    }
+  }
+  await logTurn(to, text, u, route, step);
+  await saveSession(s);
+}
+
+/**
+ * Where the template's "Pay securely" button goes: a fresh (idempotent) Bachs
+ * checkout for this customer's own booking, or null if it is not payable.
+ */
+export async function payLinkTarget(waId: string, bookingId: string): Promise<{ url: string } | { done: string }> {
+  const b = await q<{ user_id: string; status: string; price_kobo: string | null }>(
+    `SELECT b.user_id, b.status, b.price_kobo FROM booking.booking b JOIN identity.users u ON u.id = b.user_id WHERE b.id=$1 AND u.phone=$2`, [bookingId, e164(waId)],
+  ).catch(() => []);
+  if (!b[0]) return { done: 'This payment link is not valid for this number.' };
+  if (!['REQUESTED', 'PAYMENT_PENDING'].includes(String(b[0].status).toUpperCase())) return { done: 'This booking is already paid or no longer needs payment.' };
+  const amount = BigInt(String(b[0].price_kobo ?? '0').split('.')[0] || '0');
+  if (!deps || amount <= 0n) return { done: 'Open the Kendibo app to pay for this booking.' };
+  const email = await q<{ email: string | null }>(`SELECT email FROM identity.users WHERE id=$1`, [b[0].user_id]);
+  const session = await deps.createCheckout({
+    bookingId, amountKobo: amount, customerEmail: email[0]?.email || `wa${waId.replace(/\D/g, '')}@customers.kendibo.ng`,
+    reference: `bk_${bookingId}_wa`, idempotencyKey: `wa_accept_${bookingId}`,
+  });
+  return session.checkoutUrl ? { url: session.checkoutUrl } : { done: 'Open the Kendibo app to pay for this booking.' };
+}
+
+/** The map page saved a pin: carry on in WhatsApp without waiting for the customer. */
+export async function continueAfterLocation(waId: string): Promise<void> {
+  await runSerially(waId, async () => {
+    const s = await loadSession(waId);
+    const d = await currentDraft(waId);
+    if (!d) return;
+    await sendStep(waId, d, s.data, `Location saved${d.address_text ? `: ${d.address_text}` : ''}.`);
+  });
+}
+
+// ── Crash recovery ──────────────────────────────────────────────────────────
+// A turn the process died in the middle of (started, never processed) is
+// retried once, ten minutes later. Messages older than six hours are left
+// alone: a reply that late would only confuse.
+let sweeper: NodeJS.Timeout | null = null;
+export function startInboundSweeper(everyMs = 60_000) {
+  if (sweeper) return;
+  sweeper = setInterval(() => { void sweepInbound().catch((e) => observability.captureException(e)); }, everyMs);
+  sweeper.unref?.();
+}
+export async function sweepInbound(now = Date.now()): Promise<number> {
+  const rows = await q<{ message_id: string; payload: unknown; profile_name: string | null }>(
+    `SELECT message_id, payload, profile_name FROM messaging.whatsapp_inbound
+      WHERE processed_at IS NULL AND payload IS NOT NULL AND attempts < 2 AND received_at > $1
+        AND (started_at IS NULL OR started_at < $2)
+      ORDER BY received_at LIMIT 20`,
+    [new Date(now - 6 * 3600_000).toISOString(), new Date(now - RETRY_AFTER_MS).toISOString()],
+  ).catch(() => []);
+  for (const r of rows) {
+    const m = (typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload) as InboundMessage;
+    await runSerially(m.from, () => processAndMark(m, r.profile_name ?? undefined));
+  }
+  return rows.length;
 }
 
 /**
@@ -417,23 +518,30 @@ export async function notifyRequestAccepted(requestId: string, bookingId: string
   );
   const who = vendor[0]?.name ? String(vendor[0].name) : 'A verified vendor';
   if (!bookingId) {
-    await wa.text(to, `${who} accepted your job. They'll inspect first and send a quote here for you to approve — you only pay after you accept it.`);
+    await notifyCustomer(to, `${who} accepted your job. They'll inspect first and send a quote here for you to approve. You only pay after you accept it.`);
     return;
   }
   const b = await q<{ price_kobo: string | null; total_kobo: string | null }>(`SELECT * FROM booking.booking WHERE id=$1`, [bookingId]).catch(() => []);
   const amount = BigInt(String(b[0]?.price_kobo ?? b[0]?.total_kobo ?? '0').split('.')[0] || '0');
   const email = await q<{ email: string | null }>(`SELECT email FROM identity.users WHERE id=$1`, [r.user_id]);
   if (!deps || amount <= 0n) {
-    await wa.text(to, `${who} accepted your job. Open the Kendibo app to confirm and pay.`);
+    await notifyCustomer(to, `${who} accepted your job. Open the Kendibo app to confirm and pay.`);
     return;
   }
   const session = await deps.createCheckout({
     bookingId, amountKobo: amount, customerEmail: email[0]?.email || `wa${to}@customers.kendibo.ng`,
     reference: `bk_${bookingId}_wa`, idempotencyKey: `wa_accept_${bookingId}`,
   });
-  if (session.checkoutUrl) {
-    await wa.ctaUrl(to, `${who} accepted your job. Pay ${`₦${(Number(amount) / 100).toLocaleString('en-NG')}`} to confirm — Kendibo holds it until you say the job is done.`, 'Pay securely', session.checkoutUrl);
-  } else {
-    await wa.text(to, `${who} accepted your job. Open the Kendibo app to confirm and pay.`);
+  if (!session.checkoutUrl) {
+    await notifyCustomer(to, `${who} accepted your job. Open the Kendibo app to confirm and pay.`);
+    return;
   }
+  const checkoutUrl = session.checkoutUrl;
+  const line = `${who} accepted your job. Pay ${naira(amount)} to confirm. Kendibo holds it until you say the job is done.`;
+  await sendBusinessInitiated({
+    waId: to,
+    whatsapp: () => wa.ctaUrl(to, line, 'Pay securely', checkoutUrl),
+    template: { key: 'vendor_accepted', params: [who, naira(amount)], buttons: [{ index: 0, urlSuffix: encodeURIComponent(payToken(to, bookingId)) }] },
+    sms: `${line} ${checkoutUrl}`,
+  });
 }

@@ -242,4 +242,44 @@ export const identityService = {
     await this.logDevice(user.id, device ?? {});
     return { user, access, refresh: refresh.token, deviceId, isNew };
   },
+  /** Facebook Login: verify the token with Meta (see facebook.ts), match-or-create, same session bundle. */
+  async facebookVerify(accessToken: string, device?: { fp?: string; platform?: string; model?: string; os?: string; appVersion?: string; ip?: string; city?: string }) {
+    const { verifyFacebookToken } = await import('./facebook.js');
+    const p = await verifyFacebookToken(accessToken);
+    let rows = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE facebook_sub=$1`, [p.id]);
+    let isNew = false;
+    if (!rows[0]) {
+      const byEmail = p.email ? await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE email=$1`, [p.email]) : [];
+      if (byEmail[0]) {
+        await q(`UPDATE identity.users SET facebook_sub=$2, profile_image=COALESCE(profile_image,$3) WHERE id=$1`, [String(byEmail[0].id), p.id, p.picture]);
+        rows = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE id=$1`, [String(byEmail[0].id)]);
+      } else {
+        const name = p.name ?? (p.email ? p.email.split('@')[0] : 'Kendibo user');
+        rows = await q<Record<string, unknown>>(
+          `INSERT INTO identity.users (email, name, facebook_sub, profile_image) VALUES ($1,$2,$3,$4) RETURNING *`, [p.email, name, p.id, p.picture],
+        );
+        isNew = true;
+        void welcomeService.send({ id: String((rows[0] as { id?: unknown }).id), name, email: p.email, phone: null }).catch(() => {});
+      }
+    }
+    const user = row(rows[0]);
+    const deviceId = `dev_${Date.now().toString(36)}`;
+    const access = signAccess(user.id, ['booking:create', 'booking:view:self']);
+    const refresh = await signRefresh(user.id, deviceId);
+    await this.logDevice(user.id, device ?? {});
+    return { user, access, refresh: refresh.token, deviceId, isNew };
+  },
+  /**
+   * Meta Data Deletion Request / deauthorize: unlink the Facebook id and drop
+   * the Facebook photo. The account itself (bookings, payments, phone) was not
+   * obtained from Facebook and stays; the person can close it in the app.
+   */
+  async facebookDataDeletion(facebookId: string): Promise<{ code: string }> {
+    const { facebookHash } = await import('./facebook.js');
+    await q(`UPDATE identity.users SET profile_image = NULL WHERE facebook_sub=$1 AND (profile_image LIKE '%fbcdn%' OR profile_image LIKE '%facebook%' OR profile_image LIKE '%fbsbx%')`, [facebookId]);
+    await q(`UPDATE identity.users SET facebook_sub = NULL WHERE facebook_sub=$1`, [facebookId]);
+    const code = `fbdel_${createHash('sha256').update(`${facebookId}:${Date.now()}:${Math.random()}`).digest('hex').slice(0, 20)}`;
+    await q(`INSERT INTO identity.facebook_deletion (code, facebook_hash) VALUES ($1,$2)`, [code, facebookHash(facebookId)]);
+    return { code };
+  },
 };

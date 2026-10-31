@@ -14,6 +14,8 @@ import { vendorFinanceService } from '../../../modules/vendors/vendor-finance.se
 import { payoutService } from '../../../modules/payouts/payout.service.js';
 import { activeModel, FEATURES } from '../../../modules/matching/matching.service.js';
 import { trainAndMaybeActivate, MIN_ROWS } from '../../../modules/matching/trainer.js';
+import { nluStatus, reviewQueue, labelEvent, retrainNlu, INTENTS } from '../../../modules/whatsapp/nlu/index.js';
+import { catalogue, templateRows, syncTemplateStatuses, submitMissingTemplates, templateApiConfigured } from '../../../modules/whatsapp/templates.js';
 
 export const ADMIN_OPS_POLICY: Record<string, Permission> = {
   'GET /v1/admin/whatsapp/conversations': 'booking:view:any',
@@ -24,6 +26,13 @@ export const ADMIN_OPS_POLICY: Record<string, Permission> = {
   'POST /v1/admin/payouts/:providerId/pay': 'payout:approve',
   'GET /v1/admin/ml/status': 'configuration:edit',
   'POST /v1/admin/ml/train': 'configuration:edit',
+  'GET /v1/admin/assistant/status': 'configuration:edit',
+  'GET /v1/admin/assistant/review': 'configuration:edit',
+  'POST /v1/admin/assistant/review/:id/label': 'configuration:edit',
+  'POST /v1/admin/assistant/train': 'configuration:edit',
+  'GET /v1/admin/whatsapp/templates': 'configuration:edit',
+  'POST /v1/admin/whatsapp/templates/sync': 'configuration:edit',
+  'POST /v1/admin/whatsapp/templates/submit': 'configuration:edit',
 };
 
 interface Helpers {
@@ -97,7 +106,7 @@ export function registerAdminOpsRoutes(app: FastifyInstance, h: Helpers) {
       return h.fail(reply, 'OUTSIDE_24H_WINDOW', 'WhatsApp only allows replies within 24 hours of the customer\'s last message. Use an approved template instead.', 409);
     }
     const { wa } = await import('../../../modules/whatsapp/whatsapp.client.js');
-    try { await wa.text(waId, text); }
+    try { await wa.text(waId, text, { record: false }); }
     catch { return h.fail(reply, 'SEND_FAILED', 'WhatsApp did not accept the message. Try again.', 502, true); }
     await q(`INSERT INTO messaging.whatsapp_turn (wa_id, role, content) VALUES ($1,'assistant',$2)`, [waId, `[team] ${text}`]);
     // Keep the conversation with the team while they are replying.
@@ -175,6 +184,60 @@ export function registerAdminOpsRoutes(app: FastifyInstance, h: Helpers) {
     const a = h.authed(req as never)!;
     const result = await trainAndMaybeActivate();
     await auditService.log(a.sub, 'ml.train', `v${result.version ?? '-'}:${result.activated ? 'activated' : 'kept'}`);
+    return { data: result };
+  });
+
+  // ── WhatsApp assistant: understanding quality, labelling, retraining ──────
+  app.get('/v1/admin/assistant/status', async (req) => {
+    const days = z.coerce.number().int().min(1).max(90).catch(7).parse((req.query as { days?: string }).days);
+    return { data: await nluStatus(days) };
+  });
+
+  app.get('/v1/admin/assistant/review', async () => ({ data: { items: await reviewQueue(50), intents: INTENTS } }));
+
+  app.post('/v1/admin/assistant/review/:id/label', async (req, reply) => {
+    const a = h.authed(req as never)!;
+    const id = String((req.params as { id: string }).id);
+    const body = z.object({ intent: z.string().max(40) }).safeParse(req.body ?? {});
+    if (!body.success || !/^[0-9a-f-]{36}$/i.test(id)) return h.fail(reply, 'VALIDATION', 'Pick an intent for this line.', 400);
+    try {
+      if (!(await labelEvent(id, body.data.intent, a.sub))) return h.fail(reply, 'NOT_FOUND', 'That line is gone (older lines are deleted after 180 days).', 404);
+    } catch { return h.fail(reply, 'UNKNOWN_INTENT', 'That is not one of the assistant\'s intents.', 400); }
+    await auditService.log(a.sub, 'assistant.label', `${id}:${body.data.intent}`);
+    return { data: { ok: true } };
+  });
+
+  // ── WhatsApp message templates (Meta Template API) ────────────────────────
+  const templateView = async () => {
+    const rows = await templateRows();
+    return {
+      configured: templateApiConfigured(),
+      templates: catalogue().map((t) => ({ key: t.key, purpose: t.purpose, ...rows.find((r) => r.name === t.name && r.language === t.language)! })),
+    };
+  };
+  app.get('/v1/admin/whatsapp/templates', async () => ({ data: await templateView() }));
+
+  app.post('/v1/admin/whatsapp/templates/sync', async (req, reply) => {
+    if (!templateApiConfigured()) return h.fail(reply, 'NOT_CONFIGURED', 'Set WHATSAPP_ACCESS_TOKEN and WHATSAPP_BUSINESS_ACCOUNT_ID first.', 409);
+    const a = h.authed(req as never)!;
+    try { await syncTemplateStatuses(); } catch (e) { return h.fail(reply, 'META_ERROR', (e as Error).message, 502, true); }
+    await auditService.log(a.sub, 'whatsapp.templates.sync', 'statuses pulled from Meta');
+    return { data: await templateView() };
+  });
+
+  app.post('/v1/admin/whatsapp/templates/submit', async (req, reply) => {
+    if (!templateApiConfigured()) return h.fail(reply, 'NOT_CONFIGURED', 'Set WHATSAPP_ACCESS_TOKEN and WHATSAPP_BUSINESS_ACCOUNT_ID first.', 409);
+    const a = h.authed(req as never)!;
+    let result;
+    try { result = await submitMissingTemplates(); } catch (e) { return h.fail(reply, 'META_ERROR', (e as Error).message, 502, true); }
+    await auditService.log(a.sub, 'whatsapp.templates.submit', `submitted: ${result.submitted.join(',') || 'none'}; errors: ${result.errors.length}`);
+    return { data: { ...(await templateView()), result } };
+  });
+
+  app.post('/v1/admin/assistant/train', async (req) => {
+    const a = h.authed(req as never)!;
+    const result = await retrainNlu();
+    await auditService.log(a.sub, 'assistant.train', `v${result.version ?? '-'}:${result.promoted ? 'promoted' : 'kept'}`);
     return { data: result };
   });
 }

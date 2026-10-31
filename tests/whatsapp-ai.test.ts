@@ -88,27 +88,26 @@ describe('AI agent tools (scripted model)', () => {
     const page = await app.inject({ method: 'GET', url: `/w/location?t=${encodeURIComponent(t)}` });
     assert.equal(page.statusCode, 200);
     assert.match(String(page.headers['content-security-policy']), /nonce-/);
-    let calls = 0;
-    const submitResults: string[] = [];
-    setLlmForTests(async (params) => {
-      const last = params.messages[params.messages.length - 1];
-      if (Array.isArray(last.content)) for (const b of last.content as { type: string; content?: string }[]) if (b.type === 'tool_result') submitResults.push(String(b.content));
-      return ++calls === 1 ? msg([toolUse('submit_job_request', {})], 'tool_use') : msg([{ type: 'text', text: 'Submitted.' }], 'end_turn');
-    });
     const saved = await app.inject({ method: 'POST', url: '/w/location', payload: { t, lat: UYO.lat, lng: UYO.lng, address: 'Ewet Housing', landmark: 'Near the church' } });
     assert.equal(saved.statusCode, 200, saved.body);
-    // The agent continues in the background; wait for it (bounded).
-    let after: Record<string, unknown> = {};
-    for (let i = 0; i < 100; i++) {
-      after = (await q<Record<string, unknown>>(`SELECT * FROM messaging.whatsapp_job_draft WHERE wa_id=$1`, [waId]))[0];
-      if (after.status === 'submitted' || submitResults.length) break;
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    for (let i = 0; i < 100 && after.status !== 'submitted'; i++) {
-      await new Promise((r) => setTimeout(r, 100));
-      after = (await q<Record<string, unknown>>(`SELECT * FROM messaging.whatsapp_job_draft WHERE wa_id=$1`, [waId]))[0];
-    }
-    assert.ok(!submitResults.some((s) => s.includes('error')), `submit tool result: ${submitResults.join(' | ')}`);
+
+    // The flow carries on in WhatsApp by itself (no LLM): the only optional
+    // step left is the photo, then the summary, then the customer confirms.
+    const botSaid = async (needle: string) => {
+      for (let i = 0; i < 100; i++) {
+        const turns = await q<{ content: string }>(`SELECT content FROM messaging.whatsapp_turn WHERE wa_id=$1 AND role='assistant'`, [waId]);
+        if (turns.some((x) => String(x.content).includes(needle))) return true;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      return false;
+    };
+    assert.ok(await botSaid('Location saved'), 'the flow continued after the pin');
+    const { handleInbound } = await import('../modules/whatsapp/whatsapp.bot.js');
+    const tap = (id: string, title: string) => handleInbound({ id: `wamid.${randomUUID()}`, from: waId, type: 'interactive', interactive: { button_reply: { id, title } } });
+    await tap('flow:skip_photo', 'Skip photo');
+    assert.ok(await botSaid('Find vendors'), 'the summary asks to confirm');
+    await tap('flow:confirm', 'Find vendors');
+    const after = (await q<Record<string, unknown>>(`SELECT * FROM messaging.whatsapp_job_draft WHERE wa_id=$1`, [waId]))[0];
     assert.equal(Number(after.lat).toFixed(4), UYO.lat.toFixed(4));
     assert.equal(after.status, 'submitted');
     assert.ok(after.request_id, 'a service request was created');

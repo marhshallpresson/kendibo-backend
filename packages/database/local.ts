@@ -98,7 +98,9 @@ export function localDb(): IMemoryDb {
   run('026_prembly_kyb_vendor_storefront_dispatch.sql');
   run('027_vendor_rules_storefront_whatsapp_kyc_cost.sql');
   run('028_schema_reconcile_ai_agent_matching.sql');
-  console.log('[localdb] pg-mem ready (001-019, 021-028)');
+  run('029_whatsapp_understanding.sql');
+  run('030_whatsapp_templates_facebook_login.sql');
+  console.log('[localdb] pg-mem ready (001-019, 021-030)');
   return mem;
 }
 

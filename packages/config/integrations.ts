@@ -53,14 +53,24 @@ export const INTEGRATIONS: Integration[] = [
   {
     id: 'whatsapp', name: 'WhatsApp Cloud API (Meta)', purpose: 'Booking assistant, vendor offer buttons', docs: 'https://developers.facebook.com/docs/whatsapp/cloud-api',
     keys: [
-      { env: 'WHATSAPP_ACCESS_TOKEN', exposure: 'secret', requiredInProd: false, note: 'Permanent System User token, whatsapp_business_messaging scope only' },
+      { env: 'WHATSAPP_ACCESS_TOKEN', exposure: 'secret', requiredInProd: false, note: 'Permanent System User token (never expires) with whatsapp_business_messaging + whatsapp_business_management; the 24h API Setup token stops working' },
       { env: 'WHATSAPP_PHONE_NUMBER_ID', exposure: 'config', requiredInProd: false, note: 'From WhatsApp Manager → API setup' },
+      { env: 'WHATSAPP_BUSINESS_ACCOUNT_ID', exposure: 'config', requiredInProd: false, note: 'WhatsApp Business Account ID; the Template API lives under it' },
       { env: 'WHATSAPP_APP_SECRET', exposure: 'secret', requiredInProd: false, note: 'Meta App Secret; verifies X-Hub-Signature-256' },
       { env: 'WHATSAPP_VERIFY_TOKEN', exposure: 'secret', requiredInProd: false, note: 'You choose it; paste the same value in the webhook form' },
       { env: 'WHATSAPP_GRAPH_VERSION', exposure: 'config', requiredInProd: false, note: 'e.g. v21.0' },
       { env: 'WHATSAPP_BUSINESS_NUMBER', exposure: 'config', requiredInProd: false, note: 'International format, for "Back to WhatsApp" links' },
       { env: 'WHATSAPP_LINK_SECRET', exposure: 'secret', requiredInProd: false, note: 'Signs map / vendor-list links; falls back to JWT_ACCESS_SECRET' },
       { env: 'WHATSAPP_WEB_BASE_URL', exposure: 'config', requiredInProd: false, note: 'Public base the /w/* pages are served from' },
+      { env: 'WHATSAPP_TEMPLATE_JOB_OFFER', exposure: 'config', requiredInProd: false, note: 'Utility template for job offers outside the 24h window (1 body variable + Accept/Decline quick replies); else SMS' },
+      { env: 'WHATSAPP_TEMPLATE_VENDOR_ACCEPTED', exposure: 'config', requiredInProd: false, note: 'Utility template "vendor accepted + pay" (vendor, amount, link); else SMS' },
+    ],
+  },
+  {
+    id: 'facebook_login', name: 'Facebook Login (same Meta app)', purpose: 'Sign in with Facebook in the app', docs: 'https://developers.facebook.com/docs/facebook-login',
+    keys: [
+      { env: 'FACEBOOK_APP_ID', exposure: 'public', requiredInProd: false, note: 'Meta App ID (also EXPO_PUBLIC_FACEBOOK_APP_ID in the app build)' },
+      { env: 'FACEBOOK_APP_SECRET', exposure: 'secret', requiredInProd: false, note: 'Optional: defaults to WHATSAPP_APP_SECRET (same Meta app)' },
     ],
   },
   {
@@ -68,6 +78,7 @@ export const INTEGRATIONS: Integration[] = [
     keys: [
       { env: 'ANTHROPIC_API_KEY', exposure: 'secret', requiredInProd: false, note: 'Server only; set a monthly spend limit in the Anthropic console' },
       { env: 'WHATSAPP_AI_MODEL', exposure: 'config', requiredInProd: false, note: 'claude-opus-5-5 (default) or claude-haiku-5-5 for speed/cost' },
+      { env: 'WHATSAPP_AI_DAILY_TURNS', exposure: 'config', requiredInProd: false, note: 'AI fallback turns per customer per day (default 25)' },
     ],
   },
   {

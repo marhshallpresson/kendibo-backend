@@ -19,12 +19,16 @@ import { Readable } from 'node:stream';
 import { verifySubscription, verifySignature } from '../../../modules/whatsapp/whatsapp.client.js';
 import { verifyLink } from '../../../modules/whatsapp/links.js';
 import { renderLocationPage, renderVendorsPage, renderMessagePage, pageCsp } from '../../../modules/whatsapp/web-pages.js';
-import { handleInbound, type InboundMessage } from '../../../modules/whatsapp/whatsapp.bot.js';
+import { handleInbound, continueAfterLocation, startInboundSweeper, payLinkTarget, type InboundMessage } from '../../../modules/whatsapp/whatsapp.bot.js';
+import { applyTemplateWebhook } from '../../../modules/whatsapp/templates.js';
+import { saveDraftLocation } from '../../../modules/whatsapp/draft.js';
+import { notifyCustomer } from '../../../modules/whatsapp/policy.js';
 import { requestService } from '../../../modules/requests/request.service.js';
 import { auditService } from '../../../modules/audit/audit.service.js';
 import { integrationStatus } from '../../../packages/config/integrations.js';
 import { observability } from '../../../packages/observability/watchup.adapter.js';
 import { q } from '../../../packages/database/db.js';
+import { emit } from '../../../packages/observability/emit.js';
 
 export const VENDOR_ROUTE_POLICY: Record<string, 'public' | Permission> = {
   'GET /v1/categories/:id/rules': 'public',
@@ -38,6 +42,7 @@ export const VENDOR_ROUTE_POLICY: Record<string, 'public' | Permission> = {
   'POST /w/location': 'public',
   'GET /w/vendors': 'public',
   'POST /w/vendors/choose': 'public',
+  'GET /w/pay': 'public',
   'GET /v1/admin/category-rules': 'provider:verify',
   'PUT /v1/admin/category-rules/:id': 'configuration:edit',
   'GET /v1/admin/category-proposals': 'provider:verify',
@@ -75,6 +80,8 @@ const MESSAGES: Record<string, [number, string]> = {
 };
 
 export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
+  // Retries WhatsApp turns a crash cut short (never in tests: they drive the router directly).
+  if (process.env.NODE_ENV !== 'test') startInboundSweeper();
   const err = (reply: FastifyReply, e: unknown) => {
     const code = (e as Error)?.message ?? 'ERROR';
     const known = MESSAGES[code];
@@ -292,16 +299,11 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
     const { geoService } = await import('../../../modules/geo/geo.service.js');
     const zone = await geoService.checkZone(body.data.lat, body.data.lng);
     if (!zone.serviceable) return h.fail(reply, 'OUTSIDE_COVERAGE', "We don't cover that spot yet. We're live in Uyo first, then Lagos and Abuja.", 422);
-    const { saveDraftLocation, runAgent } = await import('../../../modules/whatsapp/agent.js');
     try {
       await saveDraftLocation(claims.w, claims.d, { lat: body.data.lat, lng: body.data.lng, address: body.data.address || 'Pinned on map', landmark: body.data.landmark });
     } catch { return h.fail(reply, 'LINK_EXPIRED', 'This job was already sent. Start a new one on WhatsApp.', 410); }
-    // Continue the conversation in WhatsApp without waiting for the customer.
-    const owner = await q<{ user_id: string | null }>(`SELECT user_id FROM messaging.whatsapp_job_draft WHERE id=$1`, [claims.d]);
-    if (owner[0]?.user_id) {
-      void runAgent({ waId: claims.w, userId: String(owner[0].user_id), text: '', event: `location_saved: ${body.data.address || 'pinned on map'}${body.data.landmark ? ` (landmark: ${body.data.landmark})` : ''}` })
-        .catch((e) => observability.captureException(e));
-    }
+    // Continue the conversation in WhatsApp (next step of the flow) without waiting for the customer.
+    void continueAfterLocation(claims.w).catch((e) => observability.captureException(e));
     return { ok: true, message: "We'll continue in WhatsApp." };
   });
 
@@ -337,10 +339,9 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
     if (sr[0]?.preferred_provider_id) {
       return html(reply, nonce, false, renderMessagePage({ title: 'Already sent', message: "You've already chosen a vendor for this job. We'll update you on WhatsApp.", nonce, waNumber: waNumber() }));
     }
-    const { wa } = await import('../../../modules/whatsapp/whatsapp.client.js');
     if (body.providerId === 'auto') {
       const out = await requestService.broadcast(requestId, 3);
-      await wa.text(claims.w, `We've sent your job to the ${out.offersSent} best-matched vendor${out.offersSent === 1 ? '' : 's'}. The first to accept gets it — we'll message you here.`).catch(() => undefined);
+      await notifyCustomer(claims.w, `We've sent your job to the ${out.offersSent} best-matched vendor${out.offersSent === 1 ? '' : 's'}. The first to accept gets it — we'll message you here.`).catch(() => undefined);
       return html(reply, nonce, false, renderMessagePage({ title: 'Sent to the best matches', message: "We'll message you on WhatsApp as soon as a vendor accepts.", nonce, waNumber: waNumber() }));
     }
     // The pick must still be in the eligible, in-range list (no picking arbitrary ids).
@@ -359,8 +360,19 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
       const { notifyProviderOfOffer } = await import('../../../modules/whatsapp/whatsapp.bot.js');
       await notifyProviderOfOffer(String(phone[0].phone), String(offerId), `${String(sr[0]?.title ?? 'New job').slice(0, 80)} — ${pick.distanceKm.toFixed(1)} km away`);
     }
-    await wa.text(claims.w, `We've asked ${pick.name}. You'll get a message here when they accept — if they can't, we'll offer your job to the next best match.`).catch(() => undefined);
+    await notifyCustomer(claims.w, `We've asked ${pick.name}. You'll get a message here when they accept — if they can't, we'll offer your job to the next best match.`).catch(() => undefined);
     return html(reply, nonce, false, renderMessagePage({ title: `Request sent to ${pick.name}`, message: "We'll message you on WhatsApp when they accept.", nonce, waNumber: waNumber() }));
+  });
+
+  // "Pay securely" button of the vendor-accepted template: signed link → a
+  // fresh, idempotent Bachs checkout for this customer's own booking.
+  app.get('/w/pay', async (req, reply) => {
+    const nonce = newNonce();
+    const claims = verifyLink(String((req.query as { t?: string }).t ?? ''), 'pay');
+    if (!claims) return expired(reply, nonce);
+    const target = await payLinkTarget(claims.w, claims.d).catch(() => ({ done: 'Payment is unavailable right now. Try again in a minute.' }));
+    if ('url' in target) return reply.redirect(target.url, 302);
+    return html(reply, nonce, false, renderMessagePage({ title: 'Payment', message: target.done, nonce, waNumber: waNumber() }));
   });
 
   // ── WhatsApp assistant ───────────────────────────────────────────────────
@@ -385,10 +397,22 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
       return h.fail(reply, 'BAD_SIGNATURE', 'Invalid webhook signature', 401);
     }
     // Acknowledge fast (Meta retries slow webhooks); process after replying.
-    const body = (req.body ?? {}) as { entry?: { changes?: { value?: { messages?: InboundMessage[]; contacts?: { wa_id: string; profile?: { name?: string } }[] } }[] }[] };
+    const body = (req.body ?? {}) as { entry?: { changes?: { field?: string; value?: {
+      messages?: InboundMessage[]; contacts?: { wa_id: string; profile?: { name?: string } }[];
+      statuses?: { status?: string; errors?: { code?: number; title?: string }[] }[];
+    } }[] }[] };
     const jobs: Promise<void>[] = [];
     for (const entry of body.entry ?? []) {
       for (const change of entry.changes ?? []) {
+        // Template review / category / quality changes (WhatsApp Business Account fields).
+        if (change.field && change.field.startsWith('message_template_') || change.field === 'template_category_update') {
+          jobs.push(applyTemplateWebhook(String(change.field), (change.value ?? {}) as Record<string, unknown>).catch((e) => observability.captureException(e)));
+          continue;
+        }
+        // Delivery receipts: surface failures (e.g. 131047, outside the 24h window) to observability.
+        for (const st of change.value?.statuses ?? []) {
+          if (st.status === 'failed') emit('whatsapp.delivery_failed', { code: st.errors?.[0]?.code ?? null, title: String(st.errors?.[0]?.title ?? '').slice(0, 80) });
+        }
         const contacts = change.value?.contacts ?? [];
         for (const m of change.value?.messages ?? []) {
           const name = contacts.find((c) => c.wa_id === m.from)?.profile?.name;
