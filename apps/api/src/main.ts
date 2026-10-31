@@ -28,7 +28,7 @@ import { slingClient } from '../../../modules/notifications/sling.client.js';
 import { aiCtaService, type AiCtaCampaignGoal } from '../../../modules/notifications/ai-cta.service.js';
 import { slingAutomationService, type RetainerCadence } from '../../../modules/notifications/automation.service.js';
 import { mediaService } from '../../../modules/media/media.service.js';
-import { kycService } from '../../../modules/kyc/kyc.service.js';
+import { kycService, selectKycAdapter } from '../../../modules/kyc/kyc.service.js';
 import { fraudService } from '../../../modules/fraud/fraud.service.js';
 import { configurationService } from '../../../modules/configuration/config.service.js';
 import { auditService } from '../../../modules/audit/audit.service.js';
@@ -1074,11 +1074,11 @@ app.post('/v1/provider/kyc', async (req, reply) => {
     const applied = await kycService.applyProviderTier(me.id, outcome);
     if (a?.sub) {
       void slingAutomationService.triggerEvent(
-        applied.status === 'VERIFIED' ? 'provider.kyc_verified' : 'provider.kyc_submitted',
+        applied?.status === 'VERIFIED' ? 'provider.kyc_verified' : 'provider.kyc_submitted',
         a.sub,
         {
           provider: businessName ?? provRow?.businessName ?? userProfile?.name ?? 'Vendor',
-          status: applied.status,
+          status: applied?.status ?? 'UNDER_REVIEW',
         },
       ).catch(() => {});
     }
@@ -1795,9 +1795,13 @@ app.post('/v1/payouts/resolve-account', async (req, reply) => {
   const provProfile = await providerService.byUserId(a.sub).catch(() => null);
 
   let r = await payments.verifyBankAccount(accountNumber, bankCode).catch(() => ({ valid: false, accountName: undefined }));
+  // Sandbox-only: invent a name so the onboarding flow can be demoed without a
+  // live PSP. NEVER in production — a made-up name always "aligns" with the
+  // vendor's own profile, which would let any account receive payouts.
+  let sandboxResolved = false;
   if (!r.valid || !r.accountName) {
-    // Fallback to Prembly bank verification or sandbox deterministic resolution when live PSP is unconfigured
-    if (!accountNumber.startsWith('0000')) {
+    if (!PROD && !accountNumber.startsWith('0000')) {
+      sandboxResolved = true;
       const fallbackName = (
         provProfile?.verifiedLegalName ||
         userProfile?.name ||
@@ -1818,7 +1822,7 @@ app.post('/v1/payouts/resolve-account', async (req, reply) => {
     bankAccountName: r.accountName,
   });
 
-  return { data: { accountName: r.accountName, valid: true, alignment } };
+  return { data: { accountName: r.accountName, valid: true, alignment, sandbox: sandboxResolved } };
 });
 
 // Prembly Name Alignment Check & Prembly MCP Server Endpoints (docs.prembly.com)
@@ -2071,7 +2075,7 @@ app.get('/v1/provider/kyc/status', async (req, reply) => {
   if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   const me = await providerService.byUserId(a.sub);
   if (!me) return fail(reply, 'NOT_FOUND', 'Provider profile not found', 404);
-  return { data: { ...(await kycService.status(me.id)), providerId: me.id, provider: kycService.activeProvider } };
+  return { data: { ...(await kycService.status(me.id)), providerId: me.id, provider: selectKycAdapter().name } };
 });
 // ---- ON-DEMAND service requests (Bolt-style broadcast + accept) ----
 app.post('/v1/service-requests', async (req, reply) => {

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { verifyNameAlignment, kycService } from '../modules/kyc/kyc.service.js';
 import { providerService } from '../modules/providers/provider.service.js';
+import { q } from '../packages/database/db.js';
 
 test('Prembly Name Alignment Engine links Legal Name, CAC Business Name, and Bank Account Holder', () => {
   const alignedPersonal = verifyNameAlignment({
@@ -60,7 +61,8 @@ test('Prembly MCP Server manifest exposes Nigeria KYC, CAC KYB, Face Biometrics,
 });
 
 test('Vendor Storefront, Office Map Pinpoint, Service Packages & Dispatch Feed operate cleanly without AI labels', async () => {
-  const uid = `usr_vendor_${Date.now()}`;
+  // provider.user_id is a UUID FK to identity.users — create a real user.
+  const uid = String((await q<{ id: string }>(`INSERT INTO identity.users (email, role) VALUES ($1,'PROVIDER') RETURNING id`, [`vendor-${Date.now()}@kendibo.local`]))[0].id);
   const prov = await providerService.onboard(uid);
   assert.ok(prov.id);
 

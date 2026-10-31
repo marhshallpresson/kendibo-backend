@@ -13,17 +13,6 @@ ALTER TABLE provider.skill ADD COLUMN IF NOT EXISTS skill_tag TEXT;
 -- respondToOffer stamps the acceptance time; offersFor orders by offer time.
 ALTER TABLE dispatch.assignment ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ;
 ALTER TABLE dispatch.assignment ADD COLUMN IF NOT EXISTS offered_at TIMESTAMPTZ NOT NULL DEFAULT now();
--- provider.service reads/writes provider.gallery_photo (021 created
--- provider.gallery). Created only if missing, so a database that already has
--- it is untouched.
-CREATE TABLE IF NOT EXISTS provider.gallery_photo (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  provider_id UUID NOT NULL REFERENCES provider.provider(id),
-  asset_id TEXT NOT NULL REFERENCES media.asset(id),
-  caption TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (provider_id, asset_id)
-);
 
 -- ── 2. WhatsApp AI agent ────────────────────────────────────────────────────
 -- Rolling conversation memory per WhatsApp user (trimmed to the last N turns

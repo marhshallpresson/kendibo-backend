@@ -201,7 +201,7 @@ export function verifyNameAlignment(input: NameAlignmentInput): NameAlignmentRes
   } else if (!cacAligned) {
     mismatchReason = 'Entered business name does not match CAC registered company name.';
   } else if (!bankAligned) {
-    mismatchReason = 'Bank account holder name does not match your verified legal name or CAC business name.';
+    mismatchReason = 'Bank account name does not match your verified legal name or CAC business name.';
   }
 
   return {
@@ -687,9 +687,13 @@ async function recordCheck(
 }
 
 async function assetBase64(assetId: string): Promise<string | null> {
-  const asset = await mediaService.get(assetId);
-  if (!asset || asset.status !== 'clean' || !asset.bytesBase64) return null;
-  return asset.bytesBase64;
+  // Media assets carry no inline bytes; read the clean file from storage.
+  try {
+    const { bytes } = await mediaService.readAsset(assetId);
+    return bytes.length ? bytes.toString('base64') : null;
+  } catch {
+    return null;
+  }
 }
 
 export interface TierRunInput {
@@ -1364,8 +1368,30 @@ export const kycService = {
             },
           },
         },
+        // Short canonical names (the documented MCP surface); the longer names
+        // above remain as aliases for existing callers.
+        {
+          name: 'prembly_verify_cac',
+          description: 'Verify a CAC RC/BN/IT number; returns { verified, companyName, rcNumber }.',
+          inputSchema: { type: 'object', required: ['rcNumber'], properties: { rcNumber: { type: 'string' }, companyName: { type: 'string' } } },
+        },
+        {
+          name: 'prembly_verify_bank_account',
+          description: 'Resolve a 10-digit NUBAN account and check the holder name against the vendor identity.',
+          inputSchema: { type: 'object', required: ['accountNumber', 'bankCode'], properties: { accountNumber: { type: 'string' }, bankCode: { type: 'string' }, submittedName: { type: 'string' } } },
+        },
+        {
+          name: 'prembly_check_name_alignment',
+          description: 'Compare submitted, NIN/BVN legal, CAC and bank account names without calling a vendor (free).',
+          inputSchema: { type: 'object', properties: { submittedName: { type: 'string' }, businessName: { type: 'string' }, ninLegalName: { type: 'string' }, bvnLegalName: { type: 'string' }, cacCompanyName: { type: 'string' }, bankAccountName: { type: 'string' } } },
+        },
       ],
     };
+  },
+
+  /** Tool list only (what an MCP client's tools/list returns). */
+  listMcpTools() {
+    return this.getMcpToolsManifest().tools;
   },
 
   async executeMcpTool(toolName: string, args: Record<string, unknown>) {
@@ -1383,17 +1409,30 @@ export const kycService = {
         if (selfie && adapter.verifyBvnWithFace) return adapter.verifyBvnWithFace(bvn, selfie);
         return adapter.verifyBvn(bvn);
       }
-      case 'prembly_verify_cac_kyb': {
+      case 'prembly_verify_cac_kyb':
+      case 'prembly_verify_cac': {
         const rcNumber = String(args.rcNumber ?? '');
-        const businessName = typeof args.businessName === 'string' ? args.businessName : undefined;
-        return adapter.verifyCac(rcNumber, businessName);
+        const name = typeof args.businessName === 'string' ? args.businessName
+          : typeof args.companyName === 'string' ? args.companyName : undefined;
+        const r = await adapter.verifyCac(rcNumber, name);
+        return { ...r, verified: r.passed };
       }
+      case 'prembly_check_name_alignment':
+        return verifyNameAlignment({
+          submittedName: typeof args.submittedName === 'string' ? args.submittedName : undefined,
+          businessName: typeof args.businessName === 'string' ? args.businessName : undefined,
+          ninLegalName: typeof args.ninLegalName === 'string' ? args.ninLegalName : undefined,
+          bvnLegalName: typeof args.bvnLegalName === 'string' ? args.bvnLegalName : undefined,
+          cacCompanyName: typeof args.cacCompanyName === 'string' ? args.cacCompanyName : undefined,
+          bankAccountName: typeof args.bankAccountName === 'string' ? args.bankAccountName : undefined,
+        });
       case 'prembly_verify_face_liveness': {
         const selfie = String(args.selfieBase64 ?? '');
         if (adapter.verifyFaceLiveness) return adapter.verifyFaceLiveness(selfie);
         return adapter.verifyDocAndFace(selfie, selfie);
       }
-      case 'prembly_verify_bank_alignment': {
+      case 'prembly_verify_bank_alignment':
+      case 'prembly_verify_bank_account': {
         const accountNumber = String(args.accountNumber ?? '');
         const bankCode = String(args.bankCode ?? '');
         const bankRes = adapter.verifyBankAccount

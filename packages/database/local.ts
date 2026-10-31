@@ -33,6 +33,17 @@ export function localDb(): IMemoryDb {
         .join('\n');
       // pg-mem shims: no ON CONFLICT, native gen_random_uuid() is built in.
       sql = sql.replace(/ON CONFLICT[^\n;]*DO NOTHING/gi, '');
+      if (f === '001_core.sql') {
+        // pg-mem answers `WHERE job_id = $1` wrongly when the composite
+        // UNIQUE (job_id, provider_id) index exists (prefix lookups miss rows),
+        // which broke offer expiry and escalation locally. Postgres keeps the
+        // constraint; code paths already avoid duplicate offers.
+        sql = sql.replace(/,\s*UNIQUE \(job_id, provider_id\)/i, '');
+        // Same pg-mem bug with the partial unique index on job_id. Postgres keeps
+        // it as the hard "one winner per job" guarantee; respondToOffer also
+        // checks for an existing accepted offer first.
+        sql = sql.replace(/CREATE UNIQUE INDEX IF NOT EXISTS one_accepted_per_job[^;]*;/i, '');
+      }
       if (f === '015_provider_one_per_user.sql') {
         sql = sql.replace(/WITH ranked AS \([^)]+\)[\s\S]*?WHERE p\.id = r\.id AND r\.rn > 1;/i, '');
       }

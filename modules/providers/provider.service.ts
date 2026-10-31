@@ -11,6 +11,7 @@ export interface GalleryPhoto {
   assetId: string;
   url: string;
   caption: string | null;
+  position?: number;
   createdAt: string;
 }
 
@@ -281,13 +282,16 @@ export const providerService = {
   },
 
   async offer(jobId: string, providerId: string, slaSec = 60) {
+    // Expiry computed here (not with interval arithmetic) so it is identical on
+    // Postgres and pg-mem, and returned so callers can show the SLA countdown.
+    const expiresAt = new Date(Date.now() + slaSec * 1000).toISOString();
     const rows = await q<Record<string, unknown>>(
       `INSERT INTO dispatch.assignment (job_id, provider_id, status, expires_at)
-       VALUES ($1,$2,'offered', now() + ($3 || ' seconds')::interval) RETURNING *`,
-      [jobId, providerId, String(slaSec)],
+       VALUES ($1,$2,'offered',$3) RETURNING *`,
+      [jobId, providerId, expiresAt],
     );
     emit('dispatch.offered', { jobId, providerId, offerId: rows[0].id, slaSec });
-    return { id: String(rows[0].id), jobId, providerId, status: 'offered' as const };
+    return { id: String(rows[0].id), jobId, providerId, status: 'offered' as const, expiresAt };
   },
 
   async offersFor(providerId: string) {
@@ -574,58 +578,54 @@ export const providerService = {
     return results;
   },
 
-  /** Storefront work gallery — clean photo assets only, newest first. */
+  /** Storefront work gallery (provider.gallery, migration 021): clean photos in
+   *  the vendor's chosen order. */
   async gallery(providerId: string): Promise<GalleryPhoto[]> {
     const rows = await q<Record<string, unknown>>(
-      `SELECT g.id, g.asset_id, g.caption, g.created_at, a.url
-         FROM provider.gallery_photo g
+      `SELECT g.id, g.asset_id, g.caption, g.position, g.created_at, a.url
+         FROM provider.gallery g
          JOIN media.asset a ON a.id = g.asset_id
         WHERE g.provider_id = $1 AND a.status = 'clean'
-        ORDER BY g.created_at DESC`,
+        ORDER BY g.position, g.created_at`,
       [providerId],
     );
     return rows.map((r) => ({
       id: String(r.id),
       assetId: String(r.asset_id),
-      url: String(r.url),
+      url: String(r.url ?? ''),
       caption: r.caption ? String(r.caption) : null,
+      position: Number(r.position ?? 0),
       createdAt: String(r.created_at),
     }));
   },
 
-  async galleryAdd(providerId: string, assetId: string, caption?: string): Promise<GalleryPhoto> {
+  /**
+   * Append a cleared photo. Returns the whole gallery; re-adding an asset that
+   * is already there returns { duplicate: true, items } and changes nothing.
+   */
+  async galleryAdd(providerId: string, assetId: string, caption?: string): Promise<GalleryPhoto[] | { duplicate: true; items: GalleryPhoto[] }> {
     const asset = await mediaService.get(assetId);
     if (!asset) throw new Error('ASSET_NOT_FOUND');
-    if (asset.status !== 'clean' || asset.kind !== 'photo') {
+    // Only scanned, clean images from the photos folder (MediaAsset has no
+    // `kind`; the old check compared an undefined field and rejected everything).
+    if (asset.status !== 'clean' || (asset.folder && asset.folder !== 'photos') || (asset.mime && !asset.mime.startsWith('image/'))) {
       throw new Error('ASSET_NOT_CLEAN');
     }
-    const existing = await q<Record<string, unknown>>(
-      `SELECT id, asset_id, caption, created_at FROM provider.gallery_photo WHERE provider_id=$1 AND asset_id=$2`,
-      [providerId, assetId],
+    const existing = await q(`SELECT id FROM provider.gallery WHERE provider_id=$1 AND asset_id=$2`, [providerId, assetId]);
+    if (existing[0]) return { duplicate: true, items: await this.gallery(providerId) };
+    const next = await q<{ p: number | null }>(`SELECT MAX(position) AS p FROM provider.gallery WHERE provider_id=$1`, [providerId]);
+    const position = next[0]?.p == null ? 0 : Number(next[0].p) + 1;
+    await q(
+      `INSERT INTO provider.gallery (provider_id, asset_id, caption, position) VALUES ($1,$2,$3,$4)`,
+      [providerId, assetId, caption ?? null, position],
     );
-    const row =
-      existing[0] ??
-      (
-        await q<Record<string, unknown>>(
-          `INSERT INTO provider.gallery_photo (provider_id, asset_id, caption)
-           VALUES ($1, $2, $3)
-           RETURNING id, asset_id, caption, created_at`,
-          [providerId, assetId, caption ?? null],
-        )
-      )[0];
     emit('provider.gallery.added', { providerId, assetId });
-    return {
-      id: String(row.id),
-      assetId: String(row.asset_id),
-      url: asset.url,
-      caption: row.caption ? String(row.caption) : null,
-      createdAt: String(row.created_at),
-    };
+    return this.gallery(providerId);
   },
 
   async galleryRemove(providerId: string, entryId: string): Promise<{ removed: true }> {
     const rows = await q<{ id: string }>(
-      `DELETE FROM provider.gallery_photo WHERE id=$1 AND provider_id=$2 RETURNING id`,
+      `DELETE FROM provider.gallery WHERE id=$1 AND provider_id=$2 RETURNING id`,
       [entryId, providerId],
     );
     if (!rows[0]) throw new Error('NOT_FOUND');

@@ -69,7 +69,7 @@ describe('dispatch (filters then scores)', () => {
     const o2 = await providerService.offer(jobId, b.id);
     await providerService.respondToOffer(o1.id, true);
     const after = await providerService.offersFor(b.id);
-    const o2now = after.find((r) => String(r.id) === o2.id);
+    const o2now = after.find((r) => String(r.id) === o2.id) as { status?: string } | undefined;
     assert.equal(String(o2now?.status), 'expired');
   });
 });

@@ -11,7 +11,8 @@ import { q } from '../packages/database/db.js';
 process.env.NODE_ENV = 'test';
 process.env.WHATSAPP_APP_SECRET = 'test-app-secret';
 
-let app: { inject: (opts: unknown) => Promise<{ statusCode: number; headers: Record<string, string>; body: string; json: () => any }>; close?: () => Promise<void> };
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let app: { inject: (opts: any) => Promise<any>; close?: () => Promise<void> };
 before(async () => {
   process.env.DATABASE_URL = '';
   process.env.REDIS_URL = '';

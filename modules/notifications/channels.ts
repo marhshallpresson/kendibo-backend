@@ -227,19 +227,20 @@ export class FcmPushAdapter implements PushPort {
   private readonly legacyKey = process.env.FCM_SERVER_KEY || '';
   private readonly saJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '';
   private readonly saPath = process.env.GOOGLE_APPLICATION_CREDENTIALS || '';
-  private adminReady: Promise<import('firebase-admin').app.App | null> | null = null;
+  // firebase-admin v14 is modular-only (the old `admin.apps` / `admin.credential`
+  // / `admin.messaging()` namespace API is gone), so import the subpaths.
+  private adminReady: Promise<import('firebase-admin/app').App | null> | null = null;
 
-  private getAdmin(): Promise<import('firebase-admin').app.App | null> {
+  private getAdmin(): Promise<import('firebase-admin/app').App | null> {
     if (this.adminReady) return this.adminReady;
     this.adminReady = (async () => {
       if (!this.saJson && !this.saPath) return null;
       try {
-        const admin = await import('firebase-admin');
-        if (admin.apps.length) return admin.apps[0]!;
-        const credential = this.saJson
-          ? admin.credential.cert(JSON.parse(this.saJson))
-          : admin.credential.applicationDefault();
-        return admin.initializeApp({ credential });
+        const { getApps, initializeApp, cert, applicationDefault } = await import('firebase-admin/app');
+        const existing = getApps();
+        if (existing.length) return existing[0]!;
+        const credential = this.saJson ? cert(JSON.parse(this.saJson)) : applicationDefault();
+        return initializeApp({ credential });
       } catch (e) {
         console.warn('[push:fcm] firebase-admin init failed, falling back:', (e as Error).message);
         return null;
@@ -251,8 +252,8 @@ export class FcmPushAdapter implements PushPort {
   async send(token: string, title: string, body: string, data: Record<string, string> = {}): Promise<{ id: string }> {
     const app = await this.getAdmin();
     if (app) {
-      const admin = await import('firebase-admin');
-      const id = await admin.messaging(app).send({
+      const { getMessaging } = await import('firebase-admin/messaging');
+      const id = await getMessaging(app).send({
         token,
         notification: { title, body },
         data,
