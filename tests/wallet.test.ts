@@ -20,7 +20,7 @@ const fakePsp = {
   createPayout: async () => ({ payoutId: 'pay_test', status: 'pending' }),
   verifyWebhookSignature: () => true,
 };
-(globalThis as Record<string, unknown>).__PSP__ = { bachs: fakePsp, flutterwave: fakePsp };
+(globalThis as Record<string, unknown>).__PSP__ = { bachs: fakePsp };
 
 let app: { inject: (opts: unknown) => Promise<{ statusCode: number; json: () => Record<string, any> }>; close?: () => Promise<void> };
 before(async () => {

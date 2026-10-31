@@ -1,19 +1,31 @@
-// PaymentService — PSP router. Primary Bachs, fallback Flutterwave.
+// PaymentService — Bachs.io is the single PSP (Flutterwave removed Oct 2026).
 // Rules: server owns money; webhook != truth until verified; every mutation idempotent.
+// With one PSP there is no failover, so transient Bachs failures (timeouts,
+// 429/5xx) get one quick retry with the SAME idempotency key — safe, because
+// Bachs dedupes on it — before the caller sees PSP_UNAVAILABLE.
 import type { PaymentPort, PSP, CreateCheckoutInput, VerifiedPayment } from './payment.port.js';
 import { BachsAdapter } from './bachs.adapter.js';
-import { FlutterwaveAdapter } from './flutterwave.adapter.js';
 import { q } from '../../packages/database/db.js';
+
+const transient = (e: unknown) => {
+  const m = String((e as Error)?.message ?? '');
+  return /BACHS_(429|5\d\d)|timeout|aborted|ECONNRESET|ETIMEDOUT|fetch failed/i.test(m);
+};
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  try { return await fn(); }
+  catch (e) {
+    if (!transient(e)) throw e;
+    await new Promise((r) => setTimeout(r, 400));
+    return fn();
+  }
+}
 
 export class PaymentService {
   private adapters: Record<PSP, PaymentPort>;
 
-  /** Pass fake adapters in tests to avoid PSP network calls. */
+  /** Pass a fake adapter in tests to avoid PSP network calls. */
   constructor(adapters?: Partial<Record<PSP, PaymentPort>>) {
-    this.adapters = {
-      bachs: adapters?.bachs ?? new BachsAdapter(),
-      flutterwave: adapters?.flutterwave ?? new FlutterwaveAdapter(),
-    };
+    this.adapters = { bachs: adapters?.bachs ?? new BachsAdapter() };
   }
 
   private async recordIntent(psp: PSP, checkoutId: string, input: CreateCheckoutInput): Promise<void> {
@@ -35,24 +47,15 @@ export class PaymentService {
     );
     if (existing[0]) return { psp: existing[0].psp, checkoutId: existing[0].charge_id || '' };
 
-    try {
-      const s = await this.adapters[preferred].createCheckout(input);
-      await this.recordIntent(s.psp, s.checkoutId, input);
-      return s;
-    } catch (e) {
-      if (preferred === 'bachs') {
-        // Rule 10: no single-PSP dependency — fail over to Flutterwave
-        const s = await this.adapters.flutterwave.createCheckout(input);
-        await this.recordIntent(s.psp, s.checkoutId, input);
-        return s;
-      }
-      throw e;
-    }
+    const s = await withRetry(() => this.adapters[preferred].createCheckout(input));
+    await this.recordIntent(s.psp, s.checkoutId, input);
+    return s;
   }
 
   /** Server-side verify of a charge (webhook is never trusted alone). */
   async verify(psp: PSP, chargeId: string): Promise<VerifiedPayment> {
-    return this.adapters[psp].verifyByChargeId(chargeId);
+    const adapter = this.adapters[psp] ?? this.adapters.bachs; // legacy rows may carry a retired PSP name
+    return withRetry(() => adapter.verifyByChargeId(chargeId));
   }
 
   /** PSP refund for a verified charge (policy decision happens in refundService first). */
@@ -62,7 +65,8 @@ export class PaymentService {
     );
     const row = rows[0];
     if (!row?.charge_id) throw new Error('CHARGE_NOT_SETTLED');
-    return this.adapters[row.psp].refund({
+    if (row.psp !== 'bachs') throw new Error('REFUND_RETIRED_PSP'); // pre-Oct-2026 Flutterwave charges: refund in its dashboard
+    return this.adapters.bachs.refund({
       chargeId: row.charge_id, reference: `rf_${reference}`,
       ...(amountKobo !== undefined ? { amountKobo } : {}),
       reason, idempotencyKey: `rf_${reference}`,

@@ -39,13 +39,18 @@ async function testUser(): Promise<string> {
   return String(rows[0].id);
 }
 
+// Returns the provider id plus the vendor's user id: accepting an offer is a
+// vendor-session action (the offer must belong to the signed-in provider).
 async function onlinePro(lat: number, lng: number): Promise<string> {
-  const p = await providerService.onboard(await testUser());
+  const uid = await testUser();
+  const p = await providerService.onboard(uid);
   await providerService.addSkill(p.id, 'hvac');
   await providerService.verifyKyc(p.id);
   await providerService.setOnline(p.id, true, lat, lng);
+  proUsers.set(p.id, uid);
   return p.id;
 }
+const proUsers = new Map<string, string>();
 
 describe('on-demand request lifecycle', () => {
   it('create with coords auto-offers; accept creates and links a booking', async () => {
@@ -79,6 +84,7 @@ describe('on-demand request lifecycle', () => {
     const accepted = await app.inject({
       method: 'POST',
       url: `/v1/provider/requests/${offer!.id}/respond`,
+      headers: auth(proUsers.get(providerId)!),
       payload: { accept: true },
     });
     assert.equal(accepted.statusCode, 200);

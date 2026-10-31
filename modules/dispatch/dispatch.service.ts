@@ -21,6 +21,9 @@ export const dispatchService = {
   weights: WEIGHTS,
   async findCandidates(job: { serviceId: string; lat: number; lng: number; radiusKm?: number }): Promise<Candidate[]> {
     const svc = await catalogService.get(job.serviceId);
+    const catRow = await q<{ category_id: string }>(`SELECT category_id FROM catalog.service WHERE id=$1`, [job.serviceId]);
+    const categoryId = catRow[0]?.category_id ? String(catRow[0].category_id) : null;
+    const { vendorEligibilityService } = await import('../vendors/eligibility.service.js');
     const radius = job.radiusKm ?? 15;
     const userZone = await geoService.checkZone(job.lat, job.lng);
     const out: Candidate[] = [];
@@ -38,6 +41,8 @@ export const dispatchService = {
         const prov = await q<{ kyc_status: string }>(`SELECT kyc_status FROM provider.provider WHERE id=$1`, [p.id]);
         if (prov[0]?.kyc_status !== 'VERIFIED') continue; // skilled work needs KYC
       }
+      // Category rules (KYC tier, face match, licence, capacity) decide who may be offered the job.
+      if (!(await vendorEligibilityService.allowed(p.id, categoryId))) continue;
       const qual = await q<Record<string, unknown>>(`SELECT * FROM provider.quality WHERE provider_id=$1`, [p.id]);
       const rating = Number(qual[0]?.rating ?? 4.5) || 4.5;
       const loadRows = await q<{ c: number }>(`SELECT count(*) c FROM dispatch.assignment WHERE provider_id=$1 AND status='accepted'`, [p.id]);
@@ -49,8 +54,9 @@ export const dispatchService = {
   },
   async assign(jobId: string, providerId: string, expiresInSeconds?: number) {
     const sla = expiresInSeconds ?? OFFER_SLA_SECONDS;
-    const expiresAt = new Date(Date.now() + sla * 1000);
-    const offer = await providerService.offer(jobId, providerId, expiresAt);
+    // offer() takes the SLA in seconds (it was being handed a Date, which made
+    // every offer INSERT fail with an interval parse error).
+    const offer = await providerService.offer(jobId, providerId, sla);
     try { observability.track('dispatch.assigned', { jobId, providerId }); } catch { /* fail open */ }
     return offer;
   },

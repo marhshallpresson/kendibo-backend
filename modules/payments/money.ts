@@ -1,7 +1,7 @@
 // Money: internal authority is integer kobo (bigint). No floats.
 // NGN 25,000 == 2_500_000n kobo. Adapters convert at the boundary:
 // - Bachs.io wants decimal strings ("7000.00") + ISO currency — never minor units.
-// - Flutterwave wants major-unit numbers (2000 == NGN 2000).
+
 export type Kobo = bigint;
 export const CURRENCY = 'NGN' as const;
 
@@ -26,12 +26,6 @@ export function bachsDecimalToKobo(decimal: string): Kobo {
   return nairaToKobo(decimal);
 }
 
-/** kobo -> Flutterwave major units e.g. 200000n -> 2000 */
-export function koboToFlutterwaveMajor(kobo: Kobo): number {
-  if (kobo <= 0n) throw new Error('AMOUNT_MUST_BE_POSITIVE');
-  if (kobo % 100n !== 0n) throw new Error('FLW_REQUIRES_WHOLE_NAIRA');
-  return Number(kobo / 100n);
-}
 
 export function formatNaira(kobo: Kobo): string {
   const sign = kobo < 0n ? '-' : '';

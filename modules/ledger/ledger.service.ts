@@ -25,6 +25,12 @@ export const CHART: LedgerAccount[] = [
   { id: 'a12', code: '2200', name: 'Refunds Payable', type: 'liability' },
 ];
 
+// Accounting period for a posting: calendar month in Lagos time (WAT, UTC+1,
+// no DST), e.g. '2026-11'. Postings must never be pinned to a literal month.
+export function currentPeriod(at: Date = new Date()): string {
+  const wat = new Date(at.getTime() + 60 * 60 * 1000);
+  return `${wat.getUTCFullYear()}-${String(wat.getUTCMonth() + 1).padStart(2, '0')}`;
+}
 export async function openPeriod(period: string) {
   await q(`INSERT INTO ledger.period (period, locked) VALUES ($1,FALSE)`, [period]).catch(() => undefined);
 }

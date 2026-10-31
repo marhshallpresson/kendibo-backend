@@ -83,7 +83,11 @@ export function localDb(): IMemoryDb {
   run('022_wallet_psp.sql');
   run('023_settings_kyc_perf.sql');
   run('024_kyc_tiers.sql');
-  console.log('[localdb] pg-mem ready (001-019, 021-024)');
+  run('025_sling_communications_ai.sql');
+  run('026_prembly_kyb_vendor_storefront_dispatch.sql');
+  run('027_vendor_rules_storefront_whatsapp_kyc_cost.sql');
+  run('028_schema_reconcile_ai_agent_matching.sql');
+  console.log('[localdb] pg-mem ready (001-019, 021-028)');
   return mem;
 }
 

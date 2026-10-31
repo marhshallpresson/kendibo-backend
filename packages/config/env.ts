@@ -21,9 +21,6 @@ const schema = z.object({
   BACHS_BASE_URL: z.string().default('https://sandbox-api.bachs.io'),
   BACHS_WEBHOOK_SECRET: z.string().default(''),
   BACHS_ACCOUNT_ID: z.string().default(''),
-  FLW_SECRET_KEY: z.string().default(''),
-  FLW_PUBLIC_KEY: z.string().default(''),
-  FLW_SECRET_HASH: z.string().default(''),
   TERMII_API_KEY: z.string().default(''),
   TERMII_SENDER: z.string().default('KENDIBO'),
   SMTP_HOST: z.string().default(''),
@@ -31,14 +28,30 @@ const schema = z.object({
   WATCHUP_API_KEY: z.string().default(''),
   WATCHUP_ENV: z.string().default('development'),
   WATCHUP_RELEASE: z.string().default('dev'),
-  KYC_PROVIDER: z.string().default('stub'),
+  KYC_PROVIDER: z.string().default('prembly'),
   DOJAH_API_KEY: z.string().default(''),
   // Prembly (IdentityPass) — https://docs.prembly.com. Sandbox keys use the
   // same base URL. PREMBLY_APP_ID is required for document/face endpoints.
   PREMBLY_API_KEY: z.string().default(''),
   PREMBLY_APP_ID: z.string().default(''),
   PREMBLY_BASE_URL: z.string().default('https://api.prembly.com'),
+  PREMBLY_MCP_URL: z.string().default('https://mcp.prembly.com/mcp'),
   PREMBLY_COUNTRY: z.string().default('NG'),
+  // Sling (HelloSling / SlingAfrica) — https://docs.hellosling.com
+  SLING_API_TOKEN: z.string().default(''),
+  SLING_BASE_URL: z.string().default('https://app.sling.com.ng/api/v2'),
+  SLING_V1_BASE_URL: z.string().default('https://app.sling.com.ng/api/v1'),
+  SLING_SMS_SENDER: z.string().default('KENDIBO'),
+  SLING_WHATSAPP_SENDER: z.string().default('KENDIBO'),
+  SLING_RCS_SENDER: z.string().default('KENDIBO'),
+  SLING_TRUECALLER_SENDER: z.string().default('KENDIBO'),
+  SLING_EMAIL_SENDER: z.string().default('hello@kendibo.com'),
+  SLING_WEBHOOK_SECRET: z.string().default(''),
+  SLING_DEFAULT_GROUP_ID: z.string().default(''),
+  SLING_ONBOARDING_FORM_ID: z.string().default(''),
+  // AI-Assisted CTA Campaigns & Customer Retainers (Gemini)
+  GEMINI_API_KEY: z.string().default(''),
+  GEMINI_MODEL: z.string().default('gemini-3.8-flash'),
   ALLOW_OTP_DEBUG: z.string().default('false'),
 });
 export type AppConfig = z.infer<typeof schema>;

@@ -45,7 +45,7 @@ export const identityService = {
     const r = await issueOtp(channel, norm.value);
     try {
       if (channel === 'phone') {
-        await sms.send(norm.value, `Your Kendibo verification code is ${r.code}. It expires in 5 minutes.`);
+        await sms.send(norm.value, `Your Kendibo verification code is ${r.code}. It expires in 5 minutes.`, { type: 'otp' });
       } else {
         const mail = templates.otp(r.code);
         await email.send(norm.value, 'Your Kendibo code', mail.html);

@@ -22,7 +22,7 @@ const fakePsp = {
   createPayout: async () => ({ payoutId: 'pay_test', status: 'pending' }),
   verifyWebhookSignature: () => true,
 };
-(globalThis as Record<string, unknown>).__PSP__ = { bachs: fakePsp, flutterwave: fakePsp };
+(globalThis as Record<string, unknown>).__PSP__ = { bachs: fakePsp };
 
 // Isolate BEFORE importing main.js (which loads dotenv + touches the DB).
 process.env.NODE_ENV = 'test';

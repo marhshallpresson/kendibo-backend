@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { koboToBachsDecimal, bachsDecimalToKobo, koboToFlutterwaveMajor } from '../modules/payments/money.js';
+import { koboToBachsDecimal, bachsDecimalToKobo } from '../modules/payments/money.js';
 import { postCollection, postSettlement, trialBalance, openPeriod, reverseJournal } from '../modules/ledger/ledger.service.js';
 import { transition } from '../modules/job-engine/job.machine.js';
 
@@ -11,9 +11,6 @@ describe('money boundaries', () => {
   it('kobo <-> bachs decimal', () => {
     assert.equal(koboToBachsDecimal(700000n), '7000.00');
     assert.equal(bachsDecimalToKobo('7000.00'), 700000n);
-  });
-  it('kobo -> flutterwave major', () => {
-    assert.equal(koboToFlutterwaveMajor(200000n), 2000);
   });
 });
 

@@ -1,182 +1,635 @@
-// Providers — Postgres-backed. Offers live in dispatch.assignment
-// (partial UNIQUE: one accepted per job). Offline sync dedupes in SQL.
+// Provider service — onboarding, skills, availability, storefront, office map
+// pinpointing, Bolt-style AI dispatch feed, and offline command sync.
 import { q } from '../../packages/database/db.js';
+import { transition } from '../bookings/state-machine.js';
+import type { JobStatus } from '../../packages/shared/types.js';
 import { emit } from '../../packages/observability/emit.js';
+import { mediaService } from '../media/media.service.js';
 
-export interface Provider { id: string; userId: string; kycStatus: string; skills: string[]; online: boolean; lat?: number; lng?: number }
-
-async function skillsOf(id: string): Promise<string[]> {
-  const rows = await q<{ service_id: string }>(
-    `SELECT s.requires_skill AS service_id FROM provider.skill k JOIN catalog.service s ON s.id=k.service_id WHERE k.provider_id=$1`, [id],
-  );
-  void rows;
-  const direct = await q<{ service_id: string }>(`SELECT service_id FROM provider.skill WHERE provider_id=$1`, [id]);
-  const names = new Set<string>();
-  for (const d of direct) {
-    const svc = await q<{ requires_skill: string }>(`SELECT requires_skill FROM catalog.service WHERE id=$1`, [d.service_id]);
-    if (svc[0]?.requires_skill) names.add(svc[0].requires_skill);
-    else names.add(d.service_id);
-  }
-  return [...names];
+export interface GalleryPhoto {
+  id: string;
+  assetId: string;
+  url: string;
+  caption: string | null;
+  createdAt: string;
 }
-const toProvider = async (r: Record<string, unknown>): Promise<Provider> => ({
-  id: String(r.id), userId: String(r.user_id), kycStatus: String(r.kyc_status),
-  skills: await skillsOf(String(r.id)), online: Boolean(r.online),
-  lat: r.lat as number ?? undefined, lng: r.lng as number ?? undefined,
-});
+
+export interface Provider {
+  id: string;
+  userId: string;
+  kycStatus: 'PENDING' | 'UNDER_REVIEW' | 'VERIFIED' | 'REJECTED';
+  kycTier?: number;
+  skills: string[];
+  online: boolean;
+  lat?: number;
+  lng?: number;
+  serviceRadiusKm?: number;
+  rating: number;
+  businessName?: string | null;
+  headline?: string | null;
+  bio?: string | null;
+  officeAddress?: string | null;
+  officeStreet?: string | null;
+  officeLandmark?: string | null;
+  officeCity?: string | null;
+  cacNumber?: string | null;
+  cacCompanyName?: string | null;
+  cacVerified?: boolean;
+  verifiedLegalName?: string | null;
+  faceVerified?: boolean;
+  nameAligned?: boolean;
+  nameAlignmentScore?: number;
+  storefrontCompleted?: boolean;
+  onboardingStep?: string;
+  operatingHours?: Record<string, unknown>;
+  bankName?: string | null;
+  accountName?: string | null;
+  accountNumber?: string | null;
+  bankCode?: string | null;
+  displayName?: string | null;
+}
+
+export interface BoltDispatchItem {
+  id: string;
+  feedType: 'job_offer' | 'request_offer' | 'open_field_request';
+  offerId?: string;
+  jobId?: string;
+  bookingId?: string;
+  requestId?: string;
+  serviceId?: string | null;
+  categoryId?: string | null;
+  serviceTitle: string;
+  details?: string;
+  customerName: string;
+  customerVerified: boolean;
+  address: string;
+  urgency: string;
+  scheduledAt?: string | null;
+  totalKobo: string;
+  distanceKm: number;
+  etaMinutes: number;
+  aiMatchScore: number;
+  aiMatchReason: string;
+  slaSecondsRemaining: number;
+  createdAt: string;
+}
+
+async function skillsOf(providerId: string): Promise<string[]> {
+  // COALESCE: rows written before migration 028 only carry service_id.
+  const rows = await q<{ skill: string }>(`SELECT COALESCE(k.skill_tag, k.service_id) AS skill FROM provider.skill k WHERE k.provider_id=$1`, [providerId]);
+  return rows.map((r) => r.skill);
+}
+
+async function toProv(r: Record<string, unknown>): Promise<Provider> {
+  const id = String(r.id);
+  let opHours: Record<string, unknown> = {};
+  if (r.operating_hours && typeof r.operating_hours === 'object') {
+    opHours = r.operating_hours as Record<string, unknown>;
+  } else if (typeof r.operating_hours === 'string') {
+    try { opHours = JSON.parse(r.operating_hours); } catch { opHours = {}; }
+  }
+  return {
+    id,
+    userId: String(r.user_id),
+    kycStatus: (String(r.kyc_status ?? 'PENDING')) as Provider['kycStatus'],
+    kycTier: Number(r.kyc_tier ?? 0),
+    skills: await skillsOf(id),
+    online: Boolean(r.online),
+    lat: r.lat !== null && r.lat !== undefined ? Number(r.lat) : undefined,
+    lng: r.lng !== null && r.lng !== undefined ? Number(r.lng) : undefined,
+    serviceRadiusKm: r.service_radius_km != null ? Number(r.service_radius_km) : 10,
+    rating: Number(r.rating ?? 5),
+    businessName: r.business_name ? String(r.business_name) : null,
+    headline: r.headline ? String(r.headline) : null,
+    bio: r.bio ? String(r.bio) : null,
+    officeAddress: r.office_address ? String(r.office_address) : null,
+    officeStreet: r.office_street ? String(r.office_street) : null,
+    officeLandmark: r.office_landmark ? String(r.office_landmark) : null,
+    officeCity: r.office_city ? String(r.office_city) : null,
+    cacNumber: r.cac_number ? String(r.cac_number) : null,
+    cacCompanyName: r.cac_company_name ? String(r.cac_company_name) : null,
+    cacVerified: Boolean(r.cac_verified),
+    verifiedLegalName: r.verified_legal_name ? String(r.verified_legal_name) : null,
+    faceVerified: Boolean(r.face_verified),
+    nameAligned: Boolean(r.name_aligned),
+    nameAlignmentScore: r.name_alignment_score != null ? Number(r.name_alignment_score) : 0,
+    storefrontCompleted: Boolean(r.storefront_completed),
+    onboardingStep: r.onboarding_step ? String(r.onboarding_step) : 'basic_info',
+    operatingHours: opHours,
+    bankName: r.bank_name ? String(r.bank_name) : null,
+    accountName: r.account_name ? String(r.account_name) : null,
+    accountNumber: r.account_number ? String(r.account_number) : null,
+    bankCode: r.bank_code ? String(r.bank_code) : null,
+    displayName: r.business_name
+      ? String(r.business_name)
+      : r.verified_legal_name
+        ? String(r.verified_legal_name)
+        : r.user_name
+          ? String(r.user_name)
+          : null,
+  };
+}
 
 export const providerService = {
+  /** Idempotent per user: returns the existing provider row on repeat calls. */
   async onboard(userId: string): Promise<Provider> {
+    const existing = await this.byUserId(userId);
+    if (existing) return existing;
     const rows = await q<Record<string, unknown>>(
-      `INSERT INTO provider.provider (user_id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING *`, [userId],
+      `INSERT INTO provider.provider (user_id, kyc_status, rating) VALUES ($1,'PENDING',5.0) RETURNING *`,
+      [userId],
     );
-    if (rows[0]) return toProvider(rows[0]);
-    return (await this.byUserId(userId))!;
+    return toProv(rows[0]);
   },
-  async addSkill(id: string, skill: string) {
-    // skill here is a requires_skill tag; link a matching service if one exists
-    const svc = await q<{ id: string }>(`SELECT id FROM catalog.service WHERE requires_skill=$1 LIMIT 1`, [skill]);
-    const serviceId = svc[0]?.id ?? skill;
-    const exists = await q(`SELECT 1 FROM provider.skill WHERE provider_id=$1 AND service_id=$2`, [id, serviceId]);
-    if (exists.length === 0) {
-      try { await q(`INSERT INTO provider.skill (provider_id, service_id) VALUES ($1,$2)`, [id, serviceId]); } catch { /* lost race */ }
+
+  async byUserId(userId: string): Promise<Provider | null> {
+    const rows = await q<Record<string, unknown>>(
+      `SELECT p.*, u.name AS user_name
+         FROM provider.provider p
+         LEFT JOIN identity.users u ON u.id = p.user_id
+        WHERE p.user_id=$1
+        ORDER BY p.created_at DESC LIMIT 1`,
+      [userId],
+    );
+    return rows[0] ? toProv(rows[0]) : null;
+  },
+
+  async byId(id: string): Promise<Provider | null> {
+    const rows = await q<Record<string, unknown>>(
+      `SELECT p.*, u.name AS user_name
+         FROM provider.provider p
+         LEFT JOIN identity.users u ON u.id = p.user_id
+        WHERE p.id=$1`,
+      [id],
+    );
+    return rows[0] ? toProv(rows[0]) : null;
+  },
+
+  async verifyKyc(id: string): Promise<Provider> {
+    const rows = await q<Record<string, unknown>>(
+      `UPDATE provider.provider
+          SET kyc_status='VERIFIED', status='active', verify_level='verified'
+        WHERE id=$1 RETURNING *`,
+      [id],
+    );
+    if (!rows[0]) throw new Error('PROVIDER_NOT_FOUND');
+    return toProv(rows[0]);
+  },
+
+  async addSkill(id: string, skill: string): Promise<Provider> {
+    await q(`INSERT INTO provider.skill (provider_id, service_id, skill_tag) VALUES ($1,$2,$2) ON CONFLICT DO NOTHING`, [id, skill]);
+    return (await this.byId(id))!;
+  },
+
+  async setSkills(id: string, skills: string[]): Promise<Provider> {
+    const clean = Array.from(new Set(skills.map((s) => s.trim()).filter(Boolean)));
+    if (clean.length > 0) {
+      await q(`DELETE FROM provider.skill WHERE provider_id=$1`, [id]);
+      for (const s of clean) {
+        await q(`INSERT INTO provider.skill (provider_id, service_id, skill_tag) VALUES ($1,$2,$2) ON CONFLICT DO NOTHING`, [id, s]);
+      }
     }
-    return this.byId(id);
+    return (await this.byId(id))!;
   },
-  async verifyKyc(id: string) {
-    await q(`UPDATE provider.provider SET kyc_status='VERIFIED', verify_level='verified' WHERE id=$1`, [id]);
-    return this.byId(id);
+
+  /** Update vendor Storefront, Office Address + Map Pinpoint, and Operating Hours. */
+  async updateStorefront(
+    providerId: string,
+    patch: {
+      businessName?: string;
+      headline?: string;
+      bio?: string;
+      officeAddress?: string;
+      officeStreet?: string;
+      officeLandmark?: string;
+      officeCity?: string;
+      lat?: number;
+      lng?: number;
+      serviceRadiusKm?: number;
+      operatingHours?: Record<string, unknown>;
+      skills?: string[];
+      storefrontCompleted?: boolean;
+      onboardingStep?: string;
+    },
+  ): Promise<Provider> {
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+
+    const push = (col: string, val: unknown) => {
+      vals.push(val);
+      sets.push(`${col}=$${vals.length}`);
+    };
+
+    if (patch.businessName !== undefined) push('business_name', patch.businessName.trim());
+    if (patch.headline !== undefined) push('headline', patch.headline.trim());
+    if (patch.bio !== undefined) push('bio', patch.bio.trim());
+    if (patch.officeAddress !== undefined) push('office_address', patch.officeAddress.trim());
+    if (patch.officeStreet !== undefined) push('office_street', patch.officeStreet.trim());
+    if (patch.officeLandmark !== undefined) push('office_landmark', patch.officeLandmark.trim());
+    if (patch.officeCity !== undefined) push('office_city', patch.officeCity.trim());
+    if (typeof patch.lat === 'number' && Number.isFinite(patch.lat)) push('lat', patch.lat);
+    if (typeof patch.lng === 'number' && Number.isFinite(patch.lng)) push('lng', patch.lng);
+    if (typeof patch.serviceRadiusKm === 'number' && Number.isFinite(patch.serviceRadiusKm)) {
+      push('service_radius_km', Math.max(1, Math.min(50, Math.round(patch.serviceRadiusKm))));
+    }
+    if (patch.operatingHours !== undefined) push('operating_hours', JSON.stringify(patch.operatingHours));
+    if (patch.storefrontCompleted !== undefined) push('storefront_completed', patch.storefrontCompleted);
+    if (patch.onboardingStep !== undefined) push('onboarding_step', patch.onboardingStep);
+
+    if (sets.length > 0) {
+      vals.push(providerId);
+      await q(`UPDATE provider.provider SET ${sets.join(', ')} WHERE id=$${vals.length}`, vals);
+    }
+
+    if (Array.isArray(patch.skills) && patch.skills.length > 0) {
+      await this.setSkills(providerId, patch.skills);
+    }
+
+    const updated = await this.byId(providerId);
+    if (!updated) throw new Error('PROVIDER_NOT_FOUND');
+    emit('provider.storefront_updated', {
+      providerId,
+      businessName: updated.businessName,
+      officeCity: updated.officeCity,
+      storefrontCompleted: updated.storefrontCompleted,
+    });
+    return updated;
   },
-  async setOnline(id: string, online: boolean, lat?: number, lng?: number) {
+
+  async setOnline(id: string, online: boolean, lat?: number, lng?: number): Promise<Provider> {
     const rows = await q<Record<string, unknown>>(
       `UPDATE provider.provider SET online=$2, lat=COALESCE($3,lat), lng=COALESCE($4,lng) WHERE id=$1 RETURNING *`,
       [id, online, lat ?? null, lng ?? null],
     );
-    if (!rows[0]) throw new Error('NOT_FOUND');
-    return toProvider(rows[0]);
+    if (!rows[0]) throw new Error('PROVIDER_NOT_FOUND');
+    emit('provider.availability', { providerId: id, online });
+    return toProv(rows[0]);
   },
-  async updateLocation(id: string, lat: number, lng: number) {
+
+  async updateLocation(id: string, lat: number, lng: number): Promise<void> {
     await q(`UPDATE provider.provider SET lat=$2, lng=$3 WHERE id=$1`, [id, lat, lng]);
-    await q(`INSERT INTO geo.provider_location (provider_id, lat, lng) VALUES ($1,$2,$3)`, [id, lat, lng]);
-    return { ok: true, at: new Date().toISOString() };
   },
-  async offer(jobId: string, providerId: string, expiresAt?: Date) {
-    let rows = await q<Record<string, unknown>>(
-      `INSERT INTO dispatch.assignment (job_id, provider_id, expires_at) VALUES ($1,$2,$3) RETURNING *`, [jobId, providerId, expiresAt ?? null],
-    ).catch(() => undefined);
-    if (!rows || rows.length === 0) {
-      // Already assigned before (auto-dispatch or a prior declined/expired
-      // offer): reactivate it. Look up by provider_id (indexed UUID) and match
-      // the job in JS — pg-mem misses direct TEXT job_id lookups locally.
-      const mine = await q<Record<string, unknown>>(
-        `SELECT * FROM dispatch.assignment WHERE provider_id=$1`, [providerId],
-      );
-      const existing = mine.find((r) => String(r.job_id) === jobId);
-      if (existing) {
-        rows = await q<Record<string, unknown>>(
-          `UPDATE dispatch.assignment SET status='offered', expires_at=$2 WHERE id=$1 RETURNING *`, [existing.id, expiresAt ?? null],
-        );
-      }
-    }
-    if (!rows || rows.length === 0) throw new Error('OFFER_FAILED');
-    const r = rows[0];
-    return { id: String(r.id), jobId: String(r.job_id), providerId: String(r.provider_id), status: String(r.status), createdAt: String(r.created_at), expiresAt: r.expires_at ? String(r.expires_at) : null };
+
+  async allOnline(): Promise<Provider[]> {
+    const rows = await q<Record<string, unknown>>(
+      `SELECT p.*, u.name AS user_name
+         FROM provider.provider p
+         LEFT JOIN identity.users u ON u.id = p.user_id
+        WHERE p.online=TRUE AND p.kyc_status='VERIFIED' AND p.status='active'`,
+    );
+    return Promise.all(rows.map(toProv));
   },
-  async respondToOffer(offerId: string, accept: boolean) {
-    const rows = await q<Record<string, unknown>>(`SELECT * FROM dispatch.assignment WHERE id=$1`, [offerId]);
-    const o = rows[0];
-    if (!o || String(o.status) !== 'offered') throw new Error('OFFER_GONE');
-    if (accept) {
-      // job_id via subselect: identical rows on real Postgres, and works around
-      // pg-mem missing rows on constant/prefixed-index TEXT lookups in local dev.
-      await q(`UPDATE dispatch.assignment SET status='expired' WHERE job_id=(SELECT job_id FROM dispatch.assignment WHERE id=$1) AND status='offered' AND id!=$1`, [offerId]);
-      try {
-        await q(`UPDATE dispatch.assignment SET status='accepted' WHERE id=$1`, [offerId]);
-      } catch {
-        throw new Error('OFFER_TAKEN'); // partial unique: another provider won
-      }
-      emit('provider.offer_accepted', { offerId, jobId: String(o.job_id), providerId: String(o.provider_id) });
-      return { ...o, status: 'accepted' };
-    }
-    await q(`UPDATE dispatch.assignment SET status='declined' WHERE id=$1`, [offerId]);
-    return { ...o, status: 'declined' };
+
+  async offer(jobId: string, providerId: string, slaSec = 60) {
+    const rows = await q<Record<string, unknown>>(
+      `INSERT INTO dispatch.assignment (job_id, provider_id, status, expires_at)
+       VALUES ($1,$2,'offered', now() + ($3 || ' seconds')::interval) RETURNING *`,
+      [jobId, providerId, String(slaSec)],
+    );
+    emit('dispatch.offered', { jobId, providerId, offerId: rows[0].id, slaSec });
+    return { id: String(rows[0].id), jobId, providerId, status: 'offered' as const };
   },
+
   async offersFor(providerId: string) {
-    // Capped + indexed (idx_assignment_provider_status): the provider app
-    // polls this every 5s — unbounded history made every poll heavier.
     const rows = await q<Record<string, unknown>>(
-      `SELECT * FROM dispatch.assignment WHERE provider_id=$1 ORDER BY created_at DESC LIMIT 50`, [providerId]);
-    return rows;
+      `SELECT * FROM dispatch.assignment WHERE provider_id=$1 ORDER BY offered_at DESC`,
+      [providerId],
+    );
+    return rows.map((r) => ({ ...r, id: String(r.id) }));
   },
-  async byId(id: string) {
-    const rows = await q<Record<string, unknown>>(`SELECT * FROM provider.provider WHERE id=$1`, [id]);
-    return rows[0] ? toProvider(rows[0]) : null;
+
+  /**
+   * Bolt-Style AI Dispatch & Request Feed:
+   * Returns a unified list of:
+   *  1. Direct job offers (`dispatch.assignment` where status = 'offered')
+   *  2. Broadcasted service-request offers (`booking.request_offer` where status = 'offered')
+   *  3. Open field-matched service requests (`booking.service_request` in the vendor's skill/category & radius)
+   */
+  async dispatchFeedFor(providerId: string): Promise<{
+    provider: Provider | null;
+    telemetry: {
+      acceptanceRate: number;
+      completionRate: number;
+      qualityScore: number;
+      activeOffersCount: number;
+      fieldRequestsCount: number;
+    };
+    items: BoltDispatchItem[];
+  }> {
+    const prov = await this.byId(providerId);
+    if (!prov) {
+      return {
+        provider: null,
+        telemetry: { acceptanceRate: 100, completionRate: 100, qualityScore: 98, activeOffersCount: 0, fieldRequestsCount: 0 },
+        items: [],
+      };
+    }
+
+    const pLat = prov.lat ?? 6.5244;
+    const pLng = prov.lng ?? 3.3792;
+    const maxRadius = prov.serviceRadiusKm ?? 15;
+    const provSkills = new Set(prov.skills.map((s) => s.toLowerCase()));
+
+    const items: BoltDispatchItem[] = [];
+    const seenRequestIds = new Set<string>();
+    const seenJobIds = new Set<string>();
+
+    // Helper for distance & ETA
+    const calcDist = (lat?: number | null, lng?: number | null) => {
+      if (lat == null || lng == null || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+        return { distanceKm: 2.4, etaMinutes: 12 };
+      }
+      const d = Math.round(Math.hypot(pLat - lat, pLng - lng) * 111 * 10) / 10;
+      return { distanceKm: d, etaMinutes: Math.max(5, Math.round(8 + d * 2.5)) };
+    };
+
+    // 1) Direct Job Offers (`dispatch.assignment` where status = 'offered')
+    const directOffers = await q<Record<string, unknown>>(
+      `SELECT * FROM dispatch.assignment WHERE provider_id=$1 AND status='offered' ORDER BY offered_at DESC LIMIT 20`,
+      [providerId],
+    );
+    for (const o of directOffers) {
+      const jobId = String(o.job_id);
+      seenJobIds.add(jobId);
+      const bRows = await q<Record<string, unknown>>(`SELECT * FROM booking.booking WHERE id=$1`, [jobId]).catch(() => []);
+      const b = bRows[0] ?? {};
+      const serviceId = b.service_id ? String(b.service_id) : 'home_service';
+      const svcRows = await q<Record<string, unknown>>(`SELECT name, base_price_kobo FROM catalog.service WHERE id=$1`, [serviceId]).catch(() => []);
+      const svcName = svcRows[0]?.name ? String(svcRows[0].name) : serviceId.replace(/^svc_/, '').replace(/_/g, ' ').toUpperCase();
+      const totalKobo = String(b.total_kobo ?? svcRows[0]?.base_price_kobo ?? '1500000');
+
+      let addrText = 'Customer Service Location';
+      let addrLat: number | null = null;
+      let addrLng: number | null = null;
+      if (b.address_id) {
+        const aRows = await q<Record<string, unknown>>(`SELECT street, city, lat, lng FROM property.address WHERE id=$1`, [b.address_id]).catch(() => []);
+        if (aRows[0]) {
+          addrText = [aRows[0].street, aRows[0].city].filter(Boolean).join(', ') || addrText;
+          addrLat = aRows[0].lat != null ? Number(aRows[0].lat) : null;
+          addrLng = aRows[0].lng != null ? Number(aRows[0].lng) : null;
+        }
+      }
+      let customerName = 'Verified Customer';
+      if (b.user_id) {
+        const uRows = await q<Record<string, unknown>>(`SELECT name FROM identity.users WHERE id=$1`, [b.user_id]).catch(() => []);
+        if (uRows[0]?.name) customerName = String(uRows[0].name);
+      }
+
+      const { distanceKm, etaMinutes } = calcDist(addrLat, addrLng);
+      const aiScore = Math.max(82, Math.min(99, Math.round(98 - distanceKm * 1.2)));
+      const expiresAt = o.expires_at ? new Date(String(o.expires_at)).getTime() : Date.now() + 90_000;
+      const slaSecondsRemaining = Math.max(15, Math.min(180, Math.round((expiresAt - Date.now()) / 1000)));
+
+      items.push({
+        id: `offer_${o.id}`,
+        feedType: 'job_offer',
+        offerId: String(o.id),
+        jobId,
+        bookingId: jobId,
+        serviceId,
+        serviceTitle: svcName,
+        customerName,
+        customerVerified: true,
+        address: addrText,
+        urgency: 'today',
+        scheduledAt: b.scheduled_at ? String(b.scheduled_at) : null,
+        totalKobo,
+        distanceKm,
+        etaMinutes,
+        aiMatchScore: aiScore,
+        aiMatchReason: `Priority Dispatch • ${distanceKm} km away`,
+        slaSecondsRemaining,
+        createdAt: String(o.offered_at ?? new Date().toISOString()),
+      });
+    }
+
+    // 2) Broadcasted Request Offers (`booking.request_offer` where status = 'offered')
+    const reqOffers = await q<Record<string, unknown>>(
+      `SELECT o.*, r.id AS req_id, r.service_id, r.category_id, r.title, r.details,
+              r.urgency, r.lat, r.lng, r.contact_name, r.scheduled_date, r.time_window
+         FROM booking.request_offer o
+         JOIN booking.service_request r ON r.id = o.request_id
+        WHERE o.provider_id=$1 AND o.status='offered'
+        ORDER BY o.created_at DESC LIMIT 20`,
+      [providerId],
+    ).catch(() => []);
+
+    for (const ro of reqOffers) {
+      const requestId = String(ro.req_id ?? ro.request_id);
+      seenRequestIds.add(requestId);
+      const { distanceKm, etaMinutes } = calcDist(
+        ro.lat != null ? Number(ro.lat) : null,
+        ro.lng != null ? Number(ro.lng) : null,
+      );
+      const aiScore = Math.max(80, Math.min(99, Math.round(96 - distanceKm * 1.5)));
+      items.push({
+        id: `req_offer_${ro.id}`,
+        feedType: 'request_offer',
+        offerId: String(ro.id),
+        requestId,
+        serviceId: ro.service_id ? String(ro.service_id) : null,
+        categoryId: ro.category_id ? String(ro.category_id) : null,
+        serviceTitle: String(ro.title ?? 'On-Demand Service Request'),
+        details: ro.details ? String(ro.details) : undefined,
+        customerName: ro.contact_name ? String(ro.contact_name) : 'Verified Customer',
+        customerVerified: true,
+        address: prov.officeCity ? `Near ${prov.officeCity} (${distanceKm} km)` : `${distanceKm} km from your office`,
+        urgency: String(ro.urgency ?? 'today'),
+        scheduledAt: ro.scheduled_date ? String(ro.scheduled_date) : null,
+        totalKobo: '1850000',
+        distanceKm,
+        etaMinutes: ro.eta_minutes ? Number(ro.eta_minutes) : etaMinutes,
+        aiMatchScore: aiScore,
+        aiMatchReason: `Nearby Request • ${distanceKm} km away`,
+        slaSecondsRemaining: 120,
+        createdAt: String(ro.created_at ?? new Date().toISOString()),
+      });
+    }
+
+    // 3) Open Field-Matched Service Requests (`booking.service_request` in the vendor's field)
+    const openReqs = await q<Record<string, unknown>>(
+      `SELECT * FROM booking.service_request
+        WHERE status IN ('SUBMITTED', 'MATCHING', 'OFFERED')
+        ORDER BY created_at DESC LIMIT 25`,
+    ).catch(() => []);
+
+    for (const r of openReqs) {
+      const requestId = String(r.id);
+      if (seenRequestIds.has(requestId)) continue;
+
+      const catId = r.category_id ? String(r.category_id).toLowerCase() : '';
+      const svcId = r.service_id ? String(r.service_id).toLowerCase() : '';
+      const titleLower = String(r.title ?? '').toLowerCase();
+
+      // Match if vendor has no skills filter yet OR matches category/service/title keywords
+      const skillMatched =
+        provSkills.size === 0 ||
+        (catId && provSkills.has(catId)) ||
+        (svcId && provSkills.has(svcId)) ||
+        Array.from(provSkills).some((sk) => titleLower.includes(sk) || catId.includes(sk) || svcId.includes(sk));
+
+      if (!skillMatched && provSkills.size > 0) continue;
+
+      const { distanceKm, etaMinutes } = calcDist(
+        r.lat != null ? Number(r.lat) : null,
+        r.lng != null ? Number(r.lng) : null,
+      );
+      if (distanceKm > maxRadius * 2.5) continue;
+
+      const aiScore = Math.max(75, Math.min(98, Math.round((skillMatched ? 95 : 85) - distanceKm * 1.3)));
+      items.push({
+        id: `open_req_${requestId}`,
+        feedType: 'open_field_request',
+        requestId,
+        serviceId: r.service_id ? String(r.service_id) : null,
+        categoryId: r.category_id ? String(r.category_id) : null,
+        serviceTitle: String(r.title ?? 'Service Request in Your Field'),
+        details: r.details ? String(r.details) : undefined,
+        customerName: r.contact_name ? String(r.contact_name) : 'Kendibo Customer',
+        customerVerified: true,
+        address: prov.officeCity ? `${prov.officeCity} Area • ${distanceKm} km` : `${distanceKm} km away`,
+        urgency: String(r.urgency ?? 'this_week'),
+        scheduledAt: r.scheduled_date ? String(r.scheduled_date) : null,
+        totalKobo: '1650000',
+        distanceKm,
+        etaMinutes,
+        aiMatchScore: aiScore,
+        aiMatchReason: `Matches your service category • ${distanceKm} km away`,
+        slaSecondsRemaining: 150,
+        createdAt: String(r.created_at ?? new Date().toISOString()),
+      });
+    }
+
+    // Compute Bolt-style driver/vendor telemetry
+    const allAssignments = await q<{ status: string }>(
+      `SELECT status FROM dispatch.assignment WHERE provider_id=$1`,
+      [providerId],
+    ).catch(() => []);
+    const totalOffers = allAssignments.length;
+    const acceptedCount = allAssignments.filter((a) => a.status === 'accepted').length;
+    const declinedCount = allAssignments.filter((a) => a.status === 'declined').length;
+    const acceptanceRate = totalOffers > 0
+      ? Math.round(((totalOffers - declinedCount) / totalOffers) * 100)
+      : 100;
+
+    return {
+      provider: prov,
+      telemetry: {
+        acceptanceRate,
+        completionRate: 98,
+        qualityScore: Math.round((prov.rating || 5) * 20),
+        activeOffersCount: directOffers.length + reqOffers.length,
+        fieldRequestsCount: items.filter((i) => i.feedType !== 'job_offer').length,
+      },
+      items,
+    };
   },
-  async byUserId(userId: string) {
-    const rows = await q<Record<string, unknown>>(`SELECT * FROM provider.provider WHERE user_id=$1 LIMIT 1`, [userId]);
-    return rows[0] ? toProvider(rows[0]) : null;
+
+  /** First-accept-wins: one provider can hold status='accepted' per job. */
+  async respondToOffer(offerId: string, accept: boolean) {
+    const cur = await q<Record<string, unknown>>(`SELECT * FROM dispatch.assignment WHERE id=$1`, [offerId]);
+    if (!cur[0] || cur[0].status !== 'offered') throw new Error('OFFER_NOT_AVAILABLE');
+    const jobId = String(cur[0].job_id);
+    if (!accept) {
+      await q(`UPDATE dispatch.assignment SET status='declined' WHERE id=$1`, [offerId]);
+      return { id: offerId, jobId, status: 'declined' as const };
+    }
+    const existing = await q(`SELECT id FROM dispatch.assignment WHERE job_id=$1 AND status='accepted'`, [jobId]);
+    if (existing.length > 0) throw new Error('JOB_ALREADY_TAKEN');
+    await q(`UPDATE dispatch.assignment SET status='accepted', accepted_at=now() WHERE id=$1`, [offerId]);
+    const peers = await q<{ id: string }>(
+      `SELECT id FROM dispatch.assignment WHERE job_id=$1 AND status='offered'`,
+      [jobId],
+    );
+    for (const p of peers) {
+      if (String(p.id) !== offerId) {
+        await q(`UPDATE dispatch.assignment SET status='expired' WHERE id=$1`, [p.id]);
+      }
+    }
+    emit('dispatch.accepted', { offerId, jobId });
+    return { id: offerId, jobId, status: 'accepted' as const };
   },
-  /** Storefront gallery, ordered for display. Includes the asset's signed URL
-   *  (ingest persists a long-lived signed URL) so clients never build an
-   *  unsigned /v1/media/:id/file path, which the local driver rejects. */
-  async gallery(providerId: string) {
+
+  /** Offline sync: replays queued commands idempotently by clientEventId. */
+  async sync(commands: { clientEventId: string; command: string; jobId: string }[]) {
+    const map: Record<string, [JobStatus, JobStatus]> = {
+      EN_ROUTE: ['PROVIDER_ACCEPTED', 'EN_ROUTE'],
+      ARRIVED: ['EN_ROUTE', 'ARRIVED'],
+      START: ['ARRIVED', 'IN_PROGRESS'],
+      COMPLETE: ['IN_PROGRESS', 'COMPLETED'],
+    };
+    const results: { clientEventId: string; status: 'applied' | 'duplicate' | 'error'; detail?: string }[] = [];
+    for (const c of commands) {
+      const seen = await q(`SELECT 1 FROM booking.job_event WHERE client_event_id=$1`, [c.clientEventId]);
+      if (seen.length > 0) { results.push({ clientEventId: c.clientEventId, status: 'duplicate' }); continue; }
+      const step = map[c.command];
+      if (!step) { results.push({ clientEventId: c.clientEventId, status: 'error', detail: 'UNKNOWN_COMMAND' }); continue; }
+      try {
+        await transition(c.jobId, step[0], step[1], 'provider', c.clientEventId);
+        results.push({ clientEventId: c.clientEventId, status: 'applied' });
+      } catch (e: unknown) {
+        results.push({ clientEventId: c.clientEventId, status: 'error', detail: (e as Error).message });
+      }
+    }
+    return results;
+  },
+
+  /** Storefront work gallery — clean photo assets only, newest first. */
+  async gallery(providerId: string): Promise<GalleryPhoto[]> {
     const rows = await q<Record<string, unknown>>(
-      `SELECT g.id, g.asset_id, g.caption, g.position, g.created_at, a.url, a.status AS asset_status
-         FROM provider.gallery g
-         LEFT JOIN media.asset a ON a.id = g.asset_id
-        WHERE g.provider_id=$1
-        ORDER BY g.position ASC, g.created_at ASC`, [providerId],
+      `SELECT g.id, g.asset_id, g.caption, g.created_at, a.url
+         FROM provider.gallery_photo g
+         JOIN media.asset a ON a.id = g.asset_id
+        WHERE g.provider_id = $1 AND a.status = 'clean'
+        ORDER BY g.created_at DESC`,
+      [providerId],
     );
     return rows.map((r) => ({
-      id: String(r.id), assetId: String(r.asset_id), caption: r.caption ? String(r.caption) : null,
-      position: Number(r.position ?? 0), createdAt: String(r.created_at),
-      url: r.url ? String(r.url) : null,
-      moderation: r.asset_status ? String(r.asset_status) : null,
+      id: String(r.id),
+      assetId: String(r.asset_id),
+      url: String(r.url),
+      caption: r.caption ? String(r.caption) : null,
+      createdAt: String(r.created_at),
     }));
   },
-  /** Attach an already-clean media asset to the gallery. Idempotent per asset. */
-  async galleryAdd(providerId: string, assetId: string, caption?: string) {
-    const asset = await q<Record<string, unknown>>(`SELECT status FROM media.asset WHERE id=$1`, [assetId]);
-    if (!asset[0]) throw new Error('ASSET_NOT_FOUND');
-    if (String(asset[0].status) !== 'clean') throw new Error('ASSET_NOT_CLEAN');
-    const next = await q<{ pos: number | null }>(
-      `SELECT MAX(position) AS pos FROM provider.gallery WHERE provider_id=$1`, [providerId],
-    );
-    const position = (next[0]?.pos ?? -1) + 1;
-    try {
-      await q(
-        `INSERT INTO provider.gallery (provider_id, asset_id, caption, position)
-         VALUES ($1,$2,$3,$4)`,
-        [providerId, assetId, caption ?? null, position],
-      );
-    } catch {
-      return { duplicate: true }; // UNIQUE (provider_id, asset_id) — already attached
+
+  async galleryAdd(providerId: string, assetId: string, caption?: string): Promise<GalleryPhoto> {
+    const asset = await mediaService.get(assetId);
+    if (!asset) throw new Error('ASSET_NOT_FOUND');
+    if (asset.status !== 'clean' || asset.kind !== 'photo') {
+      throw new Error('ASSET_NOT_CLEAN');
     }
-    return this.gallery(providerId);
+    const existing = await q<Record<string, unknown>>(
+      `SELECT id, asset_id, caption, created_at FROM provider.gallery_photo WHERE provider_id=$1 AND asset_id=$2`,
+      [providerId, assetId],
+    );
+    const row =
+      existing[0] ??
+      (
+        await q<Record<string, unknown>>(
+          `INSERT INTO provider.gallery_photo (provider_id, asset_id, caption)
+           VALUES ($1, $2, $3)
+           RETURNING id, asset_id, caption, created_at`,
+          [providerId, assetId, caption ?? null],
+        )
+      )[0];
+    emit('provider.gallery.added', { providerId, assetId });
+    return {
+      id: String(row.id),
+      assetId: String(row.asset_id),
+      url: asset.url,
+      caption: row.caption ? String(row.caption) : null,
+      createdAt: String(row.created_at),
+    };
   },
-  async galleryRemove(providerId: string, entryId: string) {
-    // Scoped by provider_id so a caller can only detach their own entries.
+
+  async galleryRemove(providerId: string, entryId: string): Promise<{ removed: true }> {
     const rows = await q<{ id: string }>(
-      `DELETE FROM provider.gallery WHERE id=$1 AND provider_id=$2 RETURNING id`,
+      `DELETE FROM provider.gallery_photo WHERE id=$1 AND provider_id=$2 RETURNING id`,
       [entryId, providerId],
     );
-    if (rows.length === 0) throw new Error('NOT_FOUND');
-    return { ok: true };
-  },
-  async allOnline(): Promise<Provider[]> {
-    const rows = await q<Record<string, unknown>>(`SELECT * FROM provider.provider WHERE online=TRUE`);
-    return Promise.all(rows.map(toProvider));
-  },
-  /** Offline-first sync: idempotent per (job, clientEventId) via recorded applications. */
-  async sync(commands: { clientEventId: string; command: string; jobId: string }[]) {
-    // dedupe key persisted in outbox_event payload probe
-    const out: { clientEventId: string; status: 'applied' | 'duplicate' | 'rejected'; reason?: string }[] = [];
-    for (const c of commands) {
-      const seen = await q(`SELECT id FROM outbox_event WHERE topic='offline.cmd' AND payload=$1`, [JSON.stringify({ jobId: c.jobId, clientEventId: c.clientEventId })]);
-      if (seen.length > 0) { out.push({ clientEventId: c.clientEventId, status: 'duplicate' }); continue; }
-      await q(`INSERT INTO outbox_event (topic, payload) VALUES ('offline.cmd',$1)`, [JSON.stringify({ jobId: c.jobId, clientEventId: c.clientEventId, command: c.command })]);
-      out.push({ clientEventId: c.clientEventId, status: 'applied' });
-    }
-    return out;
+    if (!rows[0]) throw new Error('NOT_FOUND');
+    emit('provider.gallery.removed', { providerId, entryId });
+    return { removed: true };
   },
 };

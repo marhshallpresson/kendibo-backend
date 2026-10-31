@@ -19,11 +19,14 @@ export interface ServiceRequest {
   contactName: string | null; contactPhone: string | null; contactEmail: string | null;
   notes: string | null; smsUpdates: boolean; scheduledDate: string | null; timeWindow: string | null;
   status: RequestStatus; bookingId: string | null; createdAt: string;
+  preferredProviderId: string | null; source: string;
 }
 interface MatchCandidate { providerId: string; score: number; distanceKm: number }
 const toReq = (r: Record<string, unknown>): ServiceRequest => ({
   id: String(r.id), userId: String(r.user_id), serviceId: r.service_id ? String(r.service_id) : null,
   categoryId: r.category_id ? String(r.category_id) : null,
+  preferredProviderId: r.preferred_provider_id ? String(r.preferred_provider_id) : null,
+  source: String(r.source ?? 'app'),
   title: String(r.title), details: String(r.details ?? ''), urgency: String(r.urgency),
   addressId: r.address_id ? String(r.address_id) : null,
   lat: r.lat as number ?? null, lng: r.lng as number ?? null,
@@ -69,6 +72,8 @@ export const requestService = {
     addressId?: string; lat?: number; lng?: number;
     contactName?: string; contactPhone?: string; contactEmail?: string; notes?: string;
     smsUpdates?: boolean; scheduledDate?: string; timeWindow?: string; idempotencyKey: string;
+    /** Vendor whose storefront link the customer came through — offered first when eligible. */
+    preferredProviderId?: string; source?: 'app' | 'storefront' | 'whatsapp';
   }): Promise<ServiceRequest> {
     const prior = await q<Record<string, unknown>>(
       `SELECT * FROM booking.service_request WHERE user_id=$1 AND idempotency_key=$2`, [userId, input.idempotencyKey],
@@ -79,7 +84,7 @@ export const requestService = {
     let lat = input.lat ?? null;
     let lng = input.lng ?? null;
     if ((lat == null || lng == null) && input.addressId) {
-      const addr = await q<Record<string, unknown>>(`SELECT lat, lng FROM property.address WHERE id=$1`, [input.addressId]);
+      const addr = await q<Record<string, unknown>>(`SELECT lat, lng FROM property.address WHERE id=$1 AND user_id=$2`, [input.addressId, userId]);
       if (addr[0]) {
         if (addr[0].lat != null) lat = Number(addr[0].lat);
         if (addr[0].lng != null) lng = Number(addr[0].lng);
@@ -87,13 +92,13 @@ export const requestService = {
     }
     const rows = await q<Record<string, unknown>>(
       `INSERT INTO booking.service_request
-        (user_id, service_id, category_id, title, details, urgency, address_id, lat, lng, contact_name, contact_phone, contact_email, notes, sms_updates, scheduled_date, time_window, idempotency_key)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+        (user_id, service_id, category_id, title, details, urgency, address_id, lat, lng, contact_name, contact_phone, contact_email, notes, sms_updates, scheduled_date, time_window, idempotency_key, preferred_provider_id, source)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
       [userId, input.serviceId ?? null, input.categoryId ?? null, input.title, input.details ?? '', input.urgency ?? 'this_week',
        input.addressId ?? null, lat, lng,
        input.contactName ?? null, input.contactPhone ?? null, input.contactEmail ?? null,
        input.notes ?? null, input.smsUpdates ?? true, input.scheduledDate ?? null, input.timeWindow ?? null,
-       input.idempotencyKey],
+       input.idempotencyKey, input.preferredProviderId ?? null, input.source ?? 'app'],
     );
     const req = toReq(rows[0]);
     await q(`INSERT INTO outbox_event (topic, payload) VALUES ('request.submitted',$1)`, [JSON.stringify({ requestId: req.id })]);
@@ -131,23 +136,42 @@ export const requestService = {
 
   /** Analyze + rank: catalog skill filter when a service is attached, else zone/online/KYC + distance. */
   async candidatesFor(r: ServiceRequest): Promise<{ requestId: string; candidates: MatchCandidate[]; note: string }> {
+    const ranked = await this.rankCandidates(r);
+    if (!r.preferredProviderId) return ranked;
+    // Came through a vendor's storefront link: that vendor gets first refusal,
+    // but only if the category rules clear them — a link never bypasses vetting.
+    const { vendorEligibilityService } = await import('../vendors/eligibility.service.js');
+    if (!(await vendorEligibilityService.allowed(r.preferredProviderId, r.categoryId))) return ranked;
+    const rest = ranked.candidates.filter((c) => c.providerId !== r.preferredProviderId);
+    const own = ranked.candidates.find((c) => c.providerId === r.preferredProviderId) ?? { providerId: r.preferredProviderId, score: 100, distanceKm: 0 };
+    return { ...ranked, candidates: [own, ...rest].slice(0, 10), note: `${ranked.note}+PREFERRED` };
+  },
+
+  async rankCandidates(r: ServiceRequest): Promise<{ requestId: string; candidates: MatchCandidate[]; note: string }> {
     if (r.lat == null || r.lng == null) return { requestId: r.id, candidates: [], note: 'NO_LOCATION' };
     if (r.serviceId) {
       const cands = await dispatchService.findCandidates({ serviceId: r.serviceId, lat: r.lat, lng: r.lng });
       return { requestId: r.id, candidates: cands.slice(0, 10), note: 'SKILL_MATCHED' };
     }
     const { providerService } = await import('../providers/provider.service.js');
+    const { vendorEligibilityService } = await import('../vendors/eligibility.service.js');
     const online = await providerService.allOnline();
-    const scored = online
+    const nearby = online
       .filter((p) => p.lat !== undefined && p.lng !== undefined)
       .map((p) => {
         const d = Math.hypot(r.lat! - p.lat!, r.lng! - p.lng!) * 111;
         return { providerId: p.id, score: Math.max(0, Math.round((100 - d * 4) * 10) / 10), distanceKm: Math.round(d * 100) / 100 };
       })
       .filter((c) => c.distanceKm <= 15)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 10);
-    return { requestId: r.id, candidates: scored, note: 'PROXIMITY_MATCHED' };
+      .sort((a, b) => b.score - a.score);
+    // A plumbing request must never reach a painter: only vendors cleared for
+    // the request's trade (category rules) are offered it.
+    const scored: MatchCandidate[] = [];
+    for (const c of nearby) {
+      if (scored.length >= 10) break;
+      if (await vendorEligibilityService.allowed(c.providerId, r.categoryId)) scored.push(c);
+    }
+    return { requestId: r.id, candidates: scored, note: r.categoryId ? 'CATEGORY_MATCHED' : 'PROXIMITY_MATCHED' };
   },
 
   async matches(id: string) {
@@ -235,6 +259,7 @@ export const requestService = {
       const msg = (e as Error).message;
       if (!['QUOTE_REQUIRED', 'SERVICE_NOT_FOUND', 'AMOUNT_MUST_BE_POSITIVE'].includes(msg)) throw e;
       emit('request.accept_booking_skipped', { requestId, serviceId, reason: msg });
+      void notifyWhatsappCustomer(requestId, null);
       return { id: offerId, status: 'accepted', requestId };
     }
     await assignAccepted(booking.id, providerId);
@@ -242,6 +267,7 @@ export const requestService = {
     await q(`INSERT INTO outbox_event (topic, payload) VALUES ('request.booked',$1)`,
       [JSON.stringify({ requestId, bookingId: booking.id, providerId })]);
     emit('request.booked', { requestId, bookingId: booking.id, providerId });
+    void notifyWhatsappCustomer(requestId, booking.id);
     return { id: offerId, status: 'accepted', requestId, bookingId: booking.id };
   },
 
@@ -279,3 +305,12 @@ export const requestService = {
     return toReq(upd[0]);
   },
 };
+
+/** Tell a WhatsApp-sourced customer their vendor accepted (with the Bachs pay
+ *  link when the job has a fixed price). Never throws into the accept path. */
+async function notifyWhatsappCustomer(requestId: string, bookingId: string | null): Promise<void> {
+  try {
+    const { notifyRequestAccepted } = await import('../whatsapp/whatsapp.bot.js');
+    await notifyRequestAccepted(requestId, bookingId);
+  } catch { /* notification is best-effort */ }
+}

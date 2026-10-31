@@ -18,7 +18,8 @@ async function bachsFetch(path: string, init: RequestInit & { idempotencyKey?: s
     ...((init.headers as Record<string, string>) ?? {}),
   };
   if (init.idempotencyKey) headers['Idempotency-Key'] = init.idempotencyKey;
-  const res = await fetch(`${BASE}${path}`, { ...init, headers });
+  // Bounded: a hung PSP must not pin the request (and its DB txn) open.
+  const res = await fetch(`${BASE}${path}`, { ...init, headers, signal: init.signal ?? AbortSignal.timeout(15_000) });
   const json = (await res.json().catch(() => ({}))) as any;
   if (!res.ok) {
     const err = new Error(`BACHS_${res.status}`) as Error & { data?: unknown };

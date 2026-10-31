@@ -1,8 +1,8 @@
 // PaymentPort — every PSP behind this interface. No business module imports an SDK.
-// Primary: BachsAdapter. Fallback: FlutterwaveAdapter. Paystack is NOT supported.
+// Single PSP: BachsAdapter (Flutterwave removed Oct 2026). Paystack is NOT supported.
 import type { Kobo } from './money.js';
 
-export type PSP = 'bachs' | 'flutterwave';
+export type PSP = 'bachs';
 
 export interface CreateCheckoutInput {
   bookingId: string;
@@ -18,7 +18,7 @@ export interface CreateCheckoutInput {
 export interface CheckoutSession {
   psp: PSP;
   checkoutId: string;
-  checkoutUrl: string | null; // Bachs hosted URL; Flutterwave Standard link
+  checkoutUrl: string | null; // Bachs hosted checkout URL
   reference: string;
   status: 'open' | 'pending';
 }
