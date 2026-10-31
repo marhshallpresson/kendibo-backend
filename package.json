@@ -11,7 +11,7 @@
     "start:api": "node dist/apps/api/src/main.js",
     "dev:api": "tsx watch apps/api/src/main.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test --test-force-exit \"tests/*.test.ts\"",
+    "test": "tsx --import ./tests/setup-env.ts --test --test-force-exit \"tests/*.test.ts\"",
     "test:adversarial": "node tests/adversarial.js",
     "migrate": "node scripts/migrate.js",
     "db:migrate": "tsx scripts/migrate.ts",

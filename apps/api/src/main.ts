@@ -49,6 +49,7 @@ import { vendorEligibilityService } from '../../../modules/vendors/eligibility.s
 import { vendorFinanceService } from '../../../modules/vendors/vendor-finance.service.js';
 import { configureWhatsappBot } from '../../../modules/whatsapp/whatsapp.bot.js';
 import { registerVendorRoutes, VENDOR_ROUTE_POLICY } from './vendor.routes.js';
+import { registerAdminOpsRoutes, ADMIN_OPS_POLICY } from './admin-ops.routes.js';
 import { storefrontService } from '../../../modules/storefront/storefront.service.js';
 import { surfaceFor } from '../../../packages/shared/clients.js';
 void surfaceFor;
@@ -237,7 +238,7 @@ const ROUTE_POLICY: Record<string, RoutePolicy> = {
 };
 // Vendor platform routes (storefronts, trade rules, WhatsApp) declare their own
 // public/permission entries next to the handlers; merged into the same gate.
-Object.assign(ROUTE_POLICY, VENDOR_ROUTE_POLICY);
+Object.assign(ROUTE_POLICY, VENDOR_ROUTE_POLICY, ADMIN_OPS_POLICY);
 
 app.addHook('onRequest', async (req, reply) => {
   const url = req.routeOptions.url;
@@ -2788,6 +2789,7 @@ app.get('/v1/media/:id/file', async (req, reply) => {
 const port = Number(process.env.PORT ?? 3000);
 // ---------- vendor platform: storefronts, trade rules, credentials, WhatsApp ----------
 registerVendorRoutes(app, { authed: authed as never, fail: fail as never, providerActor });
+registerAdminOpsRoutes(app, { authed: authed as never, fail: fail as never });
 configureWhatsappBot({ createCheckout: (input) => payments.createCheckout(input) });
 
 if (process.env.VITEST !== 'true' && process.env.NODE_ENV !== 'test') {
