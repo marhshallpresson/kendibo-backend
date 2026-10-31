@@ -38,8 +38,10 @@ export const INTEGRATIONS: Integration[] = [
   {
     id: 'prembly', name: 'Prembly IdentityPass (KYC/KYB)', purpose: 'NIN, BVN, face match, CAC, bank account', docs: 'https://docs.prembly.com',
     keys: [
-      { env: 'PREMBLY_API_KEY', exposure: 'secret', requiredInProd: true, note: 'x-api-key header' },
-      { env: 'PREMBLY_APP_ID', exposure: 'secret', requiredInProd: true, note: 'app-id header' },
+      { env: 'PREMBLY_SECRET_KEY', exposure: 'secret', requiredInProd: true, note: 'Secret (private) key, sent as x-api-key. Legacy name PREMBLY_API_KEY still read' },
+      { env: 'PREMBLY_APP_ID', exposure: 'secret', requiredInProd: true, note: 'Sent as app-id' },
+      { env: 'PREMBLY_PUBLIC_KEY', exposure: 'public', requiredInProd: false, note: 'Client widget/SDK only; never used for server calls' },
+      { env: 'PREMBLY_ENVIRONMENT', exposure: 'config', requiredInProd: true, note: 'sandbox | live. Must match the keys (toggle in Prembly: Integrations → API Library)' },
       { env: 'KYC_COST_NIN_KOBO', exposure: 'config', requiredInProd: false, note: 'Your contract price per NIN lookup, in kobo' },
       { env: 'KYC_COST_BVN_KOBO', exposure: 'config', requiredInProd: false, note: 'Per BVN lookup' },
       { env: 'KYC_COST_NIN_FACE_KOBO', exposure: 'config', requiredInProd: false, note: 'Per NIN + face match' },
@@ -77,14 +79,13 @@ export const INTEGRATIONS: Integration[] = [
   {
     id: 'sling', name: 'Sling (SMS / WhatsApp templates / RCS / email)', purpose: 'OTP and notifications', docs: 'https://docs.hellosling.com',
     keys: [
-      { env: 'SLING_API_TOKEN', exposure: 'secret', requiredInProd: true, note: 'Bearer token' },
+      { env: 'SLING_API_TOKEN', exposure: 'secret', requiredInProd: true, note: 'Bearer token. Sling is the only SMS provider; OTP SMS refuses in prod without it' },
       { env: 'SLING_WEBHOOK_SECRET', exposure: 'secret', requiredInProd: true, note: 'Delivery receipts are rejected without it in prod' },
     ],
   },
   {
-    id: 'fallback_comms', name: 'Termii / Resend / FCM', purpose: 'SMS, email and push fallbacks', docs: '',
+    id: 'fallback_comms', name: 'Resend / FCM', purpose: 'Email fallback and push', docs: '',
     keys: [
-      { env: 'TERMII_API_KEY', exposure: 'secret', requiredInProd: false, note: 'SMS fallback' },
       { env: 'RESEND_API_KEY', exposure: 'secret', requiredInProd: false, note: 'Email fallback' },
       { env: 'FIREBASE_SERVICE_ACCOUNT_JSON', exposure: 'secret', requiredInProd: false, note: 'FCM HTTP v1 (the legacy server key API is retired)' },
     ],

@@ -1,5 +1,5 @@
 // Real notification channel adapters — Sling (HelloSling / SlingAfrica) primary omnichannel
-// engine across SMS, WhatsApp, RCS, Truecaller & Email + FCM HTTP v1 push + Termii/SMTP/Resend fallbacks.
+// engine across SMS, WhatsApp, RCS, Truecaller & Email + FCM HTTP v1 push + SMTP/Resend email fallbacks.
 // Every adapter falls back cleanly to structured log in local dev when keys are unset.
 import nodemailer, { type Transporter } from 'nodemailer';
 import {
@@ -42,57 +42,23 @@ export interface PushPort {
   send(token: string, title: string, body: string, data?: Record<string, string>): Promise<{ id: string }>;
 }
 
-/** Termii fallback SMS adapter */
-export class TermiiSmsAdapter implements SmsPort {
-  private readonly key = process.env.TERMII_API_KEY || '';
-  private readonly sender = process.env.TERMII_SENDER || 'KENDIBO';
-  async send(to: string, body: string, opts?: { type?: SlingMessageType; reference?: string }): Promise<{ id: string; provider?: string; reference?: string }> {
-    if (!this.key) {
-      // Never log message bodies outside dev: they carry OTPs and personal data.
-      if (process.env.NODE_ENV === 'production') throw new Error('SMS_NOT_CONFIGURED');
-      console.log(`[sms:dev] -> ${to}: ${body}`);
-      return { id: `dev_sms_${Date.now()}`, provider: 'termii-dev', reference: opts?.reference };
-    }
-    const channel = opts?.type === 'otp' || opts?.type === 'transactional' ? 'dnd' : 'generic';
-    const r = await fetch('https://api.ng.termii.com/api/sms/send', {
-      method: 'POST', signal: AbortSignal.timeout(10_000),
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ to, from: this.sender, sms: body, type: 'plain', channel, api_key: this.key }),
-    });
-    const j = (await r.json().catch(() => ({}))) as Record<string, unknown>;
-    if (!r.ok) throw new Error(String(j.message ?? `Termii HTTP ${r.status}`));
-    return { id: String(j.message_id ?? ''), provider: 'termii', reference: opts?.reference };
-  }
-}
-
 /**
- * Sling Primary SMS Adapter (`POST https://app.sling.com.ng/api/v2/send` with `channel: 'sms'`)
- * Automatically falls back to Termii if SLING_API_TOKEN is unset and TERMII_API_KEY is present.
+ * Sling SMS adapter (`POST https://app.sling.com.ng/api/v2/send` with `channel: 'sms'`).
+ * Sling is the only SMS provider. Without SLING_API_TOKEN the client simulates
+ * in dev; production refuses, so a missing token never fakes a sent OTP (or logs it).
  */
 export class SlingSmsAdapter implements SmsPort {
-  constructor(
-    private readonly client: SlingClient = slingClient,
-    private readonly fallback: SmsPort = new TermiiSmsAdapter(),
-  ) {}
+  constructor(private readonly client: SlingClient = slingClient) {}
 
   async send(to: string, body: string, opts?: { type?: SlingMessageType; reference?: string }): Promise<{ id: string; provider?: string; reference?: string }> {
-    if (!this.client.isConfigured() && process.env.TERMII_API_KEY) {
-      return this.fallback.send(to, body, opts);
-    }
-    try {
-      const res = await this.client.sendSms({
-        to,
-        message: body,
-        type: opts?.type ?? 'transactional',
-        reference: opts?.reference,
-      });
-      return { id: res.message_id, provider: res.simulated ? 'sling-sim' : 'sling', reference: res.reference };
-    } catch (err) {
-      if (process.env.TERMII_API_KEY) {
-        return this.fallback.send(to, body, opts);
-      }
-      throw err;
-    }
+    if (!this.client.isConfigured() && process.env.NODE_ENV === 'production') throw new Error('SMS_NOT_CONFIGURED');
+    const res = await this.client.sendSms({
+      to,
+      message: body,
+      type: opts?.type ?? 'transactional',
+      reference: opts?.reference,
+    });
+    return { id: res.message_id, provider: res.simulated ? 'sling-sim' : 'sling', reference: res.reference };
   }
 }
 

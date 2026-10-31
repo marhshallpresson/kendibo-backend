@@ -289,7 +289,7 @@ app.get('/health/dependencies', async () => {
   const w = watchupClient as unknown as { enabled: boolean; environment: string; release: string; queueDepth: number };
   return {
     bachs: process.env.BACHS_BASE_URL?.includes('sandbox') ? 'sandbox' : 'live', maps: 'adapter', kyc: 'adapter',
-    sms: 'termii', email: 'smtp', push: 'fcm', storage: objectStore.driver,
+    sms: 'sling', email: 'smtp', push: 'fcm', storage: objectStore.driver,
     sling: slingClient.isConfigured() ? 'live' : 'sandbox-sim',
     whatsapp: 'sling',
     rcs: 'sling',

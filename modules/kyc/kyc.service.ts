@@ -218,8 +218,11 @@ export function verifyNameAlignment(input: NameAlignmentInput): NameAlignmentRes
 }
 
 // ── Prembly (IdentityPass) Adapter (`docs.prembly.com`) ─────────────────────
-// Auth headers: `x-api-key: <PREMBLY_API_KEY>`, `app-id: <PREMBLY_APP_ID>`
-// Base URL: `https://api.prembly.com` (supports both `/verification/...` and `/identitypass/verification/...`)
+// Auth (docs.prembly.com/docs/authentication): server calls send the SECRET
+// (private) key as `x-api-key` and the App ID as `app-id`; no Authorization
+// header. The PUBLIC key is only for client widgets/SDKs. Sandbox and live share
+// https://api.prembly.com — the key decides the environment.
+// Base URL: `https://api.prembly.com`; documented paths are `/identitypass/verification/...` (bare `/verification/...` tried as fallback)
 // Response shape: `{ status: boolean, response_code: "00" | "01" | ..., detail, verification: { status: "VERIFIED" | ... }, data: {...} }`
 class PremblyKycAdapter implements KycAdapter {
   readonly name = 'prembly';
@@ -233,12 +236,12 @@ class PremblyKycAdapter implements KycAdapter {
     const base = this.baseUrl.replace(/\/$/, '').replace(/\/identitypass$/, '');
     const cleanPath = path.replace(/^\/identitypass/, '');
     const candidateUrls = [
-      `${base}${cleanPath}`,
       `${base}/identitypass${cleanPath}`,
+      `${base}${cleanPath}`,
     ];
     if (fallbackPath) {
       const cleanFallback = fallbackPath.replace(/^\/identitypass/, '');
-      candidateUrls.push(`${base}${cleanFallback}`, `${base}/identitypass${cleanFallback}`);
+      candidateUrls.push(`${base}/identitypass${cleanFallback}`, `${base}${cleanFallback}`);
     }
 
     let lastStatus = 0;
@@ -637,16 +640,19 @@ class PremblySandboxAdapter implements KycAdapter {
   }
 }
 
+/** Prembly secret (private) key: PREMBLY_SECRET_KEY, or the legacy PREMBLY_API_KEY name. */
+export const premblySecret = () => (process.env.PREMBLY_SECRET_KEY || process.env.PREMBLY_API_KEY || '').trim();
+
 export function selectKycAdapter(): KycAdapter {
   const pref = (process.env.KYC_PROVIDER || 'prembly').toLowerCase();
-  if (pref === 'prembly' && process.env.PREMBLY_API_KEY) {
-    return new PremblyKycAdapter(process.env.PREMBLY_API_KEY, process.env.PREMBLY_APP_ID || '');
+  if (pref === 'prembly' && premblySecret()) {
+    return new PremblyKycAdapter(premblySecret(), process.env.PREMBLY_APP_ID || '');
   }
   if (pref === 'dojah' && process.env.DOJAH_SECRET_KEY) {
     return new DojahKycAdapter(process.env.DOJAH_SECRET_KEY, process.env.DOJAH_APP_ID || '');
   }
-  if (process.env.PREMBLY_API_KEY) {
-    return new PremblyKycAdapter(process.env.PREMBLY_API_KEY, process.env.PREMBLY_APP_ID || '');
+  if (premblySecret()) {
+    return new PremblyKycAdapter(premblySecret(), process.env.PREMBLY_APP_ID || '');
   }
   if (process.env.DOJAH_SECRET_KEY) {
     return new DojahKycAdapter(process.env.DOJAH_SECRET_KEY, process.env.DOJAH_APP_ID || '');
@@ -1329,7 +1335,7 @@ export const kycService = {
           },
         },
       },
-      configured: Boolean(process.env.PREMBLY_API_KEY),
+      configured: Boolean(premblySecret()),
       adapter: selectKycAdapter().name,
       tools: [
         {
