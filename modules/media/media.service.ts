@@ -9,7 +9,7 @@ import { emit } from '../../packages/observability/emit.js';
 
 export interface MediaAsset { id: string; sha256: string; status: 'quarantined' | 'clean' | 'rejected'; url?: string; folder?: string; mime?: string }
 
-const ALLOWED_MIME = ['image/jpeg', 'image/png', 'video/mp4', 'application/pdf'];
+const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'application/pdf', 'audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/aac', 'audio/amr'];
 
 /**
  * Magic-byte sniff — a client-declared MIME is untrusted. Returns true when
@@ -25,6 +25,18 @@ function magicBytesMatch(bytes: Buffer, mime: string): boolean {
     case 'video/mp4':
       // ISO BMFF: bytes 4..7 == 'ftyp'
       return bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70;
+    case 'image/webp':
+      return bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP';
+    case 'audio/ogg':
+      return bytes.toString('ascii', 0, 4) === 'OggS';
+    case 'audio/mpeg':
+      return bytes.toString('ascii', 0, 3) === 'ID3' || (bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0);
+    case 'audio/mp4':
+      return bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70;
+    case 'audio/aac':
+      return bytes[0] === 0xff && (bytes[1] & 0xf6) === 0xf0;
+    case 'audio/amr':
+      return bytes.toString('ascii', 0, 5) === '#!AMR';
     case 'application/pdf':
       return bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
     default:

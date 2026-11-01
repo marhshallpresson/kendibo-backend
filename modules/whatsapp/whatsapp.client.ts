@@ -16,6 +16,10 @@ const cfg = () => ({
 /** Send-time values for a template's buttons: a quick-reply payload, or the URL button's variable suffix. */
 export type TemplateButton = { index: number; payload: string } | { index: number; urlSuffix: string };
 
+// Customer uploads we accept from WhatsApp: photos, voice notes, short videos, PDFs.
+const MEDIA_MIME = /^(image\/(jpeg|png|webp)|audio\/(ogg|mpeg|mp4|aac|amr)|video\/mp4|application\/pdf)$/;
+const MEDIA_MAX = 16 * 1024 * 1024;
+
 export const whatsappConfigured = () => !!(cfg().token && cfg().phoneNumberId);
 
 /** GET handshake: Meta sends hub.mode=subscribe, hub.verify_token, hub.challenge. */
@@ -148,14 +152,20 @@ export const wa = {
     });
     if (!meta.ok) return null;
     const m = (await meta.json()) as { url?: string; mime_type?: string; file_size?: number };
-    if (!m.url || !/^image\/(jpeg|png|webp)$/.test(String(m.mime_type)) || Number(m.file_size ?? 0) > 5 * 1024 * 1024) return null;
+    if (!m.url || !MEDIA_MIME.test(String(m.mime_type).split(';')[0].trim()) || Number(m.file_size ?? 0) > MEDIA_MAX) return null;
     // Only follow Meta's own CDN — never an arbitrary URL from a payload.
     if (!/^https:\/\/([a-z0-9-]+\.)*(fbsbx\.com|whatsapp\.net|facebook\.com)\//i.test(m.url)) return null;
     const file = await fetch(m.url, { signal: AbortSignal.timeout(15_000), headers: { Authorization: `Bearer ${c.token}` } });
     if (!file.ok) return null;
     const bytes = Buffer.from(await file.arrayBuffer());
-    return bytes.length <= 5 * 1024 * 1024 ? { bytes, mime: String(m.mime_type) } : null;
+    return bytes.length <= MEDIA_MAX ? { bytes, mime: String(m.mime_type).split(';')[0].trim() } : null;
   },
+
+  /** Photo, voice note, video or document by URL (our signed storage link). */
+  media: (to: string, kind: 'image' | 'audio' | 'video' | 'document', url: string, caption?: string) => send(to, {
+    type: kind,
+    [kind]: { link: url, ...(caption && kind !== 'audio' ? { caption: clip(caption, 1024) } : {}) },
+  }),
 
   markRead: async (messageId: string) => {
     const c = cfg();

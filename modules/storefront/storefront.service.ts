@@ -235,6 +235,16 @@ export const storefrontService = {
 // value is HTML-escaped.
 const esc = (v: unknown) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 
+/**
+ * "Connect on WhatsApp": opens a chat with KENDIBO's number (never the vendor's),
+ * prefilled with the storefront reference the bot uses to route the booking.
+ */
+export function waConnect(sf: { name: string; slug: string | null }): string | null {
+  const number = (process.env.WHATSAPP_BUSINESS_NUMBER ?? '').replace(/D/g, '');
+  if (!number || !sf.slug) return null;
+  return `https://wa.me/${number}?text=${encodeURIComponent(`Hi Kendibo, I'd like to book ${sf.name} (ref KB-${sf.slug})`)}`;
+}
+
 export function renderStorefrontPage(sf: NonNullable<Awaited<ReturnType<typeof storefrontService.publicView>>>, opts: { appScheme?: string } = {}): string {
   const base = publicBaseUrl();
   const title = `${sf.name} on Kendibo`;
@@ -291,6 +301,8 @@ h1{font-size:24px;line-height:1.25;margin:0 0 4px}p{margin:0;color:var(--sub)}
 </main>
 <div class="cta">
   <a href="${esc(deepLink)}">Book ${esc(sf.name)} in the app</a>
+  ${waConnect(sf) ? `<a href="${esc(waConnect(sf)!)}" style="margin-top:8px;background:#fff;color:#14212b;border:1px solid #d0d5dd" aria-label="Connect with ${esc(sf.name)} on WhatsApp through Kendibo">Connect on WhatsApp</a>
+  <p style="text-align:center;font-size:12px;margin-top:6px;color:#52606d">Chats go through Kendibo, so your number stays private and payment stays protected.</p>` : ''}
   <p style="text-align:center;font-size:13px;margin-top:8px"><a style="all:unset;color:#1D5BD6;font-weight:600;cursor:pointer" href="${esc(`${(process.env.APP_URL || base).replace(/\/+$/, '')}/#/download`)}">Don't have Kendibo yet? Get the app</a></p>
 </div>
 </body>

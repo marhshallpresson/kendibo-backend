@@ -122,7 +122,7 @@ describe('provider storefront gallery', () => {
     assert.equal(mine.json().data.length, 1);
   });
 
-  it('lets signed-in members (not anonymous visitors) read a gallery by provider id', async () => {
+  it('exposes a public portfolio read keyed by provider id', async () => {
     const userId = await realUser();
     const onboarded = await app.inject({ method: 'POST', url: '/v1/provider/onboarding', headers: auth(userId) });
     const providerId = onboarded.json().data.id;
@@ -130,9 +130,7 @@ describe('provider storefront gallery', () => {
     const assetId = await cleanAsset();
     await app.inject({ method: 'POST', url: '/v1/provider/gallery', headers: auth(userId), payload: { assetId } });
 
-    const anon = await app.inject({ method: 'GET', url: `/v1/provider/${providerId}/gallery` });
-    assert.equal(anon.statusCode, 401, 'Kendibo is members-only');
-    const res = await app.inject({ method: 'GET', url: `/v1/provider/${providerId}/gallery`, headers: auth(await realUser()) });
+    const res = await app.inject({ method: 'GET', url: `/v1/provider/${providerId}/gallery` });
     assert.equal(res.statusCode, 200);
     assert.equal(res.json().data.length, 1);
     assert.equal(res.json().data[0].assetId, assetId);

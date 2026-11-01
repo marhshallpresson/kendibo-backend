@@ -312,5 +312,8 @@ async function notifyWhatsappCustomer(requestId: string, bookingId: string | nul
   try {
     const { notifyRequestAccepted } = await import('../whatsapp/whatsapp.bot.js');
     await notifyRequestAccepted(requestId, bookingId);
+    // Open the masked client <-> vendor chat through Kendibo.
+    const { openRelay } = await import('../whatsapp/relay.js');
+    await openRelay(requestId);
   } catch { /* notification is best-effort */ }
 }

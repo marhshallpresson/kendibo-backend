@@ -12,6 +12,8 @@ export interface Draft {
   id: string; need: string | null; category_id: string | null; service_id: string | null; budget_kobo: string | null;
   photo_asset_ids: string[]; lat: number | null; lng: number | null; address_text: string | null; landmark: string | null;
   scheduled_date: string | null; time_window: TimeWindow | null; request_id: string | null;
+  /** Set when the client came from a vendor's storefront (KB-<slug>): that vendor gets the job first. */
+  preferred_provider_id?: string | null;
 }
 
 /**
@@ -38,6 +40,7 @@ const toDraft = (r: Record<string, unknown>): Draft => ({
   scheduled_date: isoDay(r.scheduled_date),
   time_window: (r.time_window as TimeWindow) ?? null,
   request_id: r.request_id ? String(r.request_id) : null,
+  preferred_provider_id: r.preferred_provider_id ? String(r.preferred_provider_id) : null,
 });
 
 /** The open draft for this number, if any. */
@@ -55,7 +58,7 @@ export async function openDraft(waId: string, userId: string): Promise<Draft> {
   return toDraft(rows[0]);
 }
 
-const COLUMNS = new Set(['need', 'category_id', 'service_id', 'budget_kobo', 'photo_asset_ids', 'lat', 'lng', 'address_text', 'landmark', 'scheduled_date', 'time_window', 'status', 'request_id']);
+const COLUMNS = new Set(['need', 'category_id', 'service_id', 'budget_kobo', 'photo_asset_ids', 'lat', 'lng', 'address_text', 'landmark', 'scheduled_date', 'time_window', 'status', 'request_id', 'preferred_provider_id']);
 
 export async function patchDraft(id: string, patch: Record<string, unknown>): Promise<void> {
   const keys = Object.keys(patch).filter((k) => COLUMNS.has(k));
@@ -101,6 +104,7 @@ export async function submitDraft(waId: string, userId: string, d: Draft): Promi
     lat: d.lat!, lng: d.lng!, notes: [d.address_text, d.landmark && `Landmark: ${d.landmark}`].filter(Boolean).join(' · ') || undefined,
     scheduledDate: d.scheduled_date ?? undefined, timeWindow: d.time_window ? WINDOW_HOURS[d.time_window] : undefined,
     contactPhone: `+${waId.replace(/\D/g, '')}`, idempotencyKey: `wa_draft_${d.id}`, source: 'whatsapp',
+    preferredProviderId: d.preferred_provider_id ?? undefined,
   });
   await q(`UPDATE booking.service_request SET budget_kobo=$2, photo_asset_ids=$3 WHERE id=$1`, [r.id, d.budget_kobo, JSON.stringify(d.photo_asset_ids)]).catch(() => undefined);
   const ranked = await matchingService.rank({
@@ -109,6 +113,22 @@ export async function submitDraft(waId: string, userId: string, d: Draft): Promi
   });
   await patchDraft(d.id, { status: 'submitted', request_id: r.id });
   emit('whatsapp.request_submitted', { requestId: r.id, vendors: ranked.length });
+  // From a vendor's storefront: that vendor gets the job offer first.
+  if (d.preferred_provider_id) {
+    const v = await q<{ name: string | null; phone: string | null }>(
+      `SELECT p.business_name AS name, u.phone FROM provider.provider p JOIN identity.users u ON u.id=p.user_id WHERE p.id=$1`, [d.preferred_provider_id],
+    );
+    const offer = await q<{ id: string }>(
+      `INSERT INTO booking.request_offer (request_id, provider_id, eta_minutes) VALUES ($1,$2,30) RETURNING id`, [r.id, d.preferred_provider_id],
+    ).catch(() => []);
+    await q(`UPDATE booking.service_request SET preferred_provider_id=$2, status='OFFERED' WHERE id=$1`, [r.id, d.preferred_provider_id]).catch(() => undefined);
+    if (offer[0] && v[0]?.phone) {
+      const { notifyProviderOfOffer } = await import('./whatsapp.bot.js');
+      await notifyProviderOfOffer(String(v[0].phone), String(offer[0].id), `${(d.need ?? 'New job').slice(0, 80)} (booked from your storefront)`);
+    }
+    await wa.text(waId, `Done, your request is with ${v[0]?.name ?? 'the vendor'}. You'll get a message here when they accept, and you can then chat with them here through Kendibo.`);
+    return { requestId: r.id, vendors: 1 };
+  }
   if (ranked.length) {
     await wa.ctaUrl(waId, `Done, your request is in. ${ranked.length} verified vendor${ranked.length === 1 ? '' : 's'} near you can take it. Compare them and pick one, or we'll offer it to the best match.`, 'See vendors', vendorsLink(waId, d.id));
   } else {

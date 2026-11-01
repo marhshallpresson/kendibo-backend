@@ -29,6 +29,7 @@ import { nextStep, sendStep, handleFlowTap, patchFromUnderstanding, acknowledge,
 import { FACTS, priceLines } from './facts.js';
 import { OPT_IN, OPT_OUT, llmAllowed, sendBusinessInitiated, notifyCustomer } from './policy.js';
 import { payToken } from './links.js';
+import { activeRelay, closeRelay, relayText, relayMedia } from './relay.js';
 
 type State = 'BOT' | 'HUMAN';
 interface Session { waId: string; userId: string | null; state: State; data: Asked; updatedAt: number }
@@ -40,6 +41,9 @@ export interface InboundMessage {
   button?: { payload?: string; text?: string };
   location?: { latitude: number; longitude: number; name?: string; address?: string };
   image?: { id: string; mime_type?: string; caption?: string };
+  audio?: { id: string; mime_type?: string; voice?: boolean };
+  video?: { id: string; mime_type?: string; caption?: string };
+  document?: { id: string; mime_type?: string; caption?: string; filename?: string };
 }
 
 interface Deps {
@@ -105,9 +109,26 @@ async function userFor(waId: string, profileName?: string): Promise<{ id: string
   return { id: String(created[0].id), role: 'CUSTOMER', email: null };
 }
 
+/**
+ * Download a customer's photo, voice note, video or PDF from Meta and store it
+ * (object storage / FTP via mediaService). Returns null when the message has no file.
+ */
+async function saveUpload(m: InboundMessage): Promise<{ kind: 'image' | 'audio' | 'video' | 'document'; assetId: string | null; url: string | null; mime: string; bytes: Buffer | null } | null> {
+  const kind = (['image', 'audio', 'video', 'document'] as const).find((k) => m.type === k && m[k]?.id);
+  if (!kind) return null;
+  const media = await wa.downloadMedia(String(m[kind]!.id)).catch(() => null);
+  if (!media) return { kind, assetId: null, url: null, mime: '', bytes: null };
+  const { mediaService } = await import('../media/media.service.js');
+  const { assetId } = await mediaService.presign(kind === 'image' ? 'photo' : kind === 'video' ? 'video' : 'doc');
+  const done = await mediaService.ingest(assetId, media.bytes, media.mime).catch(() => null);
+  return done?.status === 'clean'
+    ? { kind, assetId, url: (done as { url?: string }).url ?? null, mime: media.mime, bytes: media.bytes }
+    : { kind, assetId: null, url: null, mime: media.mime, bytes: null };
+}
+
 const replyId = (m: InboundMessage) => m.interactive?.button_reply?.id ?? m.interactive?.list_reply?.id ?? m.button?.payload ?? '';
 const replyText = (m: InboundMessage) =>
-  (m.text?.body ?? m.image?.caption ?? m.interactive?.button_reply?.title ?? m.interactive?.list_reply?.title ?? m.button?.text ?? '').trim();
+  (m.text?.body ?? m.image?.caption ?? m.video?.caption ?? m.document?.caption ?? m.interactive?.button_reply?.title ?? m.interactive?.list_reply?.title ?? m.button?.text ?? '').trim();
 
 // ── Replies ──────────────────────────────────────────────────────────────────
 async function sendWelcome(to: string, name?: string) {
@@ -308,6 +329,20 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
   let draft = await currentDraft(to);
   if (!draft) s.data = { lang: s.data.lang };
 
+  // ── Masked client ↔ vendor chat: words and uploads pass straight through ────
+  const relay = id ? null : await activeRelay(to);
+  if (relay && !['menu', 'agent', 'bot', 'help'].includes(lower)) {
+    if (lower === 'end') {
+      await closeRelay(relay.id);
+      await sendMenu(to, 'Chat closed. Your booking stays active in Kendibo.');
+      return;
+    }
+    const up = await saveUpload(m);
+    if (up?.url) await relayMedia(relay, up.kind, up.url, text || undefined);
+    else if (text) await relayText(relay, text);
+    return;
+  }
+
   // ── Taps ──────────────────────────────────────────────────────────────────
   if (id && !id.startsWith('ai:')) {
     try {
@@ -344,24 +379,33 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
     return;
   }
 
-  // ── Photo (its caption, if any, is read as text below) ──────────────────────
+  // ── Photo, voice note, video or document (a caption is read as text below) ──
   const images: { mime: string; base64: string }[] = [];
-  if (m.type === 'image' && m.image?.id) {
-    const media = await wa.downloadMedia(m.image.id).catch(() => null);
-    let saved = false;
-    if (media) {
-      const { mediaService } = await import('../media/media.service.js');
-      const { assetId } = await mediaService.presign('photo');
-      const done = await mediaService.ingest(assetId, media.bytes, media.mime).catch(() => null);
-      if (done?.status === 'clean') {
-        draft = await addPhotoToDraft(to, user.id, assetId);
-        images.push({ mime: media.mime, base64: media.bytes.toString('base64') });
-        saved = true;
-      }
+  const upload = await saveUpload(m);
+  if (upload) {
+    if (upload.assetId) {
+      draft = await addPhotoToDraft(to, user.id, upload.assetId);
+      if (upload.kind === 'image' && upload.bytes) images.push({ mime: upload.mime, base64: upload.bytes.toString('base64') });
     }
     if (!text) {
       const d = draft ?? (await openDraft(to, user.id));
-      await sendStep(to, d, s.data, saved ? 'Photo added.' : "I couldn't save that photo. You can send it again, or carry on without it.");
+      const noun = { image: 'Photo', audio: 'Voice note', video: 'Video', document: 'Document' }[upload.kind];
+      await sendStep(to, d, s.data, upload.assetId ? `${noun} added.` : `I couldn't save that ${noun.toLowerCase()}. You can send it again (up to 16 MB), or carry on without it.`);
+      await saveSession(s);
+      return;
+    }
+  }
+
+  // ── Arrived from a vendor's storefront ("Connect on WhatsApp", ref KB-<slug>) ──
+  const ref = text.match(/\bKB-([a-z0-9][a-z0-9-]{1,60})\b/i);
+  if (ref) {
+    const { storefrontService } = await import('../storefront/storefront.service.js');
+    const sf = await storefrontService.bySlug(ref[1].toLowerCase()).catch(() => null);
+    if (sf) {
+      const d = draft ?? (await openDraft(to, user.id));
+      await patchDraft(d.id, { preferred_provider_id: sf.id });
+      await sendStep(to, { ...d, preferred_provider_id: sf.id }, s.data,
+        `${firstContact ? `${DISCLOSURE}\n\n` : ''}You're booking ${sf.name} through Kendibo. Your number stays private, you chat with them here, and your payment is held until the job is done.`);
       await saveSession(s);
       return;
     }
