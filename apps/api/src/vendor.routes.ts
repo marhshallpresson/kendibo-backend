@@ -32,7 +32,7 @@ import { emit } from '../../../packages/observability/emit.js';
 
 export const VENDOR_ROUTE_POLICY: Record<string, 'public' | Permission> = {
   'GET /v1/categories/:id/rules': 'public',
-  'GET /v1/storefronts/:slug': 'public',
+  // Shared storefront links show a members-only teaser; details need an account.
   'GET /s/:slug': 'public',
   'GET /webhooks/whatsapp': 'public', // verify-token handshake checked in the handler
   'POST /webhooks/whatsapp': 'public', // X-Hub-Signature-256 checked in the handler
@@ -241,7 +241,15 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
     void reply.header('Cache-Control', 'public, max-age=300');
     if (!sf) return reply.code(404).type('text/html; charset=utf-8').send('<!doctype html><title>Not found</title><p style="font-family:system-ui;padding:24px">This Kendibo storefront is not available.</p>');
     await storefrontService.track(sf.id, 'view', src(req));
-    return reply.type('text/html; charset=utf-8').send(renderStorefrontPage(sf));
+    // Kendibo is members-only: services, prices and photos are shown in the app after sign-in.
+    const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
+    const join = (process.env.APP_URL || 'https://kendibo-app.pxxl.click').replace(/\/+$/, '');
+    void renderStorefrontPage;
+    return reply.type('text/html; charset=utf-8').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(sf.businessName)} on Kendibo</title>
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:520px;margin:48px auto;padding:0 16px;color:#14212b}h1{font-size:22px;margin:0 0 4px}p{color:#4a5a68}a.btn{display:inline-block;margin-top:16px;background:#1f5fd6;color:#fff;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:600}a.btn:focus-visible{outline:3px solid #0b2f73;outline-offset:2px}</style></head>
+<body><main><p>Verified vendor on Kendibo</p><h1>${esc(sf.businessName)}</h1>${sf.headline ? `<p>${esc(String(sf.headline))}</p>` : ''}
+<p>Kendibo is members-only. Create a free account or sign in to see services, prices and reviews, and to book with payment held until the job is done.</p>
+<a class="btn" href="${esc(join)}">Join or sign in to book</a></main></body></html>`);
   });
   // Customer books the vendor straight from their storefront. The vendor gets
   // first refusal (still gated by category rules) via preferredProviderId.

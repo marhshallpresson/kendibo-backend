@@ -214,10 +214,7 @@ const ROUTE_POLICY: Record<string, RoutePolicy> = {
   'GET /v1/services/:id/availability': 'public',
   'POST /v1/pricing/quote': 'public',
   'GET /v1/checklists/:category': 'public',
-  'GET /v1/providers/approved': 'public',
-  'GET /v1/providers/:id': 'public',
-  'GET /v1/providers/:id/storefront': 'public',
-  'GET /v1/provider/:id/gallery': 'public',
+  // Closed marketplace: vendor profiles, storefronts and galleries need an account.
   'GET /v1/banks': 'public',
   'GET /v1/media/:id/file': 'public', // HMAC-signed URL checked in the handler
   'POST /webhooks/payments/bachs': 'public', // PSP signature checked in the handler
