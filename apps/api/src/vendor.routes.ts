@@ -43,6 +43,7 @@ export const VENDOR_ROUTE_POLICY: Record<string, 'public' | Permission> = {
   'GET /w/vendors': 'public',
   'POST /w/vendors/choose': 'public',
   'GET /w/pay': 'public',
+  'GET /w/geocode': 'public',
   'GET /v1/admin/category-rules': 'provider:verify',
   'PUT /v1/admin/category-rules/:id': 'configuration:edit',
   'GET /v1/admin/category-proposals': 'provider:verify',
@@ -362,6 +363,22 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
     }
     await notifyCustomer(claims.w, `We've asked ${pick.name}. You'll get a message here when they accept — if they can't, we'll offer your job to the next best match.`).catch(() => undefined);
     return html(reply, nonce, false, renderMessagePage({ title: `Request sent to ${pick.name}`, message: "We'll message you on WhatsApp when they accept.", nonce, waNumber: waNumber() }));
+  });
+
+  // Address lookup for the location page (works without the Google map key):
+  // signed link required, Mapbox/Google geocoder behind the maps port, Uyo bias.
+  app.get('/w/geocode', async (req, reply) => {
+    const qs = req.query as { t?: string; q?: string };
+    if (!verifyLink(String(qs.t ?? ''), 'loc')) return h.fail(reply, 'LINK_EXPIRED', 'This link has expired. Ask for a new one on WhatsApp.', 410);
+    const text = String(qs.q ?? '').trim().slice(0, 200);
+    if (text.length < 4) return h.fail(reply, 'BAD_QUERY', 'Type the street and area first.');
+    const { maps } = await import('../../../modules/geo/maps.port.js');
+    const city = (process.env.GEOLOCK_CITY ?? 'uyo').split(',')[0].trim() || 'uyo';
+    const g = await maps.geocode(text, city).catch(() => null);
+    if (!g) return h.fail(reply, 'NOT_FOUND', 'We could not find that address. Add the area or a landmark.', 404);
+    const { geoService } = await import('../../../modules/geo/geo.service.js');
+    const zone = await geoService.checkZone(g.lat, g.lng).catch(() => ({ serviceable: false }));
+    return { data: { lat: g.lat, lng: g.lng, formatted: g.formatted, serviceable: Boolean(zone.serviceable) } };
   });
 
   // "Pay securely" button of the vendor-accepted template: signed link → a
