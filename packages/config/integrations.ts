@@ -84,6 +84,7 @@ export const INTEGRATIONS: Integration[] = [
   {
     id: 'google_maps', name: 'Google Maps Platform', purpose: 'Location picker: map, Places (New) search + nearby landmarks, geocoding', docs: 'https://developers.google.com/maps',
     keys: [
+      { env: 'GOOGLE_MAPS_API_KEY', exposure: 'secret', requiredInProd: false, note: 'Server geocoding (primary provider); Mapbox is the fallback, OSM the last resort' },
       { env: 'GOOGLE_MAPS_BROWSER_KEY', exposure: 'public', requiredInProd: false, note: 'Restrict to HTTP referrer <WHATSAPP_WEB_BASE_URL>/* and to Maps JS + Places (New) + Geocoding APIs' },
     ],
   },

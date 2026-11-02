@@ -142,7 +142,7 @@ const ADAPTERS: Record<MapsProviderName, () => MapsPort & { available?: () => bo
   stub: () => new StubMapsAdapter(),
 };
 
-export const MAPS_PROVIDER_NAMES: MapsProviderName[] = ['mapbox', 'google', 'osm'];
+export const MAPS_PROVIDER_NAMES: MapsProviderName[] = ['google', 'mapbox', 'osm'];
 
 interface MapsConfig {
   provider: MapsProviderName;
@@ -151,10 +151,10 @@ interface MapsConfig {
   availability: Record<string, boolean>;
 }
 
-const DEFAULT_PROVIDER: MapsProviderName =
-  process.env.MAPS_PROVIDER === 'mapbox' || process.env.MAPS_PROVIDER === 'google'
-    ? process.env.MAPS_PROVIDER
-    : 'osm';
+// Google is primary and Mapbox the fallback (OSM always ends the chain); an
+// unavailable provider (no key) is skipped. MAPS_PROVIDER / the admin setting
+// can still reorder it.
+const DEFAULT_PROVIDER: MapsProviderName = process.env.MAPS_PROVIDER === 'mapbox' ? 'mapbox' : 'google';
 
 let cachedConfig: { at: number; config: MapsConfig } | null = null;
 const CONFIG_TTL_MS = 30_000;
@@ -170,7 +170,7 @@ function availability(): Record<string, boolean> {
 async function loadConfig(): Promise<MapsConfig> {
   if (cachedConfig && Date.now() - cachedConfig.at < CONFIG_TTL_MS) return cachedConfig.config;
   let provider = DEFAULT_PROVIDER;
-  let fallbacks: MapsProviderName[] = ['osm'];
+  let fallbacks: MapsProviderName[] = DEFAULT_PROVIDER === 'google' ? ['mapbox', 'osm'] : ['google', 'osm'];
   try {
     const rows = await q<{ key: string; value: unknown }>(
       'SELECT key, value FROM configuration.platform_setting WHERE key IN ($1, $2)',

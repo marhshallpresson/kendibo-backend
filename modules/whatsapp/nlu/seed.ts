@@ -619,7 +619,7 @@ function EXTRA(): [string, Intent, Trade?][] {
  * normalising) before the model: a list beats statistics for "ok" or "daalu".
  */
 export const SHORT_REPLIES: Record<'greeting' | 'thanks' | 'affirm' | 'deny', string[]> = {
-  greeting: ['hi', 'hii', 'hello', 'helo', 'hey', 'hey there', 'good morning', 'good afternoon', 'good evening', 'good day', 'morning', 'how far', 'wetin dey', 'how you dey', 'how are you', 'e kaaro', 'e kaasan', 'e kurole', 'bawo ni', 'bawo', 'ndewo', 'kedu', 'sannu', 'ina kwana', 'barka', 'menu', 'start', 'restart', 'bot', 'hello kendibo', 'hi kendibo'],
+  greeting: ['hi', 'hii', 'hello', 'helo', 'hey', 'hey there', 'good morning', 'good afternoon', 'good evening', 'good day', 'how far', 'wetin dey', 'how you dey', 'how are you', 'e kaaro', 'e kaasan', 'e kurole', 'bawo ni', 'bawo', 'ndewo', 'kedu', 'sannu', 'ina kwana', 'barka', 'menu', 'start', 'restart', 'bot', 'hello kendibo', 'hi kendibo'],
   thanks: ['thank you', 'thanks', 'thank u', 'thanks a lot', 'thank you so much', 'thx', 'tnx', 'tanks', 'tank you', 'god bless you', 'god bless', 'e se', 'o se', 'o se gan', 'ese', 'daalu', 'na gode', 'appreciate', 'i appreciate', 'nice one', 'well done', 'you are the best', 'thank you ma', 'thank you sir'],
   affirm: ['yes', 'yes please', 'yeah', 'yep', 'yup', 'ok', 'okay', 'ok o', 'okay go ahead', 'go ahead', 'sure', 'correct', 'that is right', 'thats right', 'right', 'na so', 'oya', 'yes o', 'beeni', 'ee', 'eh', 'confirm', 'confirmed', 'send it', 'alright', 'perfect', 'fine', 'good', 'proceed', 'continue'],
   deny: ['no', 'nope', 'nah', 'no thanks', 'no thank you', 'not now', 'no be so', 'that is wrong', 'wrong', 'rara', 'mba', 'a a', "a'a", 'skip', 'not that one', 'i dont want', 'no photo', 'no budget', 'none', 'nothing'],

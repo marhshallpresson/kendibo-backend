@@ -534,7 +534,7 @@ export async function sweepInbound(now = Date.now()): Promise<number> {
   const rows = await q<{ message_id: string; payload: unknown; profile_name: string | null }>(
     `SELECT message_id, payload, profile_name FROM messaging.whatsapp_inbound
       WHERE processed_at IS NULL AND payload IS NOT NULL AND attempts < 2 AND received_at > $1
-        AND (started_at IS NULL OR started_at < $2)
+        AND received_at < $2 AND (started_at IS NULL OR started_at < $2)
       ORDER BY received_at LIMIT 20`,
     [new Date(now - 6 * 3600_000).toISOString(), new Date(now - RETRY_AFTER_MS).toISOString()],
   ).catch(() => []);

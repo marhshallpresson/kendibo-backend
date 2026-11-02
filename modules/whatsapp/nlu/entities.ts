@@ -64,7 +64,7 @@ export function extractBudgetKobo(text: string, opts: { expectingBudget?: boolea
     .replace(/\b\d+\s*(bed ?rooms?|rooms?|units?|km|kilometres?|floors?|storey|plots?|bedroom)\b/g, ' ');
   const found: number[] = [];
   for (const m of t.matchAll(/(?:₦|\bngn\s?|\bn)(\d[\d,]*(?:\.\d+)?)\s*(k|thousand|grand|m|mil|million)?\b/g)) found.push(toNum(m[1]) * (m[2] ? MULT[m[2]] : 1));
-  for (const m of t.matchAll(/\b(\d[\d,]*(?:\.\d+)?)\s*(k|thousand|grand|m|mil|million)\b/g)) found.push(toNum(m[1]) * MULT[m[2]]);
+  for (const m of t.matchAll(/\b(\d[\d,]*(?:\.\d+)?)\s*(k|thousand|grand|mil|million)\b/g)) found.push(toNum(m[1]) * MULT[m[2]]);
   for (const m of t.matchAll(/\b(\d[\d,]*)\s*(naira|ngn)\b/g)) found.push(toNum(m[1]));
   if (!found.length && (opts.expectingBudget || /\b(budget|pay|price|cost|charge|amount|spend|afford|around|about|max(imum)?|not more than|below|under|less than)\b/.test(t))) {
     for (const m of t.matchAll(/\b(\d[\d,]{2,})\b/g)) {
@@ -78,7 +78,7 @@ export function extractBudgetKobo(text: string, opts: { expectingBudget?: boolea
 }
 
 const WEEKDAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-const WEEKDAY_RE = /\b(sun|mon|tue|tues|wed|thu|thur|thurs|fri|sat)(day|sday|nesday|rsday|urday)?\b/;
+const WEEKDAY_RE = /\b(sun|mon|tue|tues|wed|thu|thur|thurs|fri|sat)(day|sday|nesday|rsday|urday)\b|\b(mon|tue|tues|wed|thu|thur|thurs|fri)\b/;
 const watDate = (d: Date) => new Date(d.getTime() + 3600_000).toISOString().slice(0, 10); // Lagos is UTC+1, no DST
 const addDays = (iso: string, n: number) => new Date(Date.parse(`${iso}T12:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
 const watHour = (d: Date) => new Date(d.getTime() + 3600_000).getUTCHours();
@@ -99,7 +99,7 @@ export function extractWhen(text: string, now: Date = new Date()): { date?: stri
   const today = watDate(now);
   const out: { date?: string; window?: TimeWindow; urgent?: boolean } = {};
 
-  if (/\b(now|asap|urgent\w*|immediately|right away|sharp ?sharp|emergency)\b/.test(t)) {
+  if (/\b(right now|come now|now now|asap|urgent\w*|immediately|right away|sharp ?sharp|emergency)\b/.test(t)) {
     out.urgent = true;
     out.date = today;
     const h = watHour(now);
@@ -118,7 +118,8 @@ export function extractWhen(text: string, now: Date = new Date()): { date?: stri
   } else {
     const wd = t.match(WEEKDAY_RE);
     if (wd) {
-      const target = WEEKDAYS.findIndex((d) => d.startsWith(wd[1].slice(0, 3)));
+      const stem = (wd[1] ?? wd[3] ?? '').slice(0, 3);
+      const target = WEEKDAYS.findIndex((d) => d.startsWith(stem));
       const dow = new Date(`${today}T12:00:00Z`).getUTCDay();
       // "Saturday" / "next Saturday": the coming one (today if it is that day).
       if (target >= 0) out.date = addDays(today, (target - dow + 7) % 7);

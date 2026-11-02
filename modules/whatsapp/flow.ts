@@ -60,6 +60,8 @@ export async function patchFromUnderstanding(d: Draft, u: Understanding, text: s
   if (u.budgetKobo) patch.budget_kobo = String(u.budgetKobo);
   if (u.when.date) patch.scheduled_date = u.when.date;
   if (u.when.window) patch.time_window = u.when.window;
+  const day = String(patch.scheduled_date ?? d.scheduled_date ?? '');
+  if (patch.time_window && day === watToday() && watHour() >= WINDOW_END[patch.time_window as TimeWindow]) delete patch.time_window;
   return patch;
 }
 

@@ -61,7 +61,8 @@ describe('understanding layer', () => {
     assert.equal(extractBudgetKobo('₦20,000 abeg'), 2_000_000n);
     assert.equal(extractBudgetKobo('I fit pay twenty five thousand'), 2_500_000n);
     assert.equal(extractBudgetKobo('between 10k and 15k'), 1_500_000n, 'a range means the most they will pay');
-    assert.equal(extractBudgetKobo('1.5m for the whole building'), 150_000_000n);
+    assert.equal(extractBudgetKobo('1.5 million for the whole building'), 150_000_000n);
+    assert.equal(extractBudgetKobo('the room is 5m wide'), null, 'a bare m is metres');
     assert.equal(extractBudgetKobo('15000'), null, 'a bare number is not money');
     assert.equal(extractBudgetKobo('15000', { expectingBudget: true }), 1_500_000n, '...unless we just asked for the budget');
     assert.equal(extractBudgetKobo('call me on 08031234567'), null);
@@ -208,7 +209,7 @@ describe('message policy', () => {
     const { sweepInbound } = await bot();
     const w = number();
     const m = { id: `wamid.${randomUUID()}`, from: w, type: 'text', text: { body: 'hi' } };
-    await q(`INSERT INTO messaging.whatsapp_inbound (message_id, wa_id, payload, started_at, attempts) VALUES ($1,$2,$3,$4,1)`,
+    await q(`INSERT INTO messaging.whatsapp_inbound (message_id, wa_id, payload, started_at, received_at, attempts) VALUES ($1,$2,$3,$4,$4,1)`,
       [m.id, w, JSON.stringify(m), new Date(Date.now() - 20 * 60_000).toISOString()]);
     const r = await botReply(w, () => sweepInbound());
     assert.match(r, /automated assistant/);

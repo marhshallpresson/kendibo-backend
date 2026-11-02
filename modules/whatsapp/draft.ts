@@ -86,7 +86,8 @@ export async function saveDraftLocation(waId: string, draftId: string, loc: { la
 }
 
 export async function cancelDraft(id: string): Promise<void> {
-  await patchDraft(id, { status: 'cancelled' });
+  // The status CHECK (migration 028) allows collecting / submitted / abandoned.
+  await patchDraft(id, { status: 'abandoned' });
 }
 
 /**

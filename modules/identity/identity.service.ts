@@ -249,7 +249,7 @@ export const identityService = {
     let rows = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE facebook_sub=$1`, [p.id]);
     let isNew = false;
     if (!rows[0]) {
-      const byEmail = p.email ? await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE email=$1`, [p.email]) : [];
+      const byEmail = p.email ? await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE email=$1 AND facebook_sub IS NULL`, [p.email]) : [];
       if (byEmail[0]) {
         await q(`UPDATE identity.users SET facebook_sub=$2, profile_image=COALESCE(profile_image,$3) WHERE id=$1`, [String(byEmail[0].id), p.id, p.picture]);
         rows = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE id=$1`, [String(byEmail[0].id)]);

@@ -73,6 +73,8 @@ describe('WhatsApp message templates', () => {
   it('outside the 24h window an approved template is used instead of SMS', async () => {
     const { applyTemplateWebhook } = await import('../modules/whatsapp/templates.js');
     await applyTemplateWebhook('message_template_status_update', { message_template_id: 555001, message_template_name: 'kendibo_job_offer', message_template_language: 'en', event: 'APPROVED' });
+    // The first test moved it to MARKETING; only utility templates are sent.
+    await applyTemplateWebhook('template_category_update', { message_template_id: 555001, message_template_name: 'kendibo_job_offer', message_template_language: 'en', new_category: 'UTILITY' });
     const { notifyProviderOfOffer } = await import('../modules/whatsapp/whatsapp.bot.js');
     const v = number();
     await notifyProviderOfOffer(`+${v}`, randomUUID(), 'AC repair, 2 km away');

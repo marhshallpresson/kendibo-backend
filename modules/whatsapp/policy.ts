@@ -18,7 +18,7 @@ import { llmTurnsToday } from './nlu/index.js';
 import { approvedTemplate, templateParam, type TemplateKey } from './templates.js';
 
 export const SERVICE_WINDOW_MS = 24 * 3600_000;
-export const OPT_OUT = /^(stop|unsubscribe|stop promos?|stop promotions?)$/;
+export const OPT_OUT = /^(stop|unsubscribe|stop promos?|stop promotions?|stop all|stop messages?)( please)?[.!]*$/;
 export const OPT_IN = /^start$/;
 
 /** True when the customer messaged us in the last 24 hours. */
@@ -49,8 +49,10 @@ export async function sendBusinessInitiated(opts: {
   if (await inServiceWindow(opts.waId)) { await opts.whatsapp(); return 'whatsapp'; }
   const t = opts.template ? await approvedTemplate(opts.template.key) : null;
   if (t && opts.template) {
-    await wa.template(opts.waId, t.name, opts.template.params.map((p) => templateParam(p)), opts.template.buttons, t.language);
-    return 'template';
+    try {
+      await wa.template(opts.waId, t.name, opts.template.params.map((p) => templateParam(p)), opts.template.buttons, t.language);
+      return 'template';
+    } catch { /* fall through to SMS so the message is not lost */ }
   }
   const { sms } = await import('../notifications/channels.js');
   await sms.send(`+${opts.waId.replace(/\D/g, '')}`, opts.sms, { type: 'transactional' });

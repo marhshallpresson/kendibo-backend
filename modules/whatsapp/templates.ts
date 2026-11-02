@@ -89,7 +89,7 @@ export async function remoteTemplates(): Promise<{ id: string; name: string; lan
 async function upsert(row: { name: string; language: string; metaId?: string | null; category?: string | null; status?: string; quality?: string | null; reason?: string | null }) {
   const updated = await q<{ name: string }>(
     `UPDATE messaging.whatsapp_template SET meta_id=COALESCE($3, meta_id), category=COALESCE($4, category), status=COALESCE($5, status),
-            quality=COALESCE($6, quality), reason=$7, updated_at=now() WHERE name=$1 AND language=$2 RETURNING name`,
+            quality=COALESCE($6, quality), reason=COALESCE($7, reason), updated_at=now() WHERE name=$1 AND language=$2 RETURNING name`,
     [row.name, row.language, row.metaId ?? null, row.category ?? null, row.status ?? null, row.quality ?? null, row.reason ?? null],
   );
   if (!updated[0]) {
@@ -145,8 +145,9 @@ export async function templateRows(): Promise<TemplateRow[]> {
 /** The template to send for `key`, or null if Meta hasn't approved it. */
 export async function approvedTemplate(key: TemplateKey): Promise<{ name: string; language: string } | null> {
   const t = templateDef(key);
-  const rows = await q<{ status: string }>(`SELECT status FROM messaging.whatsapp_template WHERE name=$1 AND language=$2`, [t.name, t.language]).catch(() => []);
-  return rows[0] && SENDABLE.has(String(rows[0].status)) ? { name: t.name, language: t.language } : null;
+  const rows = await q<{ status: string; category: string | null }>(`SELECT status, category FROM messaging.whatsapp_template WHERE name=$1 AND language=$2`, [t.name, t.language]).catch(() => []);
+  const ok = rows[0] && SENDABLE.has(String(rows[0].status)) && String(rows[0].category ?? 'UTILITY').toUpperCase() === 'UTILITY';
+  return ok ? { name: t.name, language: t.language } : null;
 }
 
 /**
