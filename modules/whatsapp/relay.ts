@@ -34,10 +34,13 @@ export async function openRelay(requestId: string): Promise<void> {
   const vendor = String(row.phone).replace(/\D/g, '');
   const existing = await q(`SELECT 1 FROM messaging.whatsapp_relay WHERE request_id=$1 AND status='active'`, [requestId]);
   if (existing[0]) return;
-  await q(`UPDATE messaging.whatsapp_relay SET status='closed', closed_at=now() WHERE status='active' AND (customer_wa=$1 OR vendor_wa=$2)`, [customer, vendor]);
+  // A customer has one live chat at a time; a vendor may serve several customers
+  // (their replies go to the most recently connected one, named in this message).
+  await q(`UPDATE messaging.whatsapp_relay SET status='closed', closed_at=now() WHERE status='active' AND customer_wa=$1`, [customer]);
   await q(`INSERT INTO messaging.whatsapp_relay (request_id, provider_id, customer_wa, vendor_wa) VALUES ($1,$2,$3,$4)`, [requestId, row.provider_id, customer, vendor]);
   emit('whatsapp.relay_opened', { requestId });
-  await notifyCustomer(vendor, 'You are now connected with the customer through Kendibo. Reply here and I will pass your messages on word for word. Type END when you are done.').catch(() => undefined);
+  const job = await q<{ title: string }>(`SELECT title FROM booking.service_request WHERE id=$1`, [requestId]).catch(() => []);
+  await notifyCustomer(vendor, `You are now connected with the customer for "${String(job[0]?.title ?? 'your new job').slice(0, 60)}" through Kendibo. Reply here and I will pass your messages on word for word. Type END when you are done.`).catch(() => undefined);
   await notifyCustomer(customer, `You can now chat with ${row.name ?? 'your vendor'} right here. Your messages go through Kendibo, so your number stays private. Type END to stop, or MENU for other options.`).catch(() => undefined);
 }
 
