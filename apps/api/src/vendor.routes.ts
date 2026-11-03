@@ -92,10 +92,10 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
     return h.fail(reply, code, extra ? `${known[1]} Missing: ${extra.join(', ')}` : known[1], known[0]);
   };
 
-  // Enable the app entry point only after the deployed bot has passed live QA.
+  // Advertise the configured business account; operators can disable it explicitly.
   app.get('/v1/kendibot', async () => {
     const number = (process.env.WHATSAPP_BUSINESS_NUMBER ?? '').replace(/\D/g, '');
-    const enabled = process.env.KENDIBOT_PROMOTION_ENABLED === 'true' && whatsappConfigured() && /^[1-9]\d{7,14}$/.test(number);
+    const enabled = process.env.KENDIBOT_PROMOTION_ENABLED !== 'false' && whatsappConfigured() && /^[1-9]\d{7,14}$/.test(number);
     return { data: { enabled, url: enabled ? `https://wa.me/${number}?text=${encodeURIComponent('Hello')}` : null } };
   });
 

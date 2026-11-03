@@ -39,7 +39,7 @@ async function botTurns(waId: string) {
 }
 
 describe('WhatsApp message templates', () => {
-  it('exposes the configured Kendibot link only after promotion is enabled', async () => {
+  it('exposes a configured Kendibot link by default and honors explicit disable', async () => {
     const keys = ['KENDIBOT_PROMOTION_ENABLED', 'WHATSAPP_BUSINESS_NUMBER', 'WHATSAPP_ACCESS_TOKEN', 'WHATSAPP_PHONE_NUMBER_ID'] as const;
     const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
     try {
@@ -49,6 +49,9 @@ describe('WhatsApp message templates', () => {
       process.env.WHATSAPP_PHONE_NUMBER_ID = '123';
       let response = await app.inject({ method: 'GET', url: '/v1/kendibot' });
       assert.deepEqual(response.json().data, { enabled: false, url: null });
+      delete process.env.KENDIBOT_PROMOTION_ENABLED;
+      response = await app.inject({ method: 'GET', url: '/v1/kendibot' });
+      assert.deepEqual(response.json().data, { enabled: true, url: 'https://wa.me/2348001234567?text=Hello' });
       process.env.KENDIBOT_PROMOTION_ENABLED = 'true';
       response = await app.inject({ method: 'GET', url: '/v1/kendibot' });
       assert.deepEqual(response.json().data, { enabled: true, url: 'https://wa.me/2348001234567?text=Hello' });
