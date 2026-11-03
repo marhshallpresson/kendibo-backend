@@ -39,6 +39,29 @@ async function botTurns(waId: string) {
 }
 
 describe('WhatsApp message templates', () => {
+  it('exposes the configured Kendibot link only after promotion is enabled', async () => {
+    const keys = ['KENDIBOT_PROMOTION_ENABLED', 'WHATSAPP_BUSINESS_NUMBER', 'WHATSAPP_ACCESS_TOKEN', 'WHATSAPP_PHONE_NUMBER_ID'] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    try {
+      process.env.KENDIBOT_PROMOTION_ENABLED = 'false';
+      process.env.WHATSAPP_BUSINESS_NUMBER = '+234 800 123 4567';
+      process.env.WHATSAPP_ACCESS_TOKEN = 'test-token';
+      process.env.WHATSAPP_PHONE_NUMBER_ID = '123';
+      let response = await app.inject({ method: 'GET', url: '/v1/kendibot' });
+      assert.deepEqual(response.json().data, { enabled: false, url: null });
+      process.env.KENDIBOT_PROMOTION_ENABLED = 'true';
+      response = await app.inject({ method: 'GET', url: '/v1/kendibot' });
+      assert.deepEqual(response.json().data, { enabled: true, url: 'https://wa.me/2348001234567?text=Hello' });
+      process.env.WHATSAPP_BUSINESS_NUMBER = 'invalid';
+      response = await app.inject({ method: 'GET', url: '/v1/kendibot' });
+      assert.deepEqual(response.json().data, { enabled: false, url: null });
+    } finally {
+      for (const key of keys) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+    }
+  });
   it('follows Meta status webhooks and only sends approved templates', async () => {
     const { applyTemplateWebhook, approvedTemplate } = await import('../modules/whatsapp/templates.js');
     const base = { message_template_id: 555001, message_template_name: 'kendibo_job_offer', message_template_language: 'en' };
@@ -72,6 +95,23 @@ describe('WhatsApp message templates', () => {
     }
     assert.equal(row?.status, 'REJECTED');
     assert.equal(row?.reason, 'INVALID_FORMAT');
+  });
+
+  it('returns a retryable error when an inbound message cannot be persisted', async () => {
+    const payload = JSON.stringify({ entry: [{ changes: [{ field: 'messages', value: { messages: [{ from: number(), type: 'text', text: { body: 'hello' } }] } }] }] });
+    const r = await app.inject({ method: 'POST', url: '/webhooks/whatsapp', payload, headers: { 'content-type': 'application/json', 'x-hub-signature-256': sign(payload) } });
+    assert.equal(r.statusCode, 503);
+    assert.equal(r.json().error.code, 'WHATSAPP_INBOUND_UNAVAILABLE');
+  });
+
+  it('stores a signed inbound message before acknowledging it and deduplicates retries', async () => {
+    const id = `wamid.${randomUUID()}`;
+    const payload = JSON.stringify({ entry: [{ changes: [{ field: 'messages', value: { messages: [{ id, from: number(), type: 'text', text: { body: 'hello' } }] } }] }] });
+    const options = { method: 'POST', url: '/webhooks/whatsapp', payload, headers: { 'content-type': 'application/json', 'x-hub-signature-256': sign(payload) } };
+    assert.equal((await app.inject(options)).statusCode, 200);
+    assert.equal((await app.inject(options)).statusCode, 200);
+    const rows = await q<{ n: string }>(`SELECT COUNT(*) AS n FROM messaging.whatsapp_inbound WHERE message_id=$1`, [id]);
+    assert.equal(Number(rows[0].n), 1);
   });
 
   it('outside the 24h window an approved template is used instead of SMS', async () => {

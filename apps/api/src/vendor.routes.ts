@@ -16,10 +16,10 @@ import { storefrontService, brandingSchema, renderStorefrontPage } from '../../.
 import { kycSpendReport } from '../../../modules/kyc/kyc-cost.guard.js';
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
-import { verifySubscription, verifySignature } from '../../../modules/whatsapp/whatsapp.client.js';
+import { verifySubscription, verifySignature, whatsappConfigured } from '../../../modules/whatsapp/whatsapp.client.js';
 import { verifyLink } from '../../../modules/whatsapp/links.js';
 import { renderLocationPage, renderVendorsPage, renderMessagePage, pageCsp } from '../../../modules/whatsapp/web-pages.js';
-import { handleInbound, continueAfterLocation, startInboundSweeper, payLinkTarget, type InboundMessage } from '../../../modules/whatsapp/whatsapp.bot.js';
+import { enqueueInbound, continueAfterLocation, startInboundSweeper, payLinkTarget, type InboundMessage } from '../../../modules/whatsapp/whatsapp.bot.js';
 import { applyTemplateWebhook, startTemplateStatusSync } from '../../../modules/whatsapp/templates.js';
 import { saveDraftLocation } from '../../../modules/whatsapp/draft.js';
 import { notifyCustomer } from '../../../modules/whatsapp/policy.js';
@@ -35,6 +35,7 @@ export const VENDOR_ROUTE_POLICY: Record<string, 'public' | Permission> = {
   'GET /v1/storefronts/:slug': 'public',
   'GET /s/:slug': 'public',
   'GET /webhooks/whatsapp': 'public', // verify-token handshake checked in the handler
+  'GET /v1/kendibot': 'public',
   'POST /webhooks/whatsapp': 'public', // X-Hub-Signature-256 checked in the handler
   // In-WhatsApp pages: the signed link token (HMAC, per user + draft + purpose,
   // expiring) is the credential, checked in every handler.
@@ -90,6 +91,13 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
     const extra = (e as { missing?: string[] }).missing;
     return h.fail(reply, code, extra ? `${known[1]} Missing: ${extra.join(', ')}` : known[1], known[0]);
   };
+
+  // Enable the app entry point only after the deployed bot has passed live QA.
+  app.get('/v1/kendibot', async () => {
+    const number = (process.env.WHATSAPP_BUSINESS_NUMBER ?? '').replace(/\D/g, '');
+    const enabled = process.env.KENDIBOT_PROMOTION_ENABLED === 'true' && whatsappConfigured() && /^[1-9]\d{7,14}$/.test(number);
+    return { data: { enabled, url: enabled ? `https://wa.me/${number}?text=${encodeURIComponent('Hello')}` : null } };
+  });
 
   // ── Category rules & trade proposals ─────────────────────────────────────
   app.get('/v1/categories/:id/rules', async (req) => {
@@ -433,7 +441,13 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
         const contacts = change.value?.contacts ?? [];
         for (const m of change.value?.messages ?? []) {
           const name = contacts.find((c) => c.wa_id === m.from)?.profile?.name;
-          jobs.push(handleInbound(m, name).catch((e) => observability.captureException(e)));
+          try {
+            await enqueueInbound(m, name);
+          } catch (e) {
+            observability.captureException(e);
+            req.log.error('[whatsapp] unable to persist inbound message');
+            return h.fail(reply, 'WHATSAPP_INBOUND_UNAVAILABLE', 'Unable to accept webhook', 503, true);
+          }
         }
       }
     }
