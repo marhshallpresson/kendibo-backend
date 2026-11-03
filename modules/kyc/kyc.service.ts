@@ -140,15 +140,15 @@ export function verifyNameAlignment(input: NameAlignmentInput): NameAlignmentRes
   const cacTokens = tokenizeName(input.cacCompanyName);
   const bankTokens = tokenizeName(input.bankAccountName);
 
-  const verifiedLegalName = input.ninLegalName || input.bvnLegalName || input.submittedName || null;
-  const verifiedCacName = input.cacCompanyName || input.businessName || null;
+  const verifiedLegalName = input.ninLegalName || input.bvnLegalName || null;
+  const verifiedCacName = input.cacCompanyName || null;
   const legalTokens = tokenizeName(verifiedLegalName);
 
   const matchedSet = new Set<string>();
 
   // 1) Personal alignment: submittedName vs NIN/BVN legal name (if both exist)
-  let personalAligned = true;
-  let personalScore = 100;
+  let personalAligned = false;
+  let personalScore = 0;
   if (submittedTokens.length > 0 && (ninTokens.length > 0 || bvnTokens.length > 0)) {
     const refTokens = ninTokens.length > 0 ? ninTokens : bvnTokens;
     const cmp = tokenOverlapScore(submittedTokens, refTokens);
@@ -197,7 +197,9 @@ export function verifyNameAlignment(input: NameAlignmentInput): NameAlignmentRes
 
   let mismatchReason: string | null = null;
   if (!personalAligned) {
-    mismatchReason = 'Submitted profile name does not match NIN/BVN legal name.';
+    mismatchReason = ninTokens.length === 0 && bvnTokens.length === 0
+      ? 'A verified NIN/BVN legal name is required for name alignment.'
+      : 'Submitted profile name does not match NIN/BVN legal name.';
   } else if (!cacAligned) {
     mismatchReason = 'Entered business name does not match CAC registered company name.';
   } else if (!bankAligned) {
@@ -328,7 +330,7 @@ class PremblyKycAdapter implements KycAdapter {
         image: selfieBase64,
         face_confidence_threshold: 70,
       });
-      return this.interpret(r, { confidence: 94 });
+      return this.interpret(r);
     } catch (e) {
       return { passed: false, provider: this.name, reason: (e as Error).message };
     }
@@ -357,7 +359,7 @@ class PremblyKycAdapter implements KycAdapter {
         image: selfieBase64,
         face_confidence_threshold: 70,
       });
-      return this.interpret(r, { confidence: 93 });
+      return this.interpret(r);
     } catch (e) {
       return { passed: false, provider: this.name, reason: (e as Error).message };
     }
@@ -378,7 +380,7 @@ class PremblyKycAdapter implements KycAdapter {
       if (base.passed && typeof base.confidence === 'number' && base.confidence < 70) {
         return { ...base, passed: false, reason: `LOW_FACE_CONFIDENCE_${base.confidence}` };
       }
-      return { ...base, confidence: base.confidence ?? 91 };
+      return base;
     } catch (e) {
       return { passed: false, provider: this.name, reason: (e as Error).message };
     }
@@ -389,7 +391,7 @@ class PremblyKycAdapter implements KycAdapter {
     try {
       const r = await this.post('/verification/biometrics/face-liveliness', { image: selfieBase64 });
       const base = this.interpret(r);
-      return { ...base, confidence: base.confidence ?? 96 };
+      return base;
     } catch (e) {
       return { passed: false, provider: this.name, reason: (e as Error).message };
     }
@@ -538,7 +540,7 @@ class PremblySandboxAdapter implements KycAdapter {
   readonly name = 'prembly';
 
   private isStrictClosed(): boolean {
-    return process.env.PREMBLY_STRICT_UNCONFIGURED === 'true';
+    return process.env.NODE_ENV === 'production' || process.env.PREMBLY_STRICT_UNCONFIGURED === 'true';
   }
 
   async verifyNin(nin: string): Promise<KycCheckResult> {
@@ -623,7 +625,7 @@ class PremblySandboxAdapter implements KycAdapter {
       provider: this.name,
       reference: `prembly_cac_${norm.formatted}`,
       rcNumber: norm.formatted,
-      companyName: businessName?.trim() || `KENDIBO VERIFIED VENDOR (${norm.formatted}) LTD`,
+      companyName: businessName?.trim() || `Kendibo VERIFIED VENDOR (${norm.formatted}) LTD`,
     };
   }
 
@@ -831,7 +833,7 @@ export const kycService = {
         checks.push({ tier: 1, kind: 'nin_w_face', passed: r.passed, reason: r.reason, confidence: r.confidence });
         if (r.passed) {
           faceVerified = true;
-          faceConfidence = r.confidence ?? 95;
+          faceConfidence = r.confidence;
         }
       } else {
         r = await adapter.verifyNin(input.nin.trim());
@@ -853,7 +855,7 @@ export const kycService = {
         checks.push({ tier: 1, kind: 'bvn_w_face', passed: r.passed, reason: r.reason, confidence: r.confidence });
         if (r.passed) {
           faceVerified = true;
-          faceConfidence = r.confidence ?? 94;
+          faceConfidence = r.confidence;
         }
       } else {
         r = await adapter.verifyBvn(input.bvn.trim());
@@ -882,7 +884,7 @@ export const kycService = {
       if (r.passed) {
         tier2Passed = true;
         faceVerified = true;
-        faceConfidence = r.confidence ?? faceConfidence ?? 92;
+        faceConfidence = r.confidence ?? faceConfidence;
       }
     } else if (selfieB64 && adapter.verifyFaceLiveness) {
       const r = await adapter.verifyFaceLiveness(selfieB64);
@@ -891,7 +893,7 @@ export const kycService = {
       if (r.passed) {
         tier2Passed = true;
         faceVerified = true;
-        faceConfidence = r.confidence ?? faceConfidence ?? 96;
+        faceConfidence = r.confidence ?? faceConfidence;
       }
     } else if (faceVerified) {
       tier2Passed = true;
@@ -910,7 +912,7 @@ export const kycService = {
       if (r.passed) {
         cacVerified = true;
         cacNumber = r.rcNumber ?? norm.formatted;
-        cacCompanyName = r.companyName ?? input.businessName;
+        cacCompanyName = r.companyName;
         if (tier2Passed) tierReached = 3;
       }
     } else if (tier2Passed && docs.some((d) => d.kind === 'address')) {
@@ -930,9 +932,9 @@ export const kycService = {
     const nameAlignment = verifyNameAlignment({
       submittedName: input.submittedName,
       businessName: input.businessName,
-      ninLegalName: ninLegalName ?? input.submittedName,
-      bvnLegalName: bvnLegalName ?? input.submittedName,
-      cacCompanyName: cacCompanyName ?? input.businessName,
+      ninLegalName,
+      bvnLegalName,
+      cacCompanyName,
       bankAccountName: input.bankAccountName,
     });
 
@@ -1259,7 +1261,7 @@ export const kycService = {
       cacNumber: r.cac_number ? String(r.cac_number) : null,
       cacCompanyName: r.cac_company_name ? String(r.cac_company_name) : null,
       cacVerified: Boolean(r.cac_verified),
-      verifiedLegalName: r.verified_legal_name ? String(r.verified_legal_name) : (r.user_name ? String(r.user_name) : null),
+      verifiedLegalName: r.verified_legal_name ? String(r.verified_legal_name) : null,
       faceVerified: Boolean(r.face_verified),
       faceConfidence: r.face_confidence != null ? Number(r.face_confidence) : null,
       nameAligned: r.name_aligned != null ? Boolean(r.name_aligned) : false,
@@ -1445,11 +1447,8 @@ export const kycService = {
         const bankCode = String(args.bankCode ?? '');
         const bankRes = adapter.verifyBankAccount
           ? await adapter.verifyBankAccount(accountNumber, bankCode)
-          : { passed: true, provider: adapter.name, verifiedName: undefined };
-        const resolvedAccountName =
-          bankRes.verifiedName ||
-          (typeof args.bankAccountName === 'string' ? args.bankAccountName : undefined) ||
-          (typeof args.submittedName === 'string' ? args.submittedName : undefined);
+          : { passed: false, provider: adapter.name, verifiedName: undefined };
+        const resolvedAccountName = bankRes.verifiedName;
         const alignment = verifyNameAlignment({
           submittedName: typeof args.submittedName === 'string' ? args.submittedName : undefined,
           businessName: typeof args.businessName === 'string' ? args.businessName : undefined,
@@ -1458,7 +1457,7 @@ export const kycService = {
           bankAccountName: resolvedAccountName,
         });
         return {
-          passed: bankRes.passed && alignment.aligned,
+          passed: bankRes.passed && Boolean(resolvedAccountName) && alignment.aligned,
           provider: adapter.name,
           accountName: resolvedAccountName,
           alignment,

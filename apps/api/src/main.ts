@@ -891,6 +891,9 @@ app.get('/v1/wallet', async (req, reply) => {
 });
 app.post('/v1/wallet/topup', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  // Checkout callbacks are not yet reconciled into wallet credits. Do not
+  // collect real money until that flow is implemented and verified.
+  if (process.env.NODE_ENV === 'production') return fail(reply, 'WALLET_TOPUP_UNAVAILABLE', 'Wallet top-ups are temporarily unavailable', 503);
   const idem = req.headers['idempotency-key'];
   if (typeof idem !== 'string') return fail(reply, 'IDEMPOTENCY_REQUIRED', 'Idempotency-Key header required');
   const parsed = z.object({ amountKobo: z.number().int().min(100).max(50000000) }).safeParse(req.body);
@@ -1872,7 +1875,7 @@ app.post('/v1/payouts/resolve-account', async (req, reply) => {
         userProfile?.name ||
         businessName ||
         provProfile?.businessName ||
-        'KENDIBO VERIFIED VENDOR'
+        'Kendibo VERIFIED VENDOR'
       ).toUpperCase();
       r = { valid: true, accountName: fallbackName };
     }
@@ -1882,8 +1885,8 @@ app.post('/v1/payouts/resolve-account', async (req, reply) => {
   const alignment = kycService.verifyNameAlignment({
     submittedName: userProfile?.name ?? undefined,
     businessName: businessName ?? provProfile?.businessName ?? undefined,
-    ninLegalName: provProfile?.verifiedLegalName ?? userProfile?.name ?? undefined,
-    cacCompanyName: provProfile?.cacCompanyName ?? businessName ?? provProfile?.businessName ?? undefined,
+    ninLegalName: provProfile?.verifiedLegalName ?? undefined,
+    cacCompanyName: provProfile?.cacCompanyName ?? undefined,
     bankAccountName: r.accountName,
   });
 
@@ -2343,7 +2346,7 @@ for (const step of [['accept', 'PROVIDER_ACCEPTED'], ['arrive', 'ARRIVED'], ['st
               : `booking.${step[0]}`;
         void slingAutomationService.triggerEvent(evt, b.userId, {
           jobId,
-          provider: actor ?? 'Your KENDIBO Technician',
+          provider: actor ?? 'Your Kendibo Technician',
           service: b.serviceId,
         }).catch(() => {});
       }
