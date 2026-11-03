@@ -103,6 +103,23 @@ describe('understanding layer', () => {
 });
 
 describe('conversations through the router (no LLM)', () => {
+  it('does not cancel a draft from a predicted intent without customer confirmation', async () => {
+    const w = number();
+    await tap(w, 'menu:book', 'Book a service');
+    await tap(w, 'cancel:confirm', 'Yes, cancel');
+    assert.equal((await draftOf(w)).status, 'collecting');
+    const reply = await botReply(w, () => say(w, 'any progress on the request I submitted'));
+    assert.equal((await draftOf(w)).status, 'collecting');
+    if (/cancel your request/i.test(reply)) {
+      await tap(w, 'cancel:keep', 'Keep request');
+      assert.equal((await draftOf(w)).status, 'collecting');
+    }
+    await say(w, 'cancel my booking');
+    assert.equal((await draftOf(w)).status, 'collecting');
+    await tap(w, 'cancel:confirm', 'Yes, cancel');
+    assert.equal((await draftOf(w)).status, 'abandoned');
+  });
+
   it('keeps a misspelled appliance problem in the active booking instead of showing status', async () => {
     const w = number();
     await tap(w, 'menu:book', 'Book a service');

@@ -372,6 +372,16 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
         await handOff(s, user.id, to, 'asked for a person from the menu');
       } else if (id === 'flow:resume') {
         if (draft) await sendStep(to, draft, s.data); else await sendMenu(to);
+      } else if (id === 'cancel:confirm') {
+        if (draft && s.data.cancelDraftId === draft.id) {
+          await cancelDraft(draft.id);
+          s.data = { lang: s.data.lang };
+          await sendMenu(to, 'Cancelled. Nothing was sent to vendors.');
+        } else await sendMenu(to, 'That cancellation confirmation has expired.');
+      } else if (id === 'cancel:keep') {
+        delete s.data.cancelDraftId;
+        if (draft) await sendStep(to, draft, s.data, 'Your request is still in progress.');
+        else await sendMenu(to);
       } else if (id === 'flow:confirm' && !draft) {
         await sendMenu(to, 'That request has already been sent. Want to do something else?');
       } else if (id.startsWith('flow:') || id.startsWith('cat:')) {
@@ -464,9 +474,11 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
     await sendStatus(to, user.id, draft);
   } else if (u.intent === 'cancel') {
     if (draft) {
-      await cancelDraft(draft.id);
-      s.data = { lang: s.data.lang };
-      await sendMenu(to, 'Cancelled. Nothing was sent to vendors.');
+      s.data.cancelDraftId = draft.id;
+      await wa.buttons(to, 'Would you like to cancel your request in progress?', [
+        { id: 'cancel:confirm', title: 'Yes, cancel' },
+        { id: 'cancel:keep', title: 'Keep request' },
+      ]);
     } else {
       await sendMenu(to, 'To cancel a booking that is already confirmed, open the Kendibo app and go to Bookings, or type "agent" and we\'ll do it for you.');
     }
