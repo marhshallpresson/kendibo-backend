@@ -247,14 +247,31 @@ export async function notifyProviderOfOffer(providerPhone: string, offerId: stri
 }
 
 // ── Inbound ──────────────────────────────────────────────────────────────────
+async function storeInbound(m: InboundMessage, profileName?: string): Promise<boolean> {
+  // Only a duplicate may be ignored. A database error must reach the webhook
+  // handler so Meta retries instead of losing the message after a 200 response.
+  const rows = await q<{ message_id: string }>(
+    `INSERT INTO messaging.whatsapp_inbound (message_id, wa_id, payload, profile_name) VALUES ($1,$2,$3,$4)
+     ON CONFLICT (message_id) DO NOTHING RETURNING message_id`,
+    [m.id, m.from, JSON.stringify(m), profileName ?? null],
+  );
+  return Boolean(rows[0]);
+}
+
 export async function handleInbound(m: InboundMessage, profileName?: string): Promise<void> {
-  // At-least-once delivery: the message id is the idempotency key.
-  try {
-    await q(`INSERT INTO messaging.whatsapp_inbound (message_id, wa_id, payload, profile_name) VALUES ($1,$2,$3,$4)`,
-      [m.id, m.from, JSON.stringify(m), profileName ?? null]);
-  } catch { return; }
+  if (!(await storeInbound(m, profileName))) return;
   void wa.markRead(m.id);
   await runSerially(m.from, () => processAndMark(m, profileName));
+}
+
+/** Persist before acknowledging the webhook; process the saved message in the background. */
+export async function enqueueInbound(m: InboundMessage, profileName?: string): Promise<void> {
+  if (!(await storeInbound(m, profileName))) return;
+  void wa.markRead(m.id);
+  void runSerially(m.from, () => processAndMark(m, profileName)).catch((e) => {
+    observability.captureException(e);
+    console.error('[whatsapp] inbound processing failed; message remains queued');
+  });
 }
 
 async function processAndMark(m: InboundMessage, profileName?: string) {
@@ -263,7 +280,10 @@ async function processAndMark(m: InboundMessage, profileName?: string) {
     await processInbound(m, profileName);
   } catch (e) {
     observability.captureException(e);
-    await wa.text(m.from, 'Something went wrong on our side. Please try again in a moment, or type "agent" to reach a person.').catch(() => undefined);
+    console.error('[whatsapp] inbound processing failed');
+    // If even the fallback cannot be delivered, leave the message unprocessed
+    // for the bounded recovery sweep instead of silently discarding it.
+    await wa.text(m.from, 'Something went wrong on our side. Please try again in a moment, or type "agent" to reach a person.');
   }
   // Processed (or answered with an apology): the sweeper only retries turns a crash cut short.
   await q(`UPDATE messaging.whatsapp_inbound SET processed_at=now() WHERE message_id=$1`, [m.id]).catch(() => undefined);

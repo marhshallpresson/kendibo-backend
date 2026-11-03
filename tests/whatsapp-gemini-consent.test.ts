@@ -75,3 +75,16 @@ test('a newer account-wide opt-out wins, and re-enabling job offers does not ena
   assert.equal(await hasJobOfferConsent(number), true);
   assert.equal((await notificationService.getUserPreferences(user.id)).promo, false);
 });
+
+test('production refuses a WhatsApp send when credentials are absent', async () => {
+  const oldEnv = process.env.NODE_ENV, token = process.env.WHATSAPP_ACCESS_TOKEN, phone = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  process.env.NODE_ENV = 'production'; process.env.WHATSAPP_ACCESS_TOKEN = ''; process.env.WHATSAPP_PHONE_NUMBER_ID = '';
+  try {
+    const { wa } = await import('../modules/whatsapp/whatsapp.client.js');
+    await assert.rejects(wa.text('2349010000001', 'test'), /WHATSAPP_NOT_CONFIGURED/);
+  } finally {
+    if (oldEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = oldEnv;
+    if (token === undefined) delete process.env.WHATSAPP_ACCESS_TOKEN; else process.env.WHATSAPP_ACCESS_TOKEN = token;
+    if (phone === undefined) delete process.env.WHATSAPP_PHONE_NUMBER_ID; else process.env.WHATSAPP_PHONE_NUMBER_ID = phone;
+  }
+});

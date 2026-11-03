@@ -74,6 +74,23 @@ describe('WhatsApp message templates', () => {
     assert.equal(row?.reason, 'INVALID_FORMAT');
   });
 
+  it('returns a retryable error when an inbound message cannot be persisted', async () => {
+    const payload = JSON.stringify({ entry: [{ changes: [{ field: 'messages', value: { messages: [{ from: number(), type: 'text', text: { body: 'hello' } }] } }] }] });
+    const r = await app.inject({ method: 'POST', url: '/webhooks/whatsapp', payload, headers: { 'content-type': 'application/json', 'x-hub-signature-256': sign(payload) } });
+    assert.equal(r.statusCode, 503);
+    assert.equal(r.json().error.code, 'WHATSAPP_INBOUND_UNAVAILABLE');
+  });
+
+  it('stores a signed inbound message before acknowledging it and deduplicates retries', async () => {
+    const id = `wamid.${randomUUID()}`;
+    const payload = JSON.stringify({ entry: [{ changes: [{ field: 'messages', value: { messages: [{ id, from: number(), type: 'text', text: { body: 'hello' } }] } }] }] });
+    const options = { method: 'POST', url: '/webhooks/whatsapp', payload, headers: { 'content-type': 'application/json', 'x-hub-signature-256': sign(payload) } };
+    assert.equal((await app.inject(options)).statusCode, 200);
+    assert.equal((await app.inject(options)).statusCode, 200);
+    const rows = await q<{ n: string }>(`SELECT COUNT(*) AS n FROM messaging.whatsapp_inbound WHERE message_id=$1`, [id]);
+    assert.equal(Number(rows[0].n), 1);
+  });
+
   it('outside the 24h window an approved template is used instead of SMS', async () => {
     const { applyTemplateWebhook } = await import('../modules/whatsapp/templates.js');
     await applyTemplateWebhook('message_template_status_update', { message_template_id: 555001, message_template_name: 'kendibo_job_offer', message_template_language: 'en', event: 'APPROVED' });

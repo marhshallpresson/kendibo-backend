@@ -19,7 +19,7 @@ import { Readable } from 'node:stream';
 import { verifySubscription, verifySignature } from '../../../modules/whatsapp/whatsapp.client.js';
 import { verifyLink } from '../../../modules/whatsapp/links.js';
 import { renderLocationPage, renderVendorsPage, renderMessagePage, pageCsp } from '../../../modules/whatsapp/web-pages.js';
-import { handleInbound, continueAfterLocation, startInboundSweeper, payLinkTarget, type InboundMessage } from '../../../modules/whatsapp/whatsapp.bot.js';
+import { enqueueInbound, continueAfterLocation, startInboundSweeper, payLinkTarget, type InboundMessage } from '../../../modules/whatsapp/whatsapp.bot.js';
 import { applyTemplateWebhook, startTemplateStatusSync } from '../../../modules/whatsapp/templates.js';
 import { saveDraftLocation } from '../../../modules/whatsapp/draft.js';
 import { notifyCustomer } from '../../../modules/whatsapp/policy.js';
@@ -433,7 +433,13 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
         const contacts = change.value?.contacts ?? [];
         for (const m of change.value?.messages ?? []) {
           const name = contacts.find((c) => c.wa_id === m.from)?.profile?.name;
-          jobs.push(handleInbound(m, name).catch((e) => observability.captureException(e)));
+          try {
+            await enqueueInbound(m, name);
+          } catch (e) {
+            observability.captureException(e);
+            req.log.error('[whatsapp] unable to persist inbound message');
+            return h.fail(reply, 'WHATSAPP_INBOUND_UNAVAILABLE', 'Unable to accept webhook', 503, true);
+          }
         }
       }
     }

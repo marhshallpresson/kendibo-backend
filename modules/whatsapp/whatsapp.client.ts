@@ -66,8 +66,9 @@ async function send(to: string, payload: Record<string, unknown>, record = true)
     if (process.env.NODE_ENV !== 'production') {
       console.log(`[whatsapp:dev] -> ${to.slice(0, 6)}… ${JSON.stringify(payload).slice(0, 200)}`);
       if (record) await sentHook?.(to, summarise(payload));
+      return;
     }
-    return;
+    throw new Error('WHATSAPP_NOT_CONFIGURED');
   }
   const res = await fetch(`https://graph.facebook.com/${c.version}/${c.phoneNumberId}/messages`, {
     method: 'POST',
