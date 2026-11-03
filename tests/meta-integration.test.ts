@@ -39,6 +39,29 @@ async function botTurns(waId: string) {
 }
 
 describe('WhatsApp message templates', () => {
+  it('exposes the configured Kendibot link only after promotion is enabled', async () => {
+    const keys = ['KENDIBOT_PROMOTION_ENABLED', 'WHATSAPP_BUSINESS_NUMBER', 'WHATSAPP_ACCESS_TOKEN', 'WHATSAPP_PHONE_NUMBER_ID'] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    try {
+      process.env.KENDIBOT_PROMOTION_ENABLED = 'false';
+      process.env.WHATSAPP_BUSINESS_NUMBER = '+234 800 123 4567';
+      process.env.WHATSAPP_ACCESS_TOKEN = 'test-token';
+      process.env.WHATSAPP_PHONE_NUMBER_ID = '123';
+      let response = await app.inject({ method: 'GET', url: '/v1/kendibot' });
+      assert.deepEqual(response.json().data, { enabled: false, url: null });
+      process.env.KENDIBOT_PROMOTION_ENABLED = 'true';
+      response = await app.inject({ method: 'GET', url: '/v1/kendibot' });
+      assert.deepEqual(response.json().data, { enabled: true, url: 'https://wa.me/2348001234567?text=Hello' });
+      process.env.WHATSAPP_BUSINESS_NUMBER = 'invalid';
+      response = await app.inject({ method: 'GET', url: '/v1/kendibot' });
+      assert.deepEqual(response.json().data, { enabled: false, url: null });
+    } finally {
+      for (const key of keys) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+    }
+  });
   it('follows Meta status webhooks and only sends approved templates', async () => {
     const { applyTemplateWebhook, approvedTemplate } = await import('../modules/whatsapp/templates.js');
     const base = { message_template_id: 555001, message_template_name: 'kendibo_job_offer', message_template_language: 'en' };

@@ -63,7 +63,7 @@ const MENU_BUTTONS = [
   { id: 'menu:bookings', title: 'My bookings' },
   { id: 'menu:help', title: 'Talk to a person' },
 ];
-const DISCLOSURE = 'I\'m Kendibo\'s automated assistant. Type "agent" any time to reach a person.';
+const DISCLOSURE = 'I\'m Kendibot, Kendibo\'s automated assistant. Type "agent" any time to reach a person.';
 const EMPTY_DRAFT: Draft = {
   id: '', need: null, category_id: null, service_id: null, budget_kobo: null, photo_asset_ids: [], lat: null, lng: null,
   address_text: null, landmark: null, scheduled_date: null, time_window: null, request_id: null,
@@ -132,7 +132,7 @@ const replyText = (m: InboundMessage) =>
 
 // ── Replies ──────────────────────────────────────────────────────────────────
 async function sendWelcome(to: string, name?: string) {
-  await wa.buttons(to, `${firstName(name) ? `Hi ${firstName(name)}! ` : 'Hi! '}I'm Kendibo's automated assistant. I can book a verified pro for cleaning, AC, plumbing, electrical, generator, appliance and pest jobs, and check your bookings. Type "agent" any time to reach a person.\n\nTo book, tell me what needs doing. A photo, your budget and when you want it done all help.\n\nVendors: reply START OFFERS to receive job offers by WhatsApp or SMS. Reply STOP to opt out.`, MENU_BUTTONS);
+  await wa.buttons(to, `${firstName(name) ? `Hi ${firstName(name)}! ` : 'Hi! '}I'm Kendibot, Kendibo's automated assistant. I can help you request a home-service pro and check your bookings, right here in WhatsApp. Type "agent" any time to reach a person.\n\nTo get started, tell me what needs doing. A photo, your budget and when you want it done all help. You'll confirm your request before it's sent.\n\nVendors: reply START OFFERS to receive job offers by WhatsApp or SMS. Reply STOP to opt out.`, MENU_BUTTONS);
 }
 const sendMenu = (to: string, body = 'What would you like to do?') => wa.buttons(to, body, MENU_BUTTONS);
 
