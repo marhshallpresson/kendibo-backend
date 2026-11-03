@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { callGemini } from '../modules/whatsapp/gemini-agent.js';
 import { hasJobOfferConsent, setJobOfferConsent, sendBusinessInitiated } from '../modules/whatsapp/policy.js';
+import { q } from '../packages/database/db.js';
 
 test('Gemini receives server tools and returns a tool call without executing it', async () => {
   const original = globalThis.fetch;
@@ -59,4 +60,18 @@ test('Gemini receives the prior function signature and server result on the next
     globalThis.fetch = original;
     if (key === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = key;
   }
+});
+
+test('a newer account-wide opt-out wins, and re-enabling job offers does not enable other promotions', async () => {
+  const number = '2349010000002';
+  const user = (await q<{ id: string }>(`INSERT INTO identity.users (phone) VALUES ($1) RETURNING id`, [`+${number}`]))[0];
+  const { notificationService } = await import('../modules/notifications/notification.service.js');
+  await setJobOfferConsent(number, true);
+  await new Promise(r => setTimeout(r, 10));
+  await notificationService.updateUserPreferences(user.id, { promo: false });
+  assert.equal(await hasJobOfferConsent(number), false);
+  await new Promise(r => setTimeout(r, 10));
+  await setJobOfferConsent(number, true);
+  assert.equal(await hasJobOfferConsent(number), true);
+  assert.equal((await notificationService.getUserPreferences(user.id)).promo, false);
 });

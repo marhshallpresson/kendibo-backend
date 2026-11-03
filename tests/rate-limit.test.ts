@@ -11,5 +11,9 @@ test('OTP verification is rate limited without contacting a provider', async () 
     }
     assert.equal(response?.statusCode, 429);
     assert.equal(response?.json().error.code, 'RATE_LIMIT');
+    for (let i = 0; i < 101; i++) {
+      response = await app.inject({ method: 'GET', url: '/health/live', remoteAddress: '192.0.2.43' });
+    }
+    assert.equal(response?.statusCode, 429, 'global per-IP limit applies to normal routes');
   } finally { await app.close(); }
 });

@@ -299,9 +299,7 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
     return;
   }
   if (!id && OPT_IN.test(lower)) {
-    const { notificationService } = await import('../notifications/notification.service.js');
     await setJobOfferConsent(to, true);
-    await notificationService.updateUserPreferences(user.id, { promo: true });
     emit('whatsapp.opt_in', { userId: user.id });
     await wa.text(to, "You've opted in to Kendibo job offers by WhatsApp or SMS. Reply STOP any time to opt out.");
     return;

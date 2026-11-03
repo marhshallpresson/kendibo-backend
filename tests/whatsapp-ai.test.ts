@@ -191,6 +191,8 @@ describe('WhatsApp marketing opt-out', () => {
     assert.ok(user, 'the WhatsApp number has an account');
     assert.equal((await notificationService.getUserPreferences(String(user.id))).promo, false);
     await handleInbound({ id: `wamid.${randomUUID()}`, from: waId, type: 'text', text: { body: 'start offers' } });
-    assert.equal((await notificationService.getUserPreferences(String(user.id))).promo, true);
+    assert.equal((await notificationService.getUserPreferences(String(user.id))).promo, false, 'job-offer opt-in must not enable unrelated promotions');
+    const { hasJobOfferConsent } = await import('../modules/whatsapp/policy.js');
+    assert.equal(await hasJobOfferConsent(waId), true);
   });
 });
