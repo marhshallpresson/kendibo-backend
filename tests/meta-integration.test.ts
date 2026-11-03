@@ -44,6 +44,8 @@ describe('WhatsApp message templates', () => {
     const base = { message_template_id: 555001, message_template_name: 'kendibo_job_offer', message_template_language: 'en' };
     assert.equal(await approvedTemplate('job_offer'), null, 'nothing is sent before review');
     await applyTemplateWebhook('message_template_status_update', { ...base, event: 'APPROVED', reason: 'NONE' });
+    assert.equal(await approvedTemplate('job_offer'), null, 'a missing category must not be assumed to be utility');
+    await applyTemplateWebhook('template_category_update', { ...base, new_category: 'UTILITY' });
     assert.deepEqual(await approvedTemplate('job_offer'), { name: 'kendibo_job_offer', language: 'en' });
     await applyTemplateWebhook('message_template_status_update', { ...base, event: 'PAUSED', reason: 'LOW_QUALITY' });
     assert.equal(await approvedTemplate('job_offer'), null, 'paused templates are not sent');
@@ -55,6 +57,8 @@ describe('WhatsApp message templates', () => {
     assert.equal(row.category, 'MARKETING');
     assert.equal(row.quality, 'YELLOW');
     assert.equal(row.status, 'APPROVED');
+    assert.equal(await approvedTemplate('job_offer'), null, 'marketing cannot be used without the consent gate');
+    assert.ok(await approvedTemplate('job_offer', true), 'the marketing template can be selected after consent is checked');
   });
 
   it('a template webhook through the signed endpoint updates the status', async () => {
@@ -77,6 +81,8 @@ describe('WhatsApp message templates', () => {
     await applyTemplateWebhook('template_category_update', { message_template_id: 555001, message_template_name: 'kendibo_job_offer', message_template_language: 'en', new_category: 'UTILITY' });
     const { notifyProviderOfOffer } = await import('../modules/whatsapp/whatsapp.bot.js');
     const v = number();
+    const { setJobOfferConsent } = await import('../modules/whatsapp/policy.js');
+    await setJobOfferConsent(v, true);
     await notifyProviderOfOffer(`+${v}`, randomUUID(), 'AC repair, 2 km away');
     assert.ok((await botTurns(v)).some((t) => t.includes('[template kendibo_job_offer]')));
   });

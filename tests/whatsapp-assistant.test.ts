@@ -197,6 +197,8 @@ describe('message policy', () => {
   it('outside the 24h window a job offer goes by SMS, inside it by WhatsApp buttons', async () => {
     const { notifyProviderOfOffer } = await bot();
     const v = number();
+    const { setJobOfferConsent } = await import('../modules/whatsapp/policy.js');
+    await setJobOfferConsent(v, true);
     const before = await botReply(v, () => notifyProviderOfOffer(`+${v}`, randomUUID(), 'AC repair, 2 km away'));
     assert.equal(before, '', 'no free-form WhatsApp message to someone who has not written in 24h');
     await q(`INSERT INTO messaging.whatsapp_inbound (message_id, wa_id) VALUES ($1,$2)`, [`wamid.${randomUUID()}`, v]);

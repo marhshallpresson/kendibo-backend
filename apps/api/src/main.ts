@@ -86,11 +86,13 @@ void app.register(helmet, {
   hsts: { maxAge: 31536000, includeSubDomains: true, preload: true }, // Strict encrypted rails
   contentSecurityPolicy: PROD,
 });
-void app.register(rateLimit, {
+// Install the onRoute hook before routes are declared; a queued register()
+// runs too late for the synchronously declared routes in this module.
+void rateLimit(app, {
   max: 100,
   timeWindow: '1 minute',
-  errorResponseBuilder: () => ({ error: { code: 'RATE_LIMIT', message: 'Too many requests' } }),
-});
+  errorResponseBuilder: (_req, context) => ({ statusCode: context.statusCode, error: { code: 'RATE_LIMIT', message: 'Too many requests' } }),
+}, () => {});
 
 // Prod CORS: explicit allowlist only (deployed app origins + Pxxl dashboard
 // CORS_ORIGINS). DEFAULT_CORS_ORIGINS is hardcoded so a missing/legacy env
@@ -349,21 +351,24 @@ app.post('/v1/auth/otp/request', OTP_LIMIT, async (req, reply) => {
     const r = await identityService.requestOtp(channel, identity);
     return { data: { sent: true, devCode: r.devCode } };
   } catch (e: unknown) {
+    if (e instanceof z.ZodError) return fail(reply, 'BAD_REQUEST', 'Enter a valid phone number or email address.', 400);
     const msg = (e as Error).message;
     if (msg === 'BAD_IDENTITY') return fail(reply, 'BAD_IDENTITY', 'Enter a valid phone number or email address.');
     if (msg === 'SEND_FAILED') return fail(reply, 'SEND_FAILED', 'Could not deliver the code. Try again.', 502, true);
     throw e;
   }
 });
-app.post('/v1/auth/otp/verify', { config: { rateLimit: { max: 10, timeWindow: '10 minutes' } } }, async (req) => {
-  const { channel, identity, code, device, name, role } = z.object({
+app.post('/v1/auth/otp/verify', { config: { rateLimit: { max: 10, timeWindow: '10 minutes' } } }, async (req, reply) => {
+  const parsed = z.object({
     channel: z.enum(['phone', 'email']), identity: z.string(), code: z.string(),
     name: z.string().optional(), role: z.string().optional(),
     device: z.object({
       fp: z.string().optional(), platform: z.string().optional(), model: z.string().optional(),
       os: z.string().optional(), appVersion: z.string().optional(), city: z.string().optional(),
     }).optional(),
-  }).parse(req.body);
+  }).safeParse(req.body);
+  if (!parsed.success) return fail(reply, 'BAD_REQUEST', 'Enter a valid verification code and identity.', 400);
+  const { channel, identity, code, device, name, role } = parsed.data;
   const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip;
   const s = await identityService.verifyOtp(channel, identity, code, { ...device, ip, name, role });
   if (!s) return { error: { code: 'BAD_OTP', message: 'Invalid or expired code', retryable: false } };

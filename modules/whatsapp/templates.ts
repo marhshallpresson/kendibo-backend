@@ -110,6 +110,23 @@ export async function syncTemplateStatuses(): Promise<TemplateRow[]> {
   return templateRows();
 }
 
+let syncTimer: NodeJS.Timeout | null = null;
+/** Refresh approvals and categories even if a Meta webhook was missed. */
+export function startTemplateStatusSync(intervalMs = 15 * 60_000): void {
+  if (syncTimer || !templateApiConfigured()) return;
+  let running = false;
+  const run = async () => {
+    if (running) return;
+    running = true;
+    try { await syncTemplateStatuses(); }
+    catch { emit('whatsapp.template_sync_failed', {}); }
+    finally { running = false; }
+  };
+  void run();
+  syncTimer = setInterval(() => { void run(); }, intervalMs);
+  syncTimer.unref?.();
+}
+
 /** Submit catalogue templates that Meta doesn't have yet (they start PENDING review). */
 export async function submitMissingTemplates(): Promise<{ submitted: string[]; existing: string[]; errors: { name: string; error: string }[] }> {
   const remote = await remoteTemplates();
@@ -143,10 +160,11 @@ export async function templateRows(): Promise<TemplateRow[]> {
 }
 
 /** The template to send for `key`, or null if Meta hasn't approved it. */
-export async function approvedTemplate(key: TemplateKey): Promise<{ name: string; language: string } | null> {
+export async function approvedTemplate(key: TemplateKey, allowMarketing = false): Promise<{ name: string; language: string } | null> {
   const t = templateDef(key);
   const rows = await q<{ status: string; category: string | null }>(`SELECT status, category FROM messaging.whatsapp_template WHERE name=$1 AND language=$2`, [t.name, t.language]).catch(() => []);
-  const ok = rows[0] && SENDABLE.has(String(rows[0].status)) && String(rows[0].category ?? 'UTILITY').toUpperCase() === 'UTILITY';
+  const category = String(rows[0]?.category ?? '').toUpperCase();
+  const ok = rows[0] && SENDABLE.has(String(rows[0].status)) && (category === 'UTILITY' || (allowMarketing && key === 'job_offer' && category === 'MARKETING'));
   return ok ? { name: t.name, language: t.language } : null;
 }
 
