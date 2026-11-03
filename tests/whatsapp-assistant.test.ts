@@ -103,6 +103,16 @@ describe('understanding layer', () => {
 });
 
 describe('conversations through the router (no LLM)', () => {
+  it('keeps a misspelled appliance problem in the active booking instead of showing status', async () => {
+    const w = number();
+    await tap(w, 'menu:book', 'Book a service');
+    const r = await botReply(w, () => say(w, 'Omo my frezzer is not working'));
+    const d = await draftOf(w);
+    assert.equal(d.need, 'Omo my frezzer is not working');
+    assert.equal(d.category_id, 'appliance');
+    assert.doesNotMatch(r, /You have no bookings yet/);
+  });
+
   it('first contact says it is an automated assistant and offers the menu', async () => {
     const w = number();
     const r = await botReply(w, () => say(w, 'hi'));

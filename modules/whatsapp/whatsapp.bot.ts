@@ -438,6 +438,10 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
   // ── Text ──────────────────────────────────────────────────────────────────
   const step: Step | null = draft ? nextStep(draft, s.data) : null;
   const u = await understand(text, { expectingBudget: step === 'budget' });
+  // Do not treat an uncertain status prediction as a status request while asking for the job description.
+  if (draft && step === 'need' && u.intent === 'status' && !u.sure && !/\b(bookings?|orders?|requests?|jobs?|vendor|technician|appointment|status|update|history)\b/i.test(text)) {
+    u.intent = 'details';
+  }
   s.data.lang = u.language === 'pcm' ? 'pcm' : (s.data.lang ?? 'en');
   let route = 'flow';
   const lead = (x: string) => (firstContact ? `${DISCLOSURE}\n\n${x}`.trim() : x);

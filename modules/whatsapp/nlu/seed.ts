@@ -640,7 +640,7 @@ export const TRADE_LEXICON: [Trade, RegExp, number][] = [
   ['handyman', /\b(carpenter\w*|handyman|painter|painting|paint)\b/, 3],
   ['ac', /\b(ac|a\/c) (technician|repair\w*|servic\w*|install\w*)\b/, 3],
   ['appliance', /\bappliances?\b/, 3],
-  ['appliance', /\b(fridge|freezer|refrigerator|washing machine|washer|cooker|oven|microwave|television|tv set|blender)\b/, 2],
+  ['appliance', /\b(fridge|freezer|frezzer|refrigerator|washing machine|washer|cooker|oven|microwave|television|tv set|blender)\b/, 2],
   ['ac', /\b(a\/?c|air ?con\w*|air condition\w*|split units?|standing units?)\b/, 2],
   ['generator', /\b(gen|generators?|carbur\w+|spark plugs?)\b/, 2],
   ['pest', /\b(cockroach\w*|roach\w*|rats?|rodents?|mice|termites?|bed ?bugs?|mosquito\w*|ants)\b/, 2],
