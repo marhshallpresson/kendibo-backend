@@ -10,7 +10,7 @@ const MATRIX: { when: string; match: (s: JobStatus, ctx: { providerFault?: boole
   { when: 'work_started', match: (s) => ['INSPECTION', 'PRE_SERVICE', 'IN_PROGRESS', 'AWAITING_APPROVAL'].includes(s) ? { refundBps: 5000, calloutApplies: true, note: 'Refund based on performed work' } : null },
 ];
 export function evaluateCancellation(status: JobStatus, ctx: { providerFault?: boolean; kendiboFault?: boolean } = {}): CancelOutcome {
-  if (ctx.providerFault || ctx.kendiboFault) return { refundBps: 10000, calloutApplies: false, note: 'Full refund: provider/KENDIBO fault' };
+  if (ctx.providerFault || ctx.kendiboFault) return { refundBps: 10000, calloutApplies: false, note: 'Full refund: provider/Kendibo fault' };
   for (const row of MATRIX) { const o = row.match(status, ctx); if (o) return o; }
   return { refundBps: 0, calloutApplies: false, note: 'Post-completion: use dispute flow' };
 }

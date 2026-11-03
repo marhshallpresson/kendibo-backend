@@ -138,7 +138,7 @@ export class EmailAdapter implements EmailPort {
   private readonly smtpSecure = (process.env.SMTP_SECURE ?? 'true') !== 'false';
   private readonly smtpUser = process.env.SMTP_USER || '';
   private readonly smtpPass = process.env.SMTP_PASS || '';
-  private readonly from = process.env.EMAIL_FROM || (this.smtpUser ? `KENDIBO <${this.smtpUser}>` : 'KENDIBO <hello@kendibo.com>');
+  private readonly from = process.env.EMAIL_FROM || (this.smtpUser ? `Kendibo <${this.smtpUser}>` : 'Kendibo <hello@kendibo.com>');
   private transporter: Transporter | null = null;
 
   constructor(private readonly sling: SlingClient = slingClient) {}

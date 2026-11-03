@@ -1,4 +1,4 @@
-// KENDIBO WhatsApp AI agent: the fallback for free text the understanding
+// Kendibo WhatsApp AI agent: the fallback for free text the understanding
 // layer (nlu/) is not sure about. The router (whatsapp.bot.ts) handles
 // greetings, the booking steps, common questions and off-topic requests on its
 // own and only calls this when understanding the message needs a model.
@@ -15,6 +15,7 @@
 // (max MAX_STEPS). If the AI is not configured or fails, the router answers
 // with its own clarifying prompt instead.
 import Anthropic from '@anthropic-ai/sdk';
+import { callGemini } from './gemini-agent.js';
 import { q } from '../../packages/database/db.js';
 import { emit } from '../../packages/observability/emit.js';
 import { observability } from '../../packages/observability/watchup.adapter.js';
@@ -29,7 +30,7 @@ const MODEL = () => (process.env.WHATSAPP_AI_MODEL || 'claude-opus-5-5').trim();
 const MAX_STEPS = 6;
 const MEMORY_TURNS = 12;
 
-export const aiConfigured = () => !!(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN) || !!llmOverride;
+export const aiConfigured = () => !!(process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN) || !!llmOverride;
 
 // ── LLM seam (tests inject a fake; production uses the SDK) ───────────────
 type CreateParams = Anthropic.Beta.MessageCreateParamsNonStreaming;
@@ -39,6 +40,7 @@ export function setLlmForTests(fn: LlmCall | null) { llmOverride = fn; }
 let client: Anthropic | null = null;
 const callLlm: LlmCall = async (params) => {
   if (llmOverride) return llmOverride(params);
+  if (process.env.GEMINI_API_KEY) return callGemini(params);
   client ??= new Anthropic({ timeout: 25_000, maxRetries: 1 });
   return client.beta.messages.create(params);
 };
@@ -57,7 +59,7 @@ Booking a job (collect in this order, skipping anything already known in the job
 3. Budget in naira if they have one (optional — never pressure).
 4. Location: call request_location to send the map button. Do not ask them to type GPS coordinates.
 5. When (today / tomorrow / a date, and morning / afternoon / evening).
-6. Read the summary back in one short message, then call submit_job_request. It sends them a button to see matched vendors near them.
+6. Call submit_job_request to show the customer a summary and confirmation button. Only the customer's confirmation submits the request.
 Use reply_with_buttons for short choices (max 3 buttons, titles under 20 characters). When you call reply_with_buttons, that IS your message — end your turn without extra text.
 
 Safety and limits
@@ -93,7 +95,7 @@ const TOOLS: Anthropic.Beta.BetaTool[] = [
     },
   },
   { name: 'request_location', description: 'Send the customer a button that opens Kendibo\'s map page to pin the exact job location and landmark. They can also share a WhatsApp location instead.', input_schema: { type: 'object', properties: {}, additionalProperties: false } },
-  { name: 'submit_job_request', description: 'Submit the job once need, trade and location are known. Matches verified vendors nearby and sends the customer a "See vendors" button.', input_schema: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'submit_job_request', description: 'Show the next missing step or the request summary and confirmation button. Only the customer can confirm submission.', input_schema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'get_my_bookings', description: "This customer's latest bookings and requests with status.", input_schema: { type: 'object', properties: {}, additionalProperties: false } },
   {
     name: 'reply_with_buttons',
@@ -170,11 +172,10 @@ async function runTool(name: string, input: Record<string, unknown>, ctx: Ctx): 
       return JSON.stringify({ sent: true, note: 'Wait for the customer to set it; you will be told when it is saved.' });
     }
     case 'submit_job_request': {
-      const miss = missing(ctx.draft).filter((m) => m === 'need' || m === 'trade' || m === 'location');
-      if (miss.length) return JSON.stringify({ error: 'Cannot submit yet', missing: miss });
-      const r = await submitDraft(ctx.waId, ctx.userId, ctx.draft);
+      const { sendStep } = await import('./flow.js');
+      const step = await sendStep(ctx.waId, ctx.draft, { photo: true, budget: true });
       ctx.sentInteractive = true;
-      return JSON.stringify({ submitted: true, requestId: r.requestId, vendorsShown: r.vendors });
+      return JSON.stringify({ submitted: false, step, ...(step !== 'confirm' ? { error: 'Cannot submit yet', missing: missing(ctx.draft) } : {}), note: 'Wait for the customer to confirm using the button.' });
     }
     case 'get_my_bookings': {
       const b = await q<{ service_id: string; status: string; scheduled_at: string | null }>(
@@ -309,6 +310,7 @@ export async function runAgent(input: AgentInput): Promise<boolean> {
 
   // reply_with_buttons already carried the reply; any other tool message (map link,
   // vendors link) is followed by the agent's short text if it wrote one.
+  if (!finalText && !ctx.sentInteractive) return false;
   if (finalText && !ctx.sentButtons) await wa.text(input.waId, finalText);
   return true;
 }

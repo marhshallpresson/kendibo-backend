@@ -1,4 +1,4 @@
-# KENDIBO — Production Backend & Platform Architecture Blueprint
+# Kendibo — Production Backend & Platform Architecture Blueprint
 
 This is the backend architecture I would put in front of a senior engineering team before they write production code.
 
@@ -8,9 +8,9 @@ The mobile application should remain a client of this backend. The React Native/
 
 ---
 
-# 1. What KENDIBO actually is technically
+# 1. What Kendibo actually is technically
 
-KENDIBO is not simply a booking application.
+Kendibo is not simply a booking application.
 
 It is a combination of:
 
@@ -86,7 +86,7 @@ Provider Payable
 Payout
 ```
 
-The supplied plan already defines this correctly: KENDIBO is fundamentally a **three-sided operations platform with a money ledger and job state machine at its core**. 
+The supplied plan already defines this correctly: Kendibo is fundamentally a **three-sided operations platform with a money ledger and job state machine at its core**. 
 
 ---
 
@@ -137,14 +137,14 @@ The supplied plan already defines this correctly: KENDIBO is fundamentally a **t
 The architecture should remain a **modular monolith with three deployables**:
 
 ```text
-KENDIBO Backend
+Kendibo Backend
 │
 ├── API
 ├── Worker
 └── Realtime
 ```
 
-rather than starting with 15 microservices. The supplied architecture explicitly recommends this because KENDIBO's early scale does not justify distributed transactions around money and job state. 
+rather than starting with 15 microservices. The supplied architecture explicitly recommends this because Kendibo's early scale does not justify distributed transactions around money and job state. 
 
 ---
 
@@ -152,7 +152,7 @@ rather than starting with 15 microservices. The supplied architecture explicitly
 
 ```text
                          ┌──────────────────────┐
-                         │   KENDIBO Mobile     │
+                         │   Kendibo Mobile     │
                          │ Customer / Provider  │
                          └──────────┬───────────┘
                                     │
@@ -188,7 +188,7 @@ rather than starting with 15 microservices. The supplied architecture explicitly
 External integrations:
 
 ```text
-                    KENDIBO
+                    Kendibo
                        │
        ┌───────────────┼────────────────┐
        │               │                │
@@ -227,7 +227,7 @@ PaymentPort
    └── FlutterwaveAdapter
 ```
 
-That gives KENDIBO provider independence.
+That gives Kendibo provider independence.
 
 ---
 
@@ -301,7 +301,7 @@ The supplied plan specifically recommends separate PostgreSQL schemas and bounda
 
 # 5. Identity architecture
 
-KENDIBO needs more than "login".
+Kendibo needs more than "login".
 
 ## Authentication
 
@@ -426,7 +426,7 @@ authorize('pricing.publish')
 
 # 7. Property architecture
 
-This is one of the things that differentiates KENDIBO from a generic service marketplace.
+This is one of the things that differentiates Kendibo from a generic service marketplace.
 
 Structure:
 
@@ -1392,7 +1392,7 @@ Manual review if ambiguous
 VERIFIED
 ```
 
-The backend plan explicitly recommends this adapter architecture rather than coupling KENDIBO to one KYC vendor. 
+The backend plan explicitly recommends this adapter architecture rather than coupling Kendibo to one KYC vendor. 
 
 ---
 
@@ -1970,7 +1970,7 @@ Every endpoint must enforce ownership.
 
 # 43. Privacy architecture
 
-Because KENDIBO handles:
+Because Kendibo handles:
 
 ```text
 identity documents
@@ -2017,12 +2017,12 @@ This is where the WatchUp integration belongs.
 
 WatchUp positions itself as an application observability platform covering error tracking, API tracing, database monitoring, server metrics and alerting, including WhatsApp/Telegram/Slack/email channels. ([watchup.site][1])
 
-For KENDIBO, I would use it as the **application-level operational observability layer**, while retaining structured logs and infrastructure-native monitoring.
+For Kendibo, I would use it as the **application-level operational observability layer**, while retaining structured logs and infrastructure-native monitoring.
 
 Architecture:
 
 ```text
-                 KENDIBO
+                 Kendibo
                     │
         ┌───────────┼────────────┐
         │           │            │
@@ -2086,7 +2086,7 @@ WatchupObservabilityAdapter
 
 ---
 
-# 46. What KENDIBO should send to WatchUp
+# 46. What Kendibo should send to WatchUp
 
 ### Automatic errors
 
@@ -2133,7 +2133,7 @@ WatchUp's Python SDK documentation says request tracing excludes authorization h
 
 ---
 
-# 47. KENDIBO custom WatchUp events
+# 47. Kendibo custom WatchUp events
 
 This is where it becomes especially useful.
 
@@ -2171,7 +2171,7 @@ queue.dead_letter
 
 WatchUp's published material specifically describes custom events such as `delivery_confirmed`, `payment_received` and `driver_assigned` as useful for correlating business failures with technical incidents. ([watchup.site][1])
 
-For KENDIBO:
+For Kendibo:
 
 ```text
 technical:
@@ -2307,7 +2307,7 @@ through AWS Secrets Manager/GitHub Actions secrets, never `.env` committed to Gi
 
 # 51. Release tagging
 
-Every KENDIBO deployment should identify itself:
+Every Kendibo deployment should identify itself:
 
 ```text
 environment=production
@@ -3043,7 +3043,7 @@ Extract only when actual scaling/team boundaries justify it.
 
 ### Rule 12
 
-**WatchUp must never be allowed to take KENDIBO down.**
+**WatchUp must never be allowed to take Kendibo down.**
 
 Telemetry failures must fail open.
 
@@ -3064,7 +3064,7 @@ critical paths.
 The platform should ultimately look like this:
 
 ```text
-                         KENDIBO PLATFORM
+                         Kendibo PLATFORM
                               │
           ┌───────────────────┼────────────────────┐
           │                   │                    │
@@ -3120,11 +3120,11 @@ The platform should ultimately look like this:
 
 ## Bottom line
 
-**KENDIBO should be engineered as an operations and financial platform first, and a mobile application second.** The React Native app is the interface; the real product is the backend system that determines *who can perform a service, where, when, at what price, under what conditions, how the job progresses, what evidence exists, where the customer's money sits, when the provider gets paid, and what happens when something goes wrong.*
+**Kendibo should be engineered as an operations and financial platform first, and a mobile application second.** The React Native app is the interface; the real product is the backend system that determines *who can perform a service, where, when, at what price, under what conditions, how the job progresses, what evidence exists, where the customer's money sits, when the provider gets paid, and what happens when something goes wrong.*
 
 The architecture in the supplied plan already has the correct foundation — **NestJS modular monolith, PostgreSQL/PostGIS, Redis/BullMQ, Socket.IO, adapter-based integrations, state machine, ledger, Terraform/ECS and strong reconciliation**.  The additional hardening above turns that foundation into the backend specification I would use to split the work into engineering epics, database migrations, API contracts, integration tasks, infrastructure tickets and production-readiness gates.
 
-For **WatchUp specifically**, I would integrate it from Phase 0 rather than after launch: errors, traces, deployment releases and KENDIBO business-critical events should be observable from the first staging environment, with WhatsApp alerting for the on-call path. WatchUp's current public documentation/material supports Node.js request tracing, error capture, custom events and alerting, while its public API/SDK approach means KENDIBO should keep the integration behind its own `ObservabilityPort` rather than coupling business modules directly to WatchUp. ([watchup.site][1])
+For **WatchUp specifically**, I would integrate it from Phase 0 rather than after launch: errors, traces, deployment releases and Kendibo business-critical events should be observable from the first staging environment, with WhatsApp alerting for the on-call path. WatchUp's current public documentation/material supports Node.js request tracing, error capture, custom events and alerting, while its public API/SDK approach means Kendibo should keep the integration behind its own `ObservabilityPort` rather than coupling business modules directly to WatchUp. ([watchup.site][1])
 
 [1]: https://watchup.site/blog/affordable-monitoring-africa?utm_source=chatgpt.com "Affordable Application Monitoring for African Startups in 2025 — WatchUp Blog"
 [2]: https://pypi.org/project/watchup/0.3.0/?utm_source=chatgpt.com "watchup · PyPI"

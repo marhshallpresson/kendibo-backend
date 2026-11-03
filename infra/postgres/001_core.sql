@@ -1,4 +1,4 @@
--- KENDIBO core schemas: identity, booking, payment, ledger, dispatch, provider, geo, messaging, audit, configuration.
+-- Kendibo core schemas: identity, booking, payment, ledger, dispatch, provider, geo, messaging, audit, configuration.
 -- Conventions: UUID PKs, timestamptz, UTC storage, kobo BIGINT CHECK>0, currency CHECK='NGN'.
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;

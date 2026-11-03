@@ -2,7 +2,7 @@
   "name": "kendibo-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "KENDIBO modular monolith — NestJS-style TypeScript, Postgres/PostGIS, Redis. Payments: Bachs.io",
+  "description": "Kendibo modular monolith — NestJS-style TypeScript, Postgres/PostGIS, Redis. Payments: Bachs.io",
   "engines": {
     "node": ">=22"
   },

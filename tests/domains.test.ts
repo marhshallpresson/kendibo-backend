@@ -15,7 +15,7 @@ import { q } from '../packages/database/db.js';
 
 // Test isolation: never touch a real DATABASE_URL/REDIS_URL from the machine env.
 // @ts-ignore
-if (typeof globalThis.KENDIBO_TEST_ISOLATION === 'undefined') { (globalThis as any).KENDIBO_TEST_ISOLATION = true; delete process.env.DATABASE_URL; delete process.env.REDIS_URL; }
+if (typeof globalThis.Kendibo_TEST_ISOLATION === 'undefined') { (globalThis as any).Kendibo_TEST_ISOLATION = true; delete process.env.DATABASE_URL; delete process.env.REDIS_URL; }
 // booking.booking.user_id is UUID (no FK) and provider.provider.user_id has an
 // FK to identity.users — so tests mint a real user row and use UUID ids.
 async function testUser(): Promise<string> {

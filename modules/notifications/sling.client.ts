@@ -169,10 +169,10 @@ export class SlingClient {
     this.v1BaseUrl = (opts?.v1BaseUrl ?? process.env.SLING_V1_BASE_URL ?? 'https://app.sling.com.ng/api/v1').replace(/\/+$/, '');
     this.appUrl = (opts?.appUrl ?? process.env.APP_URL ?? 'http://localhost:3000').replace(/\/+$/, '');
     this.senders = {
-      sms: opts?.senders?.sms ?? process.env.SLING_SMS_SENDER ?? 'KENDIBO',
-      whatsapp: opts?.senders?.whatsapp ?? process.env.SLING_WHATSAPP_SENDER ?? 'KENDIBO',
-      rcs: opts?.senders?.rcs ?? process.env.SLING_RCS_SENDER ?? 'KENDIBO',
-      truecaller: opts?.senders?.truecaller ?? process.env.SLING_TRUECALLER_SENDER ?? 'KENDIBO',
+      sms: opts?.senders?.sms ?? process.env.SLING_SMS_SENDER ?? 'Kendibo',
+      whatsapp: opts?.senders?.whatsapp ?? process.env.SLING_WHATSAPP_SENDER ?? 'Kendibo',
+      rcs: opts?.senders?.rcs ?? process.env.SLING_RCS_SENDER ?? 'Kendibo',
+      truecaller: opts?.senders?.truecaller ?? process.env.SLING_TRUECALLER_SENDER ?? 'Kendibo',
       email: opts?.senders?.email ?? process.env.SLING_EMAIL_SENDER ?? 'hello@kendibo.com',
     };
   }
@@ -194,7 +194,10 @@ export class SlingClient {
     const url = `${root}${path.startsWith('/') ? path : `/${path}`}`;
 
     let lastErr: Error | null = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    // A POST may have been accepted even when its response is lost. Retrying it
+    // without a provider-guaranteed idempotency key can send duplicate messages.
+    const maxAttempts = method === 'GET' ? 3 : 1;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10_000);
       try {
@@ -218,10 +221,13 @@ export class SlingClient {
           }
           throw new Error(msg);
         }
+        if (String(json.status ?? '').toLowerCase() === 'fail' || json.status === false) {
+          throw new Error(String(json.message ?? json.error ?? 'Sling request failed'));
+        }
         return json as T;
       } catch (e) {
         lastErr = e as Error;
-        if (attempt < 2) {
+        if (attempt < maxAttempts - 1) {
           await new Promise((r) => setTimeout(r, 300 * 2 ** attempt));
           continue;
         }
@@ -238,7 +244,7 @@ export class SlingClient {
    */
   public async sendUniversal(req: SlingSendRequest): Promise<SlingSendResponse> {
     const reference = req.reference || `slg_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
-    const sender = req.sender || this.senders[req.channel] || 'KENDIBO';
+    const sender = req.sender || this.senders[req.channel] || 'Kendibo';
     const normalizedTo = req.to ? (req.channel === 'email' ? req.to.trim() : normalizeNigerianPhone(req.to)) : undefined;
 
     const payload: Record<string, unknown> = {
@@ -269,6 +275,7 @@ export class SlingClient {
     if (req.ttl !== undefined) payload.ttl = req.ttl;
 
     if (!this.isConfigured()) {
+      if (process.env.NODE_ENV === 'production') throw new Error('SLING_NOT_CONFIGURED');
       const simId = `sim_${req.channel}_${crypto.randomBytes(6).toString('hex')}`;
       console.log(
         `[sling:sim:${req.channel}] to=${normalizedTo ?? req.group ?? 'bulk'} type=${payload.type} ref=${reference} msg=${req.message.slice(0, 90)}`,
@@ -425,6 +432,7 @@ export class SlingClient {
   ): Promise<{ status: string; formId: string; enrolled: boolean; simulated: boolean }> {
     const cleanPhone = normalizeNigerianPhone(payload.phone);
     if (!this.isConfigured() || !formId || formId.startsWith('sim_')) {
+      if (process.env.NODE_ENV === 'production') throw new Error('SLING_FORM_NOT_CONFIGURED');
       console.log(`[sling:sim:form] form=${formId || 'default_onboarding'} phone=${cleanPhone} name=${payload.name}`);
       return { status: 'success', formId: formId || 'default_onboarding', enrolled: true, simulated: true };
     }
@@ -449,6 +457,7 @@ export class SlingClient {
   public async upsertContact(contact: SlingContactPayload): Promise<{ id: string; phone: string; simulated: boolean }> {
     const cleanPhone = normalizeNigerianPhone(contact.phone);
     if (!this.isConfigured()) {
+      if (process.env.NODE_ENV === 'production') throw new Error('SLING_NOT_CONFIGURED');
       const id = `slg_cnt_${crypto.createHash('sha1').update(cleanPhone).digest('hex').slice(0, 10)}`;
       return { id, phone: cleanPhone, simulated: true };
     }
@@ -478,6 +487,7 @@ export class SlingClient {
       ...(groupId ? { group: groupId } : {}),
     }));
     if (!this.isConfigured()) {
+      if (process.env.NODE_ENV === 'production') throw new Error('SLING_NOT_CONFIGURED');
       return { status: 'success', imported: normalized.length, groupId, simulated: true };
     }
     const res = await this.request<Record<string, unknown>>('/add-contacts', {
@@ -499,6 +509,7 @@ export class SlingClient {
   public async createGroup(group: SlingGroupPayload): Promise<{ id: string; name: string; identifier: string; simulated: boolean }> {
     const identifier = group.identifier || group.name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
     if (!this.isConfigured()) {
+      if (process.env.NODE_ENV === 'production') throw new Error('SLING_NOT_CONFIGURED');
       const id = `slg_grp_${crypto.createHash('sha1').update(identifier).digest('hex').slice(0, 8)}`;
       return { id, name: group.name, identifier, simulated: true };
     }
@@ -522,6 +533,7 @@ export class SlingClient {
   /** List Audience Groups (`GET /api/v2/groups`) */
   public async listGroups(): Promise<{ groups: Array<{ id: string; name: string; contacts_count?: number }>; simulated: boolean }> {
     if (!this.isConfigured()) {
+      if (process.env.NODE_ENV === 'production') throw new Error('SLING_NOT_CONFIGURED');
       return {
         groups: [
           { id: 'slg_grp_customers', name: 'Kendibo Customers', contacts_count: 0 },
@@ -547,6 +559,7 @@ export class SlingClient {
   public async checkPhoneNumber(phone: string): Promise<SlingPhoneLookupResult> {
     const norm = normalizeNigerianPhone(phone);
     if (!this.isConfigured()) {
+      if (process.env.NODE_ENV === 'production') throw new Error('SLING_NOT_CONFIGURED');
       return {
         status: 'valid',
         number: norm,
@@ -575,6 +588,7 @@ export class SlingClient {
   public async checkRcsCapability(phone: string): Promise<SlingRcsCapabilityResult> {
     const norm = normalizeNigerianPhone(phone);
     if (!this.isConfigured()) {
+      if (process.env.NODE_ENV === 'production') throw new Error('SLING_NOT_CONFIGURED');
       return {
         status: 'checked',
         phone: norm,
@@ -605,6 +619,7 @@ export class SlingClient {
     simulated: boolean;
   }> {
     if (!this.isConfigured() || messageId.startsWith('sim_')) {
+      if (process.env.NODE_ENV === 'production') throw new Error('SLING_MESSAGE_STATUS_UNAVAILABLE');
       return {
         message_id: messageId,
         status: 'delivered',
@@ -625,6 +640,7 @@ export class SlingClient {
   /** Account Balance & Details (`GET /api/v2/balance`) */
   public async getBalance(): Promise<{ balance: number; currency: string; simulated: boolean }> {
     if (!this.isConfigured()) {
+      if (process.env.NODE_ENV === 'production') throw new Error('SLING_NOT_CONFIGURED');
       return { balance: 25000, currency: 'NGN', simulated: true };
     }
     const res = await this.request<Record<string, unknown>>('/balance', { method: 'GET' });

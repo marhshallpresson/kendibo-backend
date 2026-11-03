@@ -57,7 +57,11 @@ const toNum = (s: string) => Number(s.replace(/,/g, ''));
  * A range ("10k-15k") means the upper end: that is the most they will pay.
  */
 export function extractBudgetKobo(text: string, opts: { expectingBudget?: boolean } = {}): bigint | null {
-  const t = ` ${wordsToDigits(text.toLowerCase())} `
+  // Preserve digit + word magnitudes before converting standalone number words
+  // or stripping date-like strings (which would otherwise consume "1.5").
+  const numericMagnitudes = text.toLowerCase().replace(/\b(\d+(?:\.\d+)?)\s+(thousand|million)\b/g,
+    (_match, amount: string, magnitude: string) => `${Number(amount) * MULT[magnitude]} naira`);
+  const t = ` ${wordsToDigits(numericMagnitudes)} `
     .replace(/\b\d{1,2}(:\d{2})?\s*(am|pm)\b/g, ' ') // times
     .replace(/\b\d{1,2}[/.-]\d{1,2}([/.-]\d{2,4})?\b/g, ' ') // dates
     .replace(/(\+?234|\b0)[789][01]\d{8}\b/g, ' ') // phone numbers

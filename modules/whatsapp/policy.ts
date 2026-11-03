@@ -19,7 +19,30 @@ import { approvedTemplate, templateParam, type TemplateKey } from './templates.j
 
 export const SERVICE_WINDOW_MS = 24 * 3600_000;
 export const OPT_OUT = /^(stop|unsubscribe|stop promos?|stop promotions?|stop all|stop messages?)( please)?[.!]*$/;
-export const OPT_IN = /^start$/;
+export const OPT_IN = /^start offers$/;
+
+export async function setJobOfferConsent(waId: string, optedIn: boolean): Promise<void> {
+  await q(`INSERT INTO messaging.whatsapp_marketing_consent (wa_id, opted_in, source, updated_at)
+    VALUES ($1,$2,$3,now()) ON CONFLICT (wa_id) DO UPDATE SET opted_in=$2, source=$3, updated_at=now()`,
+  [waId.replace(/\D/g, ''), optedIn, optedIn ? 'whatsapp_start' : 'whatsapp_stop']);
+}
+
+export async function hasJobOfferConsent(waId: string): Promise<boolean> {
+  const phone = waId.replace(/\D/g, '');
+  const rows = await q<{ opted_in: boolean; updated_at: string }>(`SELECT opted_in, updated_at FROM messaging.whatsapp_marketing_consent WHERE wa_id=$1`, [phone]).catch(() => []);
+  if (rows[0]?.opted_in !== true) return false;
+  // A later account-wide opt-out wins. A newer explicit job-offer opt-in only
+  // re-enables these offers; it never enables other promotional campaigns.
+  const prefs = await q<{ promo_enabled: boolean; updated_at: string }>(
+    `SELECT p.promo_enabled, p.updated_at FROM identity.users u JOIN notification.user_preference p ON p.user_id=u.id::text WHERE u.phone=$1`, [`+${phone}`],
+  ).catch(() => [{ promo_enabled: false, updated_at: new Date().toISOString() }]);
+  if (prefs[0]?.promo_enabled === false) {
+    const preferenceTime = new Date(prefs[0].updated_at).getTime();
+    const consentTime = new Date(rows[0].updated_at).getTime();
+    return Number.isFinite(preferenceTime) && Number.isFinite(consentTime) && consentTime > preferenceTime;
+  }
+  return true;
+}
 
 /** True when the customer messaged us in the last 24 hours. */
 export async function inServiceWindow(waId: string): Promise<boolean> {
@@ -45,9 +68,11 @@ export async function sendBusinessInitiated(opts: {
   whatsapp: () => Promise<void>;
   template?: { key: TemplateKey; params: string[]; buttons?: TemplateButton[] };
   sms: string;
-}): Promise<'whatsapp' | 'template' | 'sms'> {
+}): Promise<'whatsapp' | 'template' | 'sms' | 'skipped'> {
+  const isJobOffer = opts.template?.key === 'job_offer';
+  if (isJobOffer && !(await hasJobOfferConsent(opts.waId))) return 'skipped';
   if (await inServiceWindow(opts.waId)) { await opts.whatsapp(); return 'whatsapp'; }
-  const t = opts.template ? await approvedTemplate(opts.template.key) : null;
+  const t = opts.template ? await approvedTemplate(opts.template.key, isJobOffer) : null;
   if (t && opts.template) {
     try {
       await wa.template(opts.waId, t.name, opts.template.params.map((p) => templateParam(p)), opts.template.buttons, t.language);
@@ -55,7 +80,7 @@ export async function sendBusinessInitiated(opts: {
     } catch { /* fall through to SMS so the message is not lost */ }
   }
   const { sms } = await import('../notifications/channels.js');
-  await sms.send(`+${opts.waId.replace(/\D/g, '')}`, opts.sms, { type: 'transactional' });
+  await sms.send(`+${opts.waId.replace(/\D/g, '')}`, opts.sms, { type: isJobOffer ? 'promotional' : 'transactional' });
   return 'sms';
 }
 

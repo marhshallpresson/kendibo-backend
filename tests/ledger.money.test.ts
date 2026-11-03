@@ -6,7 +6,7 @@ import { transition } from '../modules/job-engine/job.machine.js';
 
 // Test isolation: never touch a real DATABASE_URL/REDIS_URL from the machine env.
 // @ts-ignore
-if (typeof globalThis.KENDIBO_TEST_ISOLATION === 'undefined') { (globalThis as any).KENDIBO_TEST_ISOLATION = true; delete process.env.DATABASE_URL; delete process.env.REDIS_URL; }
+if (typeof globalThis.Kendibo_TEST_ISOLATION === 'undefined') { (globalThis as any).Kendibo_TEST_ISOLATION = true; delete process.env.DATABASE_URL; delete process.env.REDIS_URL; }
 describe('money boundaries', () => {
   it('kobo <-> bachs decimal', () => {
     assert.equal(koboToBachsDecimal(700000n), '7000.00');

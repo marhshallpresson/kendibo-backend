@@ -1,4 +1,4 @@
-// Trains the vendor-matching model on KENDIBO's own outcomes.
+// Trains the vendor-matching model on Kendibo's own outcomes.
 //
 // Label per (request, vendor shown): 1 when the vendor accepted the job AND it
 // was not later cancelled/failed (a rating of 1–2 also counts as 0); 0 when they

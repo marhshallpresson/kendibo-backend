@@ -236,7 +236,7 @@ export const storefrontService = {
 const esc = (v: unknown) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 
 /**
- * "Connect on WhatsApp": opens a chat with KENDIBO's number (never the vendor's),
+ * "Connect on WhatsApp": opens a chat with Kendibo's number (never the vendor's),
  * prefilled with the storefront reference the bot uses to route the booking.
  */
 export function waConnect(sf: { name: string; slug: string | null }): string | null {

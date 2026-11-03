@@ -20,7 +20,7 @@ import { verifySubscription, verifySignature } from '../../../modules/whatsapp/w
 import { verifyLink } from '../../../modules/whatsapp/links.js';
 import { renderLocationPage, renderVendorsPage, renderMessagePage, pageCsp } from '../../../modules/whatsapp/web-pages.js';
 import { handleInbound, continueAfterLocation, startInboundSweeper, payLinkTarget, type InboundMessage } from '../../../modules/whatsapp/whatsapp.bot.js';
-import { applyTemplateWebhook } from '../../../modules/whatsapp/templates.js';
+import { applyTemplateWebhook, startTemplateStatusSync } from '../../../modules/whatsapp/templates.js';
 import { saveDraftLocation } from '../../../modules/whatsapp/draft.js';
 import { notifyCustomer } from '../../../modules/whatsapp/policy.js';
 import { requestService } from '../../../modules/requests/request.service.js';
@@ -82,7 +82,7 @@ const MESSAGES: Record<string, [number, string]> = {
 
 export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
   // Retries WhatsApp turns a crash cut short (never in tests: they drive the router directly).
-  if (process.env.NODE_ENV !== 'test') startInboundSweeper();
+  if (process.env.NODE_ENV !== 'test') { startInboundSweeper(); startTemplateStatusSync(); }
   const err = (reply: FastifyReply, e: unknown) => {
     const code = (e as Error)?.message ?? 'ERROR';
     const known = MESSAGES[code];

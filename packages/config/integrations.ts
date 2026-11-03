@@ -1,4 +1,4 @@
-// Integration manifest — every third-party credential KENDIBO uses, in one
+// Integration manifest — every third-party credential Kendibo uses, in one
 // place: what it is, whether it is SECRET (server only, never in a client
 // bundle) or PUBLIC (safe in the app), which flows break without it, and
 // whether production refuses to run without it.

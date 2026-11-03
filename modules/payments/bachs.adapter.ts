@@ -33,7 +33,7 @@ export class BachsAdapter implements PaymentPort {
   readonly name = 'bachs' as const;
 
   async createCheckout(input: CreateCheckoutInput): Promise<CheckoutSession> {
-    // KENDIBO prices server-side in kobo; Bachs takes raw `pricing` decimal string.
+    // Kendibo prices server-side in kobo; Bachs takes raw `pricing` decimal string.
     // https://docs.bachs.io/guides/checkout/checkout-sessions (Charge a raw amount)
     // Redirects are deep-links back into the apps; webhook stays source of truth.
     const amount = koboToBachsDecimal(input.amountKobo);

@@ -522,7 +522,7 @@ export class SlingAutomationService {
 
     const messageBody = input.messageBody || aiVariant?.whatsappBody || aiVariant?.smsBody || input.name;
     const subject = input.subject || aiVariant?.emailSubject || input.name;
-    const ctaLabel = input.ctaLabel || aiVariant?.ctaLabel || 'Open KENDIBO';
+    const ctaLabel = input.ctaLabel || aiVariant?.ctaLabel || 'Open Kendibo';
     const ctaUrl = input.ctaUrl || aiVariant?.ctaUrl || 'https://kendibo.com';
     // 'scheduled' means handed to Sling with send_on; until it is launched it stays a draft.
     const status: BulkCampaignRecord['status'] = 'draft';

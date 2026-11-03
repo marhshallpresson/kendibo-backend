@@ -87,6 +87,18 @@ describe('wallet service (Postgres per-user ledger)', () => {
 });
 
 describe('wallet routes', () => {
+  it('refuses production top-ups until checkout reconciliation exists', async () => {
+    const u = await realUser();
+    const previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      const response = await app.inject({ method: 'POST', url: '/v1/wallet/topup', headers: { ...auth(u), ...idem() }, payload: { amountKobo: 5000 } });
+      assert.equal(response.statusCode, 503);
+      assert.equal(response.json().error.code, 'WALLET_TOPUP_UNAVAILABLE');
+    } finally {
+      process.env.NODE_ENV = previous;
+    }
+  });
   it('unauthenticated requests get 401', async () => {
     const g = await app.inject({ method: 'GET', url: '/v1/wallet' });
     assert.equal(g.statusCode, 401);

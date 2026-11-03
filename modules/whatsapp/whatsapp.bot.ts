@@ -27,7 +27,7 @@ import { understand, logTurn, type Understanding } from './nlu/index.js';
 import { currentDraft, openDraft, patchDraft, addPhotoToDraft, saveDraftLocation, cancelDraft, submitDraft, type Draft } from './draft.js';
 import { nextStep, sendStep, handleFlowTap, patchFromUnderstanding, acknowledge, tradeName, type Asked, type Step } from './flow.js';
 import { FACTS, priceLines } from './facts.js';
-import { OPT_IN, OPT_OUT, llmAllowed, sendBusinessInitiated, notifyCustomer } from './policy.js';
+import { OPT_IN, OPT_OUT, llmAllowed, sendBusinessInitiated, notifyCustomer, setJobOfferConsent } from './policy.js';
 import { payToken } from './links.js';
 import { activeRelay, closeRelay, relayText, relayMedia } from './relay.js';
 
@@ -132,7 +132,7 @@ const replyText = (m: InboundMessage) =>
 
 // ── Replies ──────────────────────────────────────────────────────────────────
 async function sendWelcome(to: string, name?: string) {
-  await wa.buttons(to, `${firstName(name) ? `Hi ${firstName(name)}! ` : 'Hi! '}I'm Kendibo's automated assistant. I can book a verified pro for cleaning, AC, plumbing, electrical, generator, appliance and pest jobs, and check your bookings. Type "agent" any time to reach a person.\n\nTo book, tell me what needs doing. A photo, your budget and when you want it done all help.`, MENU_BUTTONS);
+  await wa.buttons(to, `${firstName(name) ? `Hi ${firstName(name)}! ` : 'Hi! '}I'm Kendibo's automated assistant. I can book a verified pro for cleaning, AC, plumbing, electrical, generator, appliance and pest jobs, and check your bookings. Type "agent" any time to reach a person.\n\nTo book, tell me what needs doing. A photo, your budget and when you want it done all help.\n\nVendors: reply START OFFERS to receive job offers by WhatsApp or SMS. Reply STOP to opt out.`, MENU_BUTTONS);
 }
 const sendMenu = (to: string, body = 'What would you like to do?') => wa.buttons(to, body, MENU_BUTTONS);
 
@@ -287,6 +287,7 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
   // Marketing opt-out (Meta policy, NDPA 2023): STOP turns promotions off on
   // every channel; START turns them back on. Booking updates still go out.
   if (!id && OPT_OUT.test(lower)) {
+    await setJobOfferConsent(to, false);
     const { notificationService } = await import('../notifications/notification.service.js');
     await notificationService.updateUserPreferences(user.id, { promo: false });
     emit('whatsapp.opt_out', { userId: user.id });
@@ -294,17 +295,14 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
     if (d) await cancelDraft(d.id);
     s.data = {};
     await saveSession(s);
-    await wa.text(to, "Done. You won't get offers or promotions from Kendibo. You'll still get messages about your own bookings. Reply START to get offers again.");
+    await wa.text(to, "Done. You won't get offers or promotions from Kendibo. You'll still get messages about your own bookings. Reply START OFFERS to receive job offers by WhatsApp or SMS again.");
     return;
   }
   if (!id && OPT_IN.test(lower)) {
-    const { notificationService } = await import('../notifications/notification.service.js');
-    if (!(await notificationService.getUserPreferences(user.id)).promo) {
-      await notificationService.updateUserPreferences(user.id, { promo: true });
-      emit('whatsapp.opt_in', { userId: user.id });
-      await wa.text(to, "You're back on Kendibo offers. Reply STOP any time to opt out.");
-      return;
-    }
+    await setJobOfferConsent(to, true);
+    emit('whatsapp.opt_in', { userId: user.id });
+    await wa.text(to, "You've opted in to Kendibo job offers by WhatsApp or SMS. Reply STOP any time to opt out.");
+    return;
   }
 
   // Abuse / cost guard: at most 40 inbound messages per number per hour.

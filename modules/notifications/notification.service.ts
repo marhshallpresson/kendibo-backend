@@ -84,12 +84,12 @@ export interface UserNotificationPreferences {
 
 const COPY_BUILDERS: Record<string, (v: Record<string, string>) => { title: string; body: string }> = {
   otp: (v) => ({
-    title: 'Your KENDIBO verification code',
-    body: `Your KENDIBO verification code is ${v.code ?? ''}. Expires in 5 minutes. Never share it with anyone.`,
+    title: 'Your Kendibo verification code',
+    body: `Your Kendibo verification code is ${v.code ?? ''}. Expires in 5 minutes. Never share it with anyone.`,
   }),
   welcome: (v) => ({
-    title: `Welcome to KENDIBO, ${v.name || 'friend'}!`,
-    body: `Hi ${v.name || 'there'}, welcome to KENDIBO — verified home cleaning & maintenance pros with escrow protection.`,
+    title: `Welcome to Kendibo, ${v.name || 'friend'}!`,
+    body: `Hi ${v.name || 'there'}, welcome to Kendibo — verified home cleaning & maintenance pros with escrow protection.`,
   }),
   'booking.confirmed': (v) => ({
     title: 'Booking confirmed',
@@ -101,19 +101,19 @@ const COPY_BUILDERS: Record<string, (v: Record<string, string>) => { title: stri
   }),
   'provider.assigned': (v) => ({
     title: 'Verified technician assigned',
-    body: `${v.provider ?? 'Your KENDIBO technician'} has accepted your ${v.service ?? 'service'} job and is preparing for dispatch.`,
+    body: `${v.provider ?? 'Your Kendibo technician'} has accepted your ${v.service ?? 'service'} job and is preparing for dispatch.`,
   }),
   provider_assigned: (v) => ({
     title: 'Verified technician assigned',
-    body: `${v.provider ?? 'Your KENDIBO technician'} has accepted your ${v.service ?? 'service'} job and is preparing for dispatch.`,
+    body: `${v.provider ?? 'Your Kendibo technician'} has accepted your ${v.service ?? 'service'} job and is preparing for dispatch.`,
   }),
   'provider.en_route': (v) => ({
     title: 'Technician is on the way',
-    body: `${v.provider ?? 'Your provider'} is en route (${v.eta ?? 'arriving soon'}). Track live in the KENDIBO app.`,
+    body: `${v.provider ?? 'Your provider'} is en route (${v.eta ?? 'arriving soon'}). Track live in the Kendibo app.`,
   }),
   provider_en_route: (v) => ({
     title: 'Technician is on the way',
-    body: `${v.provider ?? 'Your provider'} is en route (${v.eta ?? 'arriving soon'}). Track live in the KENDIBO app.`,
+    body: `${v.provider ?? 'Your provider'} is en route (${v.eta ?? 'arriving soon'}). Track live in the Kendibo app.`,
   }),
   'provider.arrived': (v) => ({
     title: 'Technician has arrived',
@@ -153,7 +153,7 @@ const COPY_BUILDERS: Record<string, (v: Record<string, string>) => { title: stri
   }),
   'wallet.topup': (v) => ({
     title: 'Wallet funded successfully',
-    body: `₦${v.amount ?? ''} has been credited to your KENDIBO Wallet.`,
+    body: `₦${v.amount ?? ''} has been credited to your Kendibo Wallet.`,
   }),
   'payout.sent': (v) => ({
     title: 'Payout disbursed',
@@ -332,7 +332,7 @@ export class NotificationService {
       template: String(r.template || 'notification'),
       status: String(r.status || 'sent') as Notification['status'],
       sentAt: r.sent_at ? String(r.sent_at) : r.created_at ? String(r.created_at) : new Date().toISOString(),
-      title: r.title ? String(r.title) : String(r.template || 'KENDIBO Update'),
+      title: r.title ? String(r.title) : String(r.template || 'Kendibo Update'),
       body: r.body ? String(r.body) : '',
       ctaLabel: r.cta_label ? String(r.cta_label) : undefined,
       ctaUrl: r.cta_url ? String(r.cta_url) : undefined,

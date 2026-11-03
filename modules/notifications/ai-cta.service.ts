@@ -151,7 +151,7 @@ export class AiCtaRetainerService {
 
     let headline = `Keep your ${city} home running smoothly`;
     let ctaLabel = 'Book 1-Tap Retainer Slot';
-    let smsBody = `KENDIBO: Hi ${firstName}, your ${service} checkup is due! Claim your ${discountTag} today: ${ctaUrl}`;
+    let smsBody = `Kendibo: Hi ${firstName}, your ${service} checkup is due! Claim your ${discountTag} today: ${ctaUrl}`;
     let whatsappBody = `Hi *${firstName}* 👋,\n\nYour scheduled *${service}* retainer window in ${city} is open.\n\n✅ Verified & background-checked technician\n✅ 7-day workmanship warranty\n🎁 *${discountTag}* unlocked on your account\n\nTap below to confirm your preferred time slot:\n👉 ${ctaUrl}`;
     let pushTitle = `${service} Due (${discountTag})`;
     let pushBody = `Hi ${firstName}, confirm your verified Kendibo pro in 1 tap with ${discountTag}.`;
@@ -162,7 +162,7 @@ export class AiCtaRetainerService {
         const days = input.lastServiceDaysAgo ?? 30;
         headline = `We miss you, ${firstName}! Enjoy ${discountTag} on your next home service`;
         ctaLabel = `Claim ${discountTag} Now`;
-        smsBody = `KENDIBO: Hi ${firstName}, it's been ${days} days! Book ${service} this week & get ${discountTag}: ${ctaUrl}`;
+        smsBody = `Kendibo: Hi ${firstName}, it's been ${days} days! Book ${service} this week & get ${discountTag}: ${ctaUrl}`;
         whatsappBody = `Hello *${firstName}* ✨,\n\nIt’s been ${days} days since your last Kendibo home service in ${city}. Keep your appliances and living space spotless with a verified pro!\n\n🎁 Special Win-Back Offer: *${discountTag}*\n👉 Book in 60 seconds: ${ctaUrl}`;
         pushTitle = `Unlock ${discountTag} on ${service}`;
         pushBody = `It's been ${days} days! Schedule a verified Kendibo technician today.`;
@@ -172,7 +172,7 @@ export class AiCtaRetainerService {
       case 'quote_followup': {
         headline = `Your verified inspection quote for ${service} is ready`;
         ctaLabel = 'Review & Approve Quote';
-        smsBody = `KENDIBO: Hi ${firstName}, your itemized quote for ${service} is ready. Approve in escrow to start work: ${ctaUrl}`;
+        smsBody = `Kendibo: Hi ${firstName}, your itemized quote for ${service} is ready. Approve in escrow to start work: ${ctaUrl}`;
         whatsappBody = `Hi *${firstName}* 🛠️,\n\nYour technician has submitted the transparent, itemized quote for *${service}*.\n\n🔒 Protected by Kendibo Escrow & 7-Day Warranty.\n👉 Review & approve now: ${ctaUrl}`;
         pushTitle = `Quote Ready: ${service}`;
         pushBody = `Review your itemized quote and approve in escrow to begin work.`;
@@ -182,7 +182,7 @@ export class AiCtaRetainerService {
       case 'warranty_renewal': {
         headline = `Extend protection on your ${service}`;
         ctaLabel = 'Schedule Preventive Check';
-        smsBody = `KENDIBO: Hi ${firstName}, your ${service} warranty window is closing soon. Book a preventive tune-up: ${ctaUrl}`;
+        smsBody = `Kendibo: Hi ${firstName}, your ${service} warranty window is closing soon. Book a preventive tune-up: ${ctaUrl}`;
         whatsappBody = `Hi *${firstName}* 🛡️,\n\nYour warranty coverage on *${service}* is approaching renewal. A quick preventive tune-up prevents costly breakdowns.\n\n👉 Lock in your tune-up (${discountTag}): ${ctaUrl}`;
         pushTitle = `Warranty Tune-Up: ${service}`;
         pushBody = `Keep your ${service} covered with a preventive checkup (${discountTag}).`;
@@ -192,7 +192,7 @@ export class AiCtaRetainerService {
       case 'loyalty_cashback': {
         headline = `${discountTag} credited to your Kendibo Wallet`;
         ctaLabel = 'Use Wallet Cashback';
-        smsBody = `KENDIBO: Congrats ${firstName}! ${discountTag} is waiting in your wallet for ${service}. Redeem now: ${ctaUrl}`;
+        smsBody = `Kendibo: Congrats ${firstName}! ${discountTag} is waiting in your wallet for ${service}. Redeem now: ${ctaUrl}`;
         whatsappBody = `🎉 *Wallet Reward Unlocked, ${firstName}!*\n\nYou have *${discountTag}* ready to apply toward *${service}* in ${city}.\n\n👉 Redeem before it expires: ${ctaUrl}`;
         pushTitle = `🎁 ${discountTag} Ready to Use`;
         pushBody = `Apply your reward toward ${service} in 1 tap.`;
@@ -202,7 +202,7 @@ export class AiCtaRetainerService {
       case 'seasonal_promo': {
         headline = `${city} Home Care Promo: ${discountTag} on ${service}`;
         ctaLabel = `Book with ${discountTag}`;
-        smsBody = `KENDIBO: ${discountTag} on ${service} in ${city}! Verified pros, escrow protection. Book now: ${ctaUrl}`;
+        smsBody = `Kendibo: ${discountTag} on ${service} in ${city}! Verified pros, escrow protection. Book now: ${ctaUrl}`;
         whatsappBody = `🏡 *${city} Home Care Flash Offer!*\n\nHi *${firstName}*, get *${discountTag}* when you book *${service}* with a verified Kendibo pro.\n\n${input.customPrompt ? `📌 ${input.customPrompt}\n\n` : ''}👉 Reserve your slot: ${ctaUrl}`;
         pushTitle = `Flash Offer: ${discountTag} on ${service}`;
         pushBody = `Verified Kendibo pros available in ${city}. Tap to reserve your slot.`;
@@ -212,7 +212,7 @@ export class AiCtaRetainerService {
       case 'operational_alert': {
         headline = `Important Service Update for ${service}`;
         ctaLabel = 'View Live Status';
-        smsBody = `KENDIBO ALERT: Hi ${firstName}, ${input.customPrompt || `update on your ${service} booking`}. Track live: ${ctaUrl}`;
+        smsBody = `Kendibo ALERT: Hi ${firstName}, ${input.customPrompt || `update on your ${service} booking`}. Track live: ${ctaUrl}`;
         whatsappBody = `🔔 *Kendibo Operational Update*\n\nHi *${firstName}*,\n${input.customPrompt || `There is a real-time status update on your ${service} booking.`}\n\n👉 Open live tracker: ${ctaUrl}`;
         pushTitle = `Service Update: ${service}`;
         pushBody = input.customPrompt || `Tap to view the latest status on your ${service} booking.`;

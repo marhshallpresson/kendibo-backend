@@ -86,11 +86,13 @@ void app.register(helmet, {
   hsts: { maxAge: 31536000, includeSubDomains: true, preload: true }, // Strict encrypted rails
   contentSecurityPolicy: PROD,
 });
-void app.register(rateLimit, {
+// Install the onRoute hook before routes are declared; a queued register()
+// runs too late for the synchronously declared routes in this module.
+void rateLimit(app, {
   max: 100,
   timeWindow: '1 minute',
-  errorResponseBuilder: () => ({ error: { code: 'RATE_LIMIT', message: 'Too many requests' } }),
-});
+  errorResponseBuilder: (_req, context) => ({ statusCode: context.statusCode, error: { code: 'RATE_LIMIT', message: 'Too many requests' } }),
+}, () => {});
 
 // Prod CORS: explicit allowlist only (deployed app origins + Pxxl dashboard
 // CORS_ORIGINS). DEFAULT_CORS_ORIGINS is hardcoded so a missing/legacy env
@@ -349,21 +351,24 @@ app.post('/v1/auth/otp/request', OTP_LIMIT, async (req, reply) => {
     const r = await identityService.requestOtp(channel, identity);
     return { data: { sent: true, devCode: r.devCode } };
   } catch (e: unknown) {
+    if (e instanceof z.ZodError) return fail(reply, 'BAD_REQUEST', 'Enter a valid phone number or email address.', 400);
     const msg = (e as Error).message;
     if (msg === 'BAD_IDENTITY') return fail(reply, 'BAD_IDENTITY', 'Enter a valid phone number or email address.');
     if (msg === 'SEND_FAILED') return fail(reply, 'SEND_FAILED', 'Could not deliver the code. Try again.', 502, true);
     throw e;
   }
 });
-app.post('/v1/auth/otp/verify', { config: { rateLimit: { max: 10, timeWindow: '10 minutes' } } }, async (req) => {
-  const { channel, identity, code, device, name, role } = z.object({
+app.post('/v1/auth/otp/verify', { config: { rateLimit: { max: 10, timeWindow: '10 minutes' } } }, async (req, reply) => {
+  const parsed = z.object({
     channel: z.enum(['phone', 'email']), identity: z.string(), code: z.string(),
     name: z.string().optional(), role: z.string().optional(),
     device: z.object({
       fp: z.string().optional(), platform: z.string().optional(), model: z.string().optional(),
       os: z.string().optional(), appVersion: z.string().optional(), city: z.string().optional(),
     }).optional(),
-  }).parse(req.body);
+  }).safeParse(req.body);
+  if (!parsed.success) return fail(reply, 'BAD_REQUEST', 'Enter a valid verification code and identity.', 400);
+  const { channel, identity, code, device, name, role } = parsed.data;
   const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip;
   const s = await identityService.verifyOtp(channel, identity, code, { ...device, ip, name, role });
   if (!s) return { error: { code: 'BAD_OTP', message: 'Invalid or expired code', retryable: false } };
@@ -891,6 +896,9 @@ app.get('/v1/wallet', async (req, reply) => {
 });
 app.post('/v1/wallet/topup', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  // Checkout callbacks are not yet reconciled into wallet credits. Do not
+  // collect real money until that flow is implemented and verified.
+  if (process.env.NODE_ENV === 'production') return fail(reply, 'WALLET_TOPUP_UNAVAILABLE', 'Wallet top-ups are temporarily unavailable', 503);
   const idem = req.headers['idempotency-key'];
   if (typeof idem !== 'string') return fail(reply, 'IDEMPOTENCY_REQUIRED', 'Idempotency-Key header required');
   const parsed = z.object({ amountKobo: z.number().int().min(100).max(50000000) }).safeParse(req.body);
@@ -1872,7 +1880,7 @@ app.post('/v1/payouts/resolve-account', async (req, reply) => {
         userProfile?.name ||
         businessName ||
         provProfile?.businessName ||
-        'KENDIBO VERIFIED VENDOR'
+        'Kendibo VERIFIED VENDOR'
       ).toUpperCase();
       r = { valid: true, accountName: fallbackName };
     }
@@ -1882,8 +1890,8 @@ app.post('/v1/payouts/resolve-account', async (req, reply) => {
   const alignment = kycService.verifyNameAlignment({
     submittedName: userProfile?.name ?? undefined,
     businessName: businessName ?? provProfile?.businessName ?? undefined,
-    ninLegalName: provProfile?.verifiedLegalName ?? userProfile?.name ?? undefined,
-    cacCompanyName: provProfile?.cacCompanyName ?? businessName ?? provProfile?.businessName ?? undefined,
+    ninLegalName: provProfile?.verifiedLegalName ?? undefined,
+    cacCompanyName: provProfile?.cacCompanyName ?? undefined,
     bankAccountName: r.accountName,
   });
 
@@ -2343,7 +2351,7 @@ for (const step of [['accept', 'PROVIDER_ACCEPTED'], ['arrive', 'ARRIVED'], ['st
               : `booking.${step[0]}`;
         void slingAutomationService.triggerEvent(evt, b.userId, {
           jobId,
-          provider: actor ?? 'Your KENDIBO Technician',
+          provider: actor ?? 'Your Kendibo Technician',
           service: b.serviceId,
         }).catch(() => {});
       }

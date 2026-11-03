@@ -17,7 +17,7 @@ registerHandler('notifications', 'notification.send', async (job: { name: string
     vars?: Record<string, string>;
   };
   try {
-    const title = 'KENDIBO update';
+    const title = 'Kendibo update';
     const body = `${d.template ?? 'notification'}: ${Object.values(d.vars ?? {}).join(' ').slice(0, 140)}`;
     let sent = false;
     const tokens: string[] = [];

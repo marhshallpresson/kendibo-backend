@@ -182,7 +182,7 @@ describe('matching model', () => {
 });
 
 describe('WhatsApp marketing opt-out', () => {
-  it('STOP turns promotions off and START turns them back on', async () => {
+  it('STOP turns promotions off and START OFFERS opts in explicitly', async () => {
     const { handleInbound } = await import('../modules/whatsapp/whatsapp.bot.js');
     const { notificationService } = await import('../modules/notifications/notification.service.js');
     const waId = `23482${Math.floor(Math.random() * 1e8)}`;
@@ -190,7 +190,9 @@ describe('WhatsApp marketing opt-out', () => {
     const user = (await q<{ id: string }>(`SELECT id FROM identity.users WHERE phone=$1`, [`+${waId}`]))[0];
     assert.ok(user, 'the WhatsApp number has an account');
     assert.equal((await notificationService.getUserPreferences(String(user.id))).promo, false);
-    await handleInbound({ id: `wamid.${randomUUID()}`, from: waId, type: 'text', text: { body: 'start' } });
-    assert.equal((await notificationService.getUserPreferences(String(user.id))).promo, true);
+    await handleInbound({ id: `wamid.${randomUUID()}`, from: waId, type: 'text', text: { body: 'start offers' } });
+    assert.equal((await notificationService.getUserPreferences(String(user.id))).promo, false, 'job-offer opt-in must not enable unrelated promotions');
+    const { hasJobOfferConsent } = await import('../modules/whatsapp/policy.js');
+    assert.equal(await hasJobOfferConsent(waId), true);
   });
 });
