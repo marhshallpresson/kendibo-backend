@@ -445,7 +445,9 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
             await enqueueInbound(m, name);
           } catch (e) {
             observability.captureException(e);
-            req.log.error('[whatsapp] unable to persist inbound message');
+            const rawCode = (e as { code?: unknown })?.code;
+            const databaseCode = typeof rawCode === 'string' && /^[A-Z0-9_]{1,32}$/.test(rawCode) ? rawCode : 'UNKNOWN';
+            req.log.error({ databaseCode }, '[whatsapp] unable to persist inbound message');
             return h.fail(reply, 'WHATSAPP_INBOUND_UNAVAILABLE', 'Unable to accept webhook', 503, true);
           }
         }
