@@ -67,6 +67,9 @@ describe('WhatsApp message templates', () => {
   });
   it('follows Meta status webhooks and only sends approved templates', async () => {
     const { applyTemplateWebhook, approvedTemplate } = await import('../modules/whatsapp/templates.js');
+    await applyTemplateWebhook('message_template_status_update', { message_template_name: 'kendibo_vendor_accepted', message_template_language: 'en', event: 'APPROVED' });
+    await applyTemplateWebhook('template_category_update', { message_template_name: 'kendibo_vendor_accepted', message_template_language: 'en', new_category: 'UTILITY' });
+    assert.equal(await approvedTemplate('vendor_accepted'), null, 'unverified payment hold must not be advertised');
     const base = { message_template_id: 555001, message_template_name: 'kendibo_job_offer', message_template_language: 'en' };
     assert.equal(await approvedTemplate('job_offer'), null, 'nothing is sent before review');
     await applyTemplateWebhook('message_template_status_update', { ...base, event: 'APPROVED', reason: 'NONE' });

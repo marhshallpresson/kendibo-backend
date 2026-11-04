@@ -28,7 +28,6 @@ import { currentDraft, openDraft, patchDraft, addPhotoToDraft, saveDraftLocation
 import { nextStep, sendStep, handleFlowTap, patchFromUnderstanding, acknowledge, tradeName, type Asked, type Step } from './flow.js';
 import { FACTS, priceLines } from './facts.js';
 import { OPT_IN, OPT_OUT, llmAllowed, sendBusinessInitiated, notifyCustomer, setJobOfferConsent } from './policy.js';
-import { payToken } from './links.js';
 import { activeRelay, closeRelay, relayText, relayMedia } from './relay.js';
 
 type State = 'BOT' | 'HUMAN';
@@ -615,11 +614,11 @@ export async function notifyRequestAccepted(requestId: string, bookingId: string
     return;
   }
   const checkoutUrl = session.checkoutUrl;
-  const line = `${who} accepted your job. Pay ${naira(amount)} to confirm. Kendibo holds it until you say the job is done.`;
+  const line = `${who} accepted your job. Pay ${naira(amount)} to confirm.`;
   await sendBusinessInitiated({
     waId: to,
     whatsapp: () => wa.ctaUrl(to, line, 'Pay securely', checkoutUrl),
-    template: { key: 'vendor_accepted', params: [who, naira(amount)], buttons: [{ index: 0, urlSuffix: encodeURIComponent(payToken(to, bookingId)) }] },
+    template: { key: 'request_update', params: [`${line} ${checkoutUrl}`] },
     sms: `${line} ${checkoutUrl}`,
   });
 }

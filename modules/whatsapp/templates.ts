@@ -161,6 +161,8 @@ export async function templateRows(): Promise<TemplateRow[]> {
 
 /** The template to send for `key`, or null if Meta hasn't approved it. */
 export async function approvedTemplate(key: TemplateKey, allowMarketing = false): Promise<{ name: string; language: string } | null> {
+  // The approved copy promises a payment hold whose arrangement is unverified.
+  if (key === 'vendor_accepted') return null;
   const t = templateDef(key);
   const rows = await q<{ status: string; category: string | null }>(`SELECT status, category FROM messaging.whatsapp_template WHERE name=$1 AND language=$2`, [t.name, t.language]).catch(() => []);
   const category = String(rows[0]?.category ?? '').toUpperCase();
