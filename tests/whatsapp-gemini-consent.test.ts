@@ -4,6 +4,49 @@ import { callGemini } from '../modules/whatsapp/gemini-agent.js';
 import { hasJobOfferConsent, setJobOfferConsent, sendBusinessInitiated } from '../modules/whatsapp/policy.js';
 import { q } from '../packages/database/db.js';
 
+test('Gemini falls back once for provider overload but not invalid requests', async () => {
+  const original = globalThis.fetch;
+  const previous = { key: process.env.GEMINI_API_KEY, model: process.env.WHATSAPP_GEMINI_MODEL, fallback: process.env.WHATSAPP_GEMINI_FALLBACK_MODEL };
+  process.env.GEMINI_API_KEY = 'test-key';
+  process.env.WHATSAPP_GEMINI_MODEL = 'primary-model';
+  process.env.WHATSAPP_GEMINI_FALLBACK_MODEL = 'fallback-model';
+  const params = { model: 'unused', max_tokens: 100, messages: [{ role: 'user', content: 'Hello' }], tools: [] } as any;
+  const calls: string[] = [];
+  try {
+    globalThis.fetch = async (url) => {
+      calls.push(String(url));
+      return calls.length === 1
+        ? new Response('{}', { status: 503 })
+        : new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Hello' }] } }] }), { status: 200 });
+    };
+    assert.equal((await callGemini(params)).stop_reason, 'end_turn');
+    assert.equal(calls.length, 2);
+    assert.match(calls[1], /fallback-model/);
+    calls.length = 0;
+    globalThis.fetch = async (url) => { calls.push(String(url)); return new Response('{}', { status: 400 }); };
+    await assert.rejects(callGemini(params), /GEMINI_HTTP_400/);
+    assert.equal(calls.length, 1);
+    calls.length = 0;
+    globalThis.fetch = async (url) => { calls.push(String(url)); throw new Error('network unavailable'); };
+    await assert.rejects(callGemini(params), /network unavailable/);
+    assert.equal(calls.length, 2);
+    calls.length = 0;
+    globalThis.fetch = async (url) => { calls.push(String(url)); return new Response('{}', { status: 503 }); };
+    await assert.rejects(callGemini({ ...params, messages: [
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'tool-1', name: 'lookup', input: {}, geminiModel: 'fallback-model', geminiThoughtSignature: 'signed' }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: '{}' }] },
+    ] }), /GEMINI_HTTP_503/);
+    assert.equal(calls.length, 1, 'never move a signed tool round-trip between models');
+    assert.match(calls[0], /fallback-model/);
+  } finally {
+    globalThis.fetch = original;
+    for (const [name, value] of Object.entries({ GEMINI_API_KEY: previous.key, WHATSAPP_GEMINI_MODEL: previous.model, WHATSAPP_GEMINI_FALLBACK_MODEL: previous.fallback })) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  }
+});
+
 test('Gemini receives server tools and returns a tool call without executing it', async () => {
   const original = globalThis.fetch;
   const key = process.env.GEMINI_API_KEY;

@@ -9,7 +9,10 @@ type Part = Record<string, unknown>;
 export async function callGemini(params: Params): Promise<Anthropic.Beta.BetaMessage> {
   const key = (process.env.GEMINI_API_KEY || '').trim();
   if (!key) throw new Error('GEMINI_NOT_CONFIGURED');
-  const model = (process.env.WHATSAPP_GEMINI_MODEL || process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
+  // Keep a tool round-trip on the same model: thought signatures belong to the
+  // model that produced them and must not be replayed to a different model.
+  const priorModel = [...params.messages].reverse().flatMap((m: any) => Array.isArray(m.content) ? m.content : []).find((b: any) => b.type === 'tool_use' && b.geminiModel)?.geminiModel;
+  const model = String(priorModel || process.env.WHATSAPP_GEMINI_MODEL || process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
   if (!/^[a-zA-Z0-9._-]+$/.test(model)) throw new Error('INVALID_GEMINI_MODEL');
   const toolNames = new Map<string, string>();
   const contents: { role: 'user' | 'model'; parts: Part[] }[] = [];
@@ -40,16 +43,27 @@ export async function callGemini(params: Params): Promise<Anthropic.Beta.BetaMes
   }
   const system = typeof params.system === 'string' ? params.system : (params.system || []).map((s: any) => s.text || '').join('\n');
   const tools = (params.tools || []).filter((t: any) => t.name && t.input_schema).map((t: any) => ({ name: t.name, description: t.description, parametersJsonSchema: t.input_schema }));
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+  const fallback = priorModel ? '' : (process.env.WHATSAPP_GEMINI_FALLBACK_MODEL ?? 'gemini-2.5-flash').trim();
+  if (fallback && !/^[a-zA-Z0-9._-]+$/.test(fallback)) throw new Error('INVALID_GEMINI_FALLBACK_MODEL');
+  const request = (selected: string) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${selected}:generateContent`, {
     method: 'POST', signal: AbortSignal.timeout(25_000),
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
     body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents, tools: [{ functionDeclarations: tools }], generationConfig: { maxOutputTokens: 2000 } }),
   });
+  let response: Response;
+  let usedFallback = false;
+  try { response = await request(model); }
+  catch (e) {
+    if (!fallback || fallback === model) throw e;
+    usedFallback = true;
+    response = await request(fallback);
+  }
+  if (!usedFallback && (response.status === 429 || response.status >= 500) && fallback && fallback !== model) { usedFallback = true; response = await request(fallback); }
   if (!response.ok) throw new Error(`GEMINI_HTTP_${response.status}`);
   const json = await response.json() as any;
   const parts = json.candidates?.[0]?.content?.parts || [];
   const blocks = parts.flatMap((p: any) => {
-    if (p.functionCall?.name) return [{ type: 'tool_use', id: crypto.randomUUID(), name: p.functionCall.name, input: p.functionCall.args || {}, geminiThoughtSignature: p.thoughtSignature }];
+    if (p.functionCall?.name) return [{ type: 'tool_use', id: crypto.randomUUID(), name: p.functionCall.name, input: p.functionCall.args || {}, geminiThoughtSignature: p.thoughtSignature, geminiModel: usedFallback ? fallback : model }];
     return typeof p.text === 'string' && !p.thought ? [{ type: 'text', text: p.text }] : [];
   });
   if (!blocks.length) throw new Error('GEMINI_EMPTY_RESPONSE');

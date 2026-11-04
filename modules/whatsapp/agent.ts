@@ -49,7 +49,8 @@ const callLlm: LlmCall = async (params) => {
 const SYSTEM = `You are Kendibot, Kendibo's automated WhatsApp assistant. Kendibo is a Nigerian marketplace for home services: cleaning, AC, plumbing, electrical, generator, fumigation, painting, appliance repair and more, done by ID-verified vendors. You help customers book, track jobs and get support, entirely inside WhatsApp.
 
 How to talk
-- Warm, brief, plain Nigerian English. Mirror Pidgin if the customer uses it. Max ~60 words per message, one question at a time.
+- Warm, brief, plain Nigerian English. Mirror Nigerian Pidgin when the customer uses it. Aim for one or two short sentences and one question per turn.
+- If the customer uses another language, respond in that language only when you understand it confidently; otherwise ask them to rephrase or offer a person. Never invent a translation or claim fluency.
 - Respond to what the customer just said before asking the next relevant question. Remember details already provided and avoid making the customer repeat them. Offer short buttons when they make the next step easier, while accepting natural replies too.
 - No emojis, no marketing hype, never invent numbers, vendor names, ratings, prices, policies or timelines.
 - Prices only ever come from the get_services tool or from vendors' quotes. If a job needs inspection, say a vendor will quote first.
@@ -168,7 +169,7 @@ async function runTool(name: string, input: Record<string, unknown>, ctx: Ctx): 
       return JSON.stringify({ saved: Object.keys(patch), missing: missing(ctx.draft) });
     }
     case 'request_location': {
-      await wa.ctaUrl(ctx.waId, 'Tap below to pin the exact spot on the map and add a landmark, so the vendor finds you easily. You can also share your location here.', 'Set location', locationLink(ctx.waId, ctx.draft.id));
+      await wa.ctaUrl(ctx.waId, 'Where is the job? Share your location or pin it below.', 'Set location', locationLink(ctx.waId, ctx.draft.id));
       ctx.sentInteractive = true;
       return JSON.stringify({ sent: true, note: 'Wait for the customer to set it; you will be told when it is saved.' });
     }
@@ -309,9 +310,9 @@ export async function runAgent(input: AgentInput): Promise<boolean> {
     return false;
   }
 
-  // reply_with_buttons already carried the reply; any other tool message (map link,
-  // vendors link) is followed by the agent's short text if it wrote one.
+  // An interactive tool already sent the relevant prompt; avoid a second,
+  // often repetitive message in the same turn.
   if (!finalText && !ctx.sentInteractive) return false;
-  if (finalText && !ctx.sentButtons) await wa.text(input.waId, finalText);
+  if (finalText && !ctx.sentInteractive) await wa.text(input.waId, finalText);
   return true;
 }

@@ -131,7 +131,7 @@ const replyText = (m: InboundMessage) =>
 
 // ── Replies ──────────────────────────────────────────────────────────────────
 async function sendWelcome(to: string, name?: string) {
-  await wa.buttons(to, `${firstName(name) ? `Hi ${firstName(name)}! ` : 'Hi! '}I'm Kendibot, Kendibo's automated assistant. I can help you request a home-service pro and check your bookings, right here in WhatsApp. Type "agent" any time to reach a person.\n\nTo get started, tell me what needs doing. A photo, your budget and when you want it done all help. You'll confirm your request before it's sent.\n\nVendors: reply START OFFERS to receive job offers by WhatsApp or SMS. Reply STOP to opt out.`, MENU_BUTTONS);
+  await wa.buttons(to, `${firstName(name) ? `Hi ${firstName(name)}! ` : 'Hi! '}I'm Kendibot, Kendibo's automated assistant. What do you need help with?\n\nType AGENT for a person. Vendors: reply START OFFERS for job offers by WhatsApp or SMS, or STOP to opt out.`, MENU_BUTTONS);
 }
 const sendMenu = (to: string, body = 'What would you like to do?') => wa.buttons(to, body, MENU_BUTTONS);
 
@@ -432,7 +432,7 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
       const d = draft ?? (await openDraft(to, user.id));
       await patchDraft(d.id, { preferred_provider_id: sf.id });
       await sendStep(to, { ...d, preferred_provider_id: sf.id }, s.data,
-        `${firstContact ? `${DISCLOSURE}\n\n` : ''}You're booking ${sf.name} through Kendibo. Your number stays private, you chat with them here, and your payment is held until the job is done.`);
+        `${firstContact ? `${DISCLOSURE}\n\n` : ''}You're requesting ${sf.name} through Kendibo. Tell me what you need.`);
       await saveSession(s);
       return;
     }
