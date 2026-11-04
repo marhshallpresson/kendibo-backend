@@ -38,9 +38,8 @@ export const INTEGRATIONS: Integration[] = [
   {
     id: 'prembly', name: 'Prembly IdentityPass (KYC/KYB)', purpose: 'NIN, BVN, face match, CAC, bank account', docs: 'https://docs.prembly.com',
     keys: [
-      { env: 'PREMBLY_SECRET_KEY', exposure: 'secret', requiredInProd: true, note: 'Secret (private) key, sent as x-api-key. Legacy name PREMBLY_API_KEY still read' },
-      { env: 'PREMBLY_APP_ID', exposure: 'secret', requiredInProd: true, note: 'Sent as app-id' },
-      { env: 'PREMBLY_PUBLIC_KEY', exposure: 'public', requiredInProd: false, note: 'Client widget/SDK only; never used for server calls' },
+      { env: 'PREMBLY_SECRET_KEY', exposure: 'secret', requiredInProd: true, note: 'Secret (private) key, sent as X-API-Key. Legacy name PREMBLY_API_KEY still read' },
+      { env: 'PREMBLY_PUBLIC_KEY', exposure: 'public', requiredInProd: false, note: 'Optional client widget/SDK key; not used for server verification calls' },
       { env: 'PREMBLY_ENVIRONMENT', exposure: 'config', requiredInProd: true, note: 'sandbox | live. Must match the keys (toggle in Prembly: Integrations → API Library)' },
       { env: 'KYC_COST_NIN_KOBO', exposure: 'config', requiredInProd: false, note: 'Your contract price per NIN lookup, in kobo' },
       { env: 'KYC_COST_BVN_KOBO', exposure: 'config', requiredInProd: false, note: 'Per BVN lookup' },

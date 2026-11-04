@@ -10,7 +10,7 @@ teaser that asks people to join. The catalogue (trades and services) stays publi
 |---|---|---|
 | 1 | Redeploy the API on Pxxl (`api-kendibo.pxxlspace.cv` returns 404) and set the server variables there | Nothing works for real users; Meta can't verify the webhook |
 | 2 | Permanent WhatsApp System User token, `WHATSAPP_BUSINESS_ACCOUNT_ID`, `FACEBOOK_APP_ID` | The current WhatsApp token expired on 31 Oct; templates and Facebook Login need the IDs |
-| 3 | `PREMBLY_APP_ID`, live Prembly keys, then `KYC_PROVIDER=prembly` | Identity checks are simulated today, so nobody is really verified |
+| 3 | Live Prembly secret key, then `KYC_PROVIDER=prembly` | Identity checks are simulated today, so nobody is really verified |
 | 4 | `BACHS_ACCOUNT_ID`, `BACHS_WEBHOOK_SECRET`, `SLING_WEBHOOK_SECRET` | Payments can't be confirmed; delivery receipts are refused |
 | 5 | Media storage on FTPS or S3 (`FTP_SECURE=false` sends the password in clear) | Security |
 | 6 | Run migrations 027–030 on production after review | New tables for the WhatsApp assistant, templates, Facebook Login |
@@ -19,8 +19,8 @@ teaser that asks people to join. The catalogue (trades and services) stays publi
 ## 2. Verification, as a first-time vendor sees it
 
 A walk-through of the current vendor flow as an artisan in Uyo with a basic Android phone and no
-company registration. It was not run against live Prembly: there is no App ID yet, and it would need
-a real person's NIN and BVN.
+company registration. It was not run against live Prembly because a real NIN/BVN lookup sends
+sensitive identity data and may incur a charge.
 
 | Step | What the person thinks | Risk | Change |
 |---|---|---|---|

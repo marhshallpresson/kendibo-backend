@@ -92,7 +92,7 @@ flowchart LR
 
 1. Redeploy the API on Pxxl. `api-kendibo.pxxlspace.cv` currently shows "Domain not connected".
 2. Set the server environment variables in the Pxxl dashboard (the local `.env` doesn't deploy). See `docs/INTEGRATIONS.md`.
-3. `BACHS_ACCOUNT_ID`; `PREMBLY_SECRET_KEY` and `PREMBLY_APP_ID` (plus `PREMBLY_ENVIRONMENT=live` once Prembly approves live keys), then set `KYC_PROVIDER=prembly`; `SLING_API_TOKEN` and `SLING_WEBHOOK_SECRET`.
+3. `BACHS_ACCOUNT_ID`; `PREMBLY_SECRET_KEY` (plus `PREMBLY_ENVIRONMENT=live` once Prembly approves live keys), then set `KYC_PROVIDER=prembly`; `SLING_API_TOKEN` and `SLING_WEBHOOK_SECRET`.
 4. Give the mobile app its own ingest-only WatchUp key; it currently ships the server key.
 5. Switch media storage to FTPS or S3 (`FTP_SECURE=false` sends credentials in plain text).
 6. Run migrations 027 and 028 against production after reviewing them.

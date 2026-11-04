@@ -31,11 +31,11 @@ production.
 |---|---|---|---|---|
 | Core | `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`, `MEDIA_SIGN_SECRET`, `KYC_CACHE_SECRET`, `DATABASE_URL`, `REDIS_URL` | `CORS_ORIGINS`, `STOREFRONT_BASE_URL` | `EXPO_PUBLIC_API_URL`, `NEXT_PUBLIC_API_URL` | — |
 | Bachs.io | `BACHS_API_KEY`, `BACHS_WEBHOOK_SECRET` | `BACHS_ACCOUNT_ID`, `BACHS_BASE_URL` | — | `<API>/webhooks/payments/bachs` |
-| Prembly | `PREMBLY_SECRET_KEY` (sent as `x-api-key`), `PREMBLY_APP_ID` (sent as `app-id`) | `PREMBLY_ENVIRONMENT` (`sandbox`/`live`), `KYC_COST_*_KOBO`, `KYC_*_BUDGET_KOBO`, `KYC_MAX_ATTEMPTS_PER_DAY`, `KYC_CACHE_DAYS`, `KYC_FEE_PASSTHROUGH` | `PREMBLY_PUBLIC_KEY` (widget/SDK only; unused today) | — |
+| Prembly | `PREMBLY_SECRET_KEY` (sent as `X-API-Key`) | `PREMBLY_ENVIRONMENT` (`sandbox`/`live`), `KYC_COST_*_KOBO`, `KYC_*_BUDGET_KOBO`, `KYC_MAX_ATTEMPTS_PER_DAY`, `KYC_CACHE_DAYS`, `KYC_FEE_PASSTHROUGH` | `PREMBLY_PUBLIC_KEY` (optional client widget/SDK only) | — |
 | WhatsApp Cloud API | `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_VERIFY_TOKEN` | `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_BUSINESS_ACCOUNT_ID`, `WHATSAPP_GRAPH_VERSION` | — | `<API>/webhooks/whatsapp` (subscribe to `messages`, `message_template_status_update`, `message_template_quality_update`, `template_category_update`) |
 | Facebook Login (same Meta app) | `FACEBOOK_APP_SECRET` (optional, defaults to `WHATSAPP_APP_SECRET`) | `FACEBOOK_APP_ID` | `EXPO_PUBLIC_FACEBOOK_APP_ID` | Data deletion `<API>/v1/auth/facebook/data-deletion`, deauthorize `<API>/v1/auth/facebook/deauthorize` |
 | Sling (only SMS provider) | `SLING_API_TOKEN`, `SLING_WEBHOOK_SECRET` | `SLING_*_SENDER` | — | `<API>/webhooks/sling` |
-| Email (SMTP first, then Sling email) | `SMTP_PASS` | `SMTP_HOST`, `SMTP_USER`, `SMTP_PORT`, `EMAIL_FROM` | — | — |
+| Email (SMTP first, then Sling email) | `SMTP_PASS` | `SMTP_HOST`, `SMTP_USER`, `SMTP_PORT`, `SMTP_FROM`, `SMTP_FROM_NAME` (`EMAIL_FROM` legacy fallback) | — | — |
 | FCM push | `FIREBASE_SERVICE_ACCOUNT_JSON` or `GOOGLE_APPLICATION_CREDENTIALS` | — | `google-services.json` (EAS secret file) | — |
 | Gemini | `GEMINI_API_KEY` | `GEMINI_MODEL` | — | — |
 | Storage | `STORAGE_ACCESS_KEY`, `STORAGE_SECRET_KEY`, `FTP_PASS` | `STORAGE_DRIVER`, `STORAGE_ENDPOINT`, `STORAGE_BUCKET` | — | — |

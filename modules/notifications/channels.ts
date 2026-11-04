@@ -42,6 +42,15 @@ export interface PushPort {
   send(token: string, title: string, body: string, data?: Record<string, string>): Promise<{ id: string }>;
 }
 
+export function resolveEmailFrom(env: NodeJS.ProcessEnv = process.env): string {
+  const smtpFrom = env.SMTP_FROM?.trim();
+  if (smtpFrom) {
+    const name = env.SMTP_FROM_NAME?.trim();
+    return name ? `${name} <${smtpFrom}>` : smtpFrom;
+  }
+  return env.EMAIL_FROM?.trim() || (env.SMTP_USER ? `Kendibo <${env.SMTP_USER}>` : 'Kendibo <hello@kendibo.com>');
+}
+
 /**
  * Sling SMS adapter (`POST https://app.sling.com.ng/api/v2/send` with `channel: 'sms'`).
  * Sling is the only SMS provider. Without SLING_API_TOKEN the client simulates
@@ -140,7 +149,7 @@ export class EmailAdapter implements EmailPort {
     : process.env.SMTP_SECURE !== 'false';
   private readonly smtpUser = process.env.SMTP_USER || '';
   private readonly smtpPass = process.env.SMTP_PASS || '';
-  private readonly from = process.env.EMAIL_FROM || (this.smtpUser ? `Kendibo <${this.smtpUser}>` : 'Kendibo <hello@kendibo.com>');
+  private readonly from = resolveEmailFrom();
   private transporter: Transporter | null = null;
 
   constructor(private readonly sling: SlingClient = slingClient) {}
