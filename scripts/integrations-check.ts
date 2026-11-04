@@ -65,17 +65,16 @@ async function main() {
 
   await check('Prembly (KYC/KYB)', ['PREMBLY_SECRET_KEY|PREMBLY_API_KEY'], async () => {
     const environment = env('PREMBLY_ENVIRONMENT') || 'sandbox';
-    if (!env('PREMBLY_APP_ID')) throw new Error('PREMBLY_APP_ID is not set: every Prembly server call needs both x-api-key (secret key) and app-id');
-    if (environment !== 'sandbox') return 'live environment: not called, a verification lookup is billed';
+    if (environment !== 'live') return 'sandbox: wallet endpoint is live-only; verification not tested';
     const base = (env('PREMBLY_BASE_URL') || 'https://api.prembly.com').replace(/\/$/, '');
-    const res = await fetch(`${base}/identitypass/verification/bvn`, {
-      method: 'POST', signal: timeout(),
-      headers: { 'x-api-key': env('PREMBLY_SECRET_KEY') || env('PREMBLY_API_KEY'), 'app-id': env('PREMBLY_APP_ID'), 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ number: '54651333604' }),
+    const res = await fetch(`${base}/api/v1/wallet/`, {
+      method: 'GET', signal: timeout(),
+      headers: { 'X-API-Key': env('PREMBLY_SECRET_KEY') || env('PREMBLY_API_KEY'), Accept: 'application/json' },
     });
     const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     if (res.status === 401 || res.status === 403) throw new Error(`keys refused (HTTP ${res.status}): ${String(body.detail ?? body.message ?? '')}`);
-    return `sandbox call answered HTTP ${res.status}, response_code ${String(body.response_code ?? '-')}: ${String(body.detail ?? body.message ?? '')}`.slice(0, 200)
+    if (!res.ok) throw new Error(`wallet check: HTTP ${res.status}`);
+    return `secret key accepted by non-billable wallet endpoint (${environment} configuration)`
       + `${env('KYC_PROVIDER') === 'prembly' ? '' : `; KYC_PROVIDER=${env('KYC_PROVIDER') || 'prembly'} (set it to prembly to use these keys)`}`;
   });
 

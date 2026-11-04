@@ -22,18 +22,17 @@ const schema = z.object({
   BACHS_WEBHOOK_SECRET: z.string().default(''),
   BACHS_ACCOUNT_ID: z.string().default(''),
   SMTP_HOST: z.string().default(''),
+  SMTP_FROM: z.string().default(''),
+  SMTP_FROM_NAME: z.string().default('Kendibo'),
   WATCHUP_API_KEY: z.string().default(''),
   WATCHUP_ENV: z.string().default('development'),
   WATCHUP_RELEASE: z.string().default('dev'),
   KYC_PROVIDER: z.string().default('prembly'),
   DOJAH_API_KEY: z.string().default(''),
-  // Prembly (IdentityPass) — https://docs.prembly.com/docs/authentication.
-  // Server calls send PREMBLY_SECRET_KEY as `x-api-key` and PREMBLY_APP_ID as
-  // `app-id`. PREMBLY_PUBLIC_KEY is for client widgets/SDKs only, never the API.
-  // Sandbox and live share one base URL; the key decides which you hit.
+  // Prembly server verification calls use the secret key only. The public key
+  // belongs to client widgets/SDKs and is not sent by the server.
   PREMBLY_SECRET_KEY: z.string().default(''),
   PREMBLY_API_KEY: z.string().default(''), // legacy name for the secret key
-  PREMBLY_APP_ID: z.string().default(''),
   PREMBLY_PUBLIC_KEY: z.string().default(''),
   PREMBLY_ENVIRONMENT: z.enum(['sandbox', 'live']).default('sandbox'),
   PREMBLY_BASE_URL: z.string().default('https://api.prembly.com'),
@@ -69,8 +68,7 @@ if (config.NODE_ENV === 'production') {
   if (config.ALLOW_OTP_DEBUG === 'true') throw new Error('REFUSED TO BOOT — ALLOW_OTP_DEBUG must never be true in production');
   for (const [k, v] of [['BACHS_API_KEY', config.BACHS_API_KEY], ['SLING_API_TOKEN', config.SLING_API_TOKEN],
       ['SMTP_HOST', config.SMTP_HOST], ['WATCHUP_API_KEY', config.WATCHUP_API_KEY],
-      ['PREMBLY_SECRET_KEY', config.PREMBLY_SECRET_KEY || config.PREMBLY_API_KEY],
-      ['PREMBLY_APP_ID', config.PREMBLY_APP_ID]] as const) {
+      ['PREMBLY_SECRET_KEY', config.PREMBLY_SECRET_KEY || config.PREMBLY_API_KEY]] as const) {
     if (!v) console.warn(`[config] production running without ${k} (related feature degrades safely)`);
   }
   if (config.KYC_PROVIDER === 'stub') console.warn('[config] KYC_PROVIDER=stub: identity checks are simulated, nobody is really verified');

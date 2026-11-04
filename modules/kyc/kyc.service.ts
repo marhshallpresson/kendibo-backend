@@ -219,31 +219,27 @@ export function verifyNameAlignment(input: NameAlignmentInput): NameAlignmentRes
   };
 }
 
-// ── Prembly (IdentityPass) Adapter (`docs.prembly.com`) ─────────────────────
-// Auth (docs.prembly.com/docs/authentication): server calls send the SECRET
-// (private) key as `x-api-key` and the App ID as `app-id`; no Authorization
-// header. The PUBLIC key is only for client widgets/SDKs. Sandbox and live share
-// https://api.prembly.com — the key decides the environment.
-// Base URL: `https://api.prembly.com`; documented paths are `/identitypass/verification/...` (bare `/verification/...` tried as fallback)
-// Response shape: `{ status: boolean, response_code: "00" | "01" | ..., detail, verification: { status: "VERIFIED" | ... }, data: {...} }`
+// ── Prembly IdentityPass adapter ────────────────────────────────────────────
+// Current API reference uses only X-API-Key for server calls. The public key
+// belongs to client widgets; no App ID is required for these API endpoints.
 class PremblyKycAdapter implements KycAdapter {
   readonly name = 'prembly';
   constructor(
     private readonly apiKey: string,
-    private readonly appId: string,
     private readonly baseUrl = process.env.PREMBLY_BASE_URL || 'https://api.prembly.com',
   ) {}
 
   private async post(path: string, body: Record<string, unknown>, fallbackPath?: string): Promise<Record<string, unknown>> {
     const base = this.baseUrl.replace(/\/$/, '').replace(/\/identitypass$/, '');
-    const cleanPath = path.replace(/^\/identitypass/, '');
-    const candidateUrls = [
-      `${base}/identitypass${cleanPath}`,
-      `${base}${cleanPath}`,
-    ];
+    const urlsFor = (candidatePath: string) => {
+      if (candidatePath.startsWith('/api/v1/')) return [`${base}${candidatePath}`];
+      if (candidatePath === '/verification/vnin' || candidatePath === '/verification/bvn_validation') return [`${base}${candidatePath}`];
+      const cleanPath = candidatePath.replace(/^\/identitypass/, '');
+      return [`${base}/identitypass${cleanPath}`, `${base}${cleanPath}`];
+    };
+    const candidateUrls = urlsFor(path);
     if (fallbackPath) {
-      const cleanFallback = fallbackPath.replace(/^\/identitypass/, '');
-      candidateUrls.push(`${base}/identitypass${cleanFallback}`, `${base}${cleanFallback}`);
+      candidateUrls.push(...urlsFor(fallbackPath));
     }
 
     let lastStatus = 0;
@@ -253,8 +249,7 @@ class PremblyKycAdapter implements KycAdapter {
         headers: {
           'Content-Type': 'application/json',
           'Accept': 'application/json',
-          'x-api-key': this.apiKey,
-          'app-id': this.appId,
+          'X-API-Key': this.apiKey,
         },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(15_000),
@@ -310,11 +305,7 @@ class PremblyKycAdapter implements KycAdapter {
   async verifyNin(nin: string): Promise<KycCheckResult> {
     if (!NIN_RE.test(nin)) return { passed: false, provider: this.name, reason: 'NIN_FORMAT' };
     try {
-      const r = await this.post(
-        '/verification/vnin-basic',
-        { number_nin: nin, number: nin },
-        '/verification/nin',
-      );
+      const r = await this.post('/verification/vnin', { number_nin: nin });
       return this.interpret(r);
     } catch (e) {
       return { passed: false, provider: this.name, reason: (e as Error).message };
@@ -339,11 +330,7 @@ class PremblyKycAdapter implements KycAdapter {
   async verifyBvn(bvn: string): Promise<KycCheckResult> {
     if (!BVN_RE.test(bvn)) return { passed: false, provider: this.name, reason: 'BVN_FORMAT' };
     try {
-      const r = await this.post(
-        '/verification/bvn_validation',
-        { number: bvn },
-        '/verification/bvn',
-      );
+      const r = await this.post('/verification/bvn_validation', { number: bvn });
       return this.interpret(r);
     } catch (e) {
       return { passed: false, provider: this.name, reason: (e as Error).message };
@@ -650,13 +637,13 @@ export function selectKycAdapter(): KycAdapter {
   // An explicit stub means no provider calls at all, even when keys are present.
   if (pref === 'stub') return new PremblySandboxAdapter();
   if (pref === 'prembly' && premblySecret()) {
-    return new PremblyKycAdapter(premblySecret(), process.env.PREMBLY_APP_ID || '');
+    return new PremblyKycAdapter(premblySecret());
   }
   if (pref === 'dojah' && process.env.DOJAH_SECRET_KEY) {
     return new DojahKycAdapter(process.env.DOJAH_SECRET_KEY, process.env.DOJAH_APP_ID || '');
   }
   if (premblySecret()) {
-    return new PremblyKycAdapter(premblySecret(), process.env.PREMBLY_APP_ID || '');
+    return new PremblyKycAdapter(premblySecret());
   }
   if (process.env.DOJAH_SECRET_KEY) {
     return new DojahKycAdapter(process.env.DOJAH_SECRET_KEY, process.env.DOJAH_APP_ID || '');
