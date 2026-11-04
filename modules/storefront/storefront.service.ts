@@ -240,8 +240,8 @@ const esc = (v: unknown) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '
  * prefilled with the storefront reference the bot uses to route the booking.
  */
 export function waConnect(sf: { name: string; slug: string | null }): string | null {
-  const number = (process.env.WHATSAPP_BUSINESS_NUMBER ?? '').replace(/D/g, '');
-  if (!number || !sf.slug) return null;
+  const number = (process.env.WHATSAPP_BUSINESS_NUMBER ?? '').replace(/\D/g, '');
+  if (!/^[1-9]\d{7,14}$/.test(number) || !sf.slug) return null;
   return `https://wa.me/${number}?text=${encodeURIComponent(`Hi Kendibo, I'd like to book ${sf.name} (ref KB-${sf.slug})`)}`;
 }
 

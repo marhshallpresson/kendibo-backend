@@ -54,6 +54,7 @@ import { storefrontService } from '../../../modules/storefront/storefront.servic
 import { surfaceFor } from '../../../packages/shared/clients.js';
 void surfaceFor;
 import { Writable } from 'node:stream';
+import { safeRequestLog } from '../../../packages/observability/safe-request-log.js';
 import crypto from 'node:crypto';
 import { watchupTracing } from '../../../packages/observability/watchup/fastify.js';
 import { watchup as watchupClient } from '../../../packages/observability/watchup.adapter.js';
@@ -71,7 +72,7 @@ const logStream = new Writable({
 });
 
 const app = Fastify({
-  logger: { stream: logStream },
+  logger: { stream: logStream, serializers: { req: safeRequestLog } },
   genReqId: () => `req_${Date.now().toString(36)}${Math.floor(Math.random() * 1e6)}`,
   trustProxy: PROD, // Pxxl edge terminates TLS ahead of the container
 });
@@ -354,7 +355,14 @@ app.post('/v1/auth/otp/request', OTP_LIMIT, async (req, reply) => {
     if (e instanceof z.ZodError) return fail(reply, 'BAD_REQUEST', 'Enter a valid phone number or email address.', 400);
     const msg = (e as Error).message;
     if (msg === 'BAD_IDENTITY') return fail(reply, 'BAD_IDENTITY', 'Enter a valid phone number or email address.');
-    if (msg === 'SEND_FAILED') return fail(reply, 'SEND_FAILED', 'Could not deliver the code. Try again.', 502, true);
+    if (msg === 'SEND_FAILED') {
+      const cause = (e as Error & { cause?: unknown }).cause;
+      const causeMessage = cause instanceof Error ? cause.message : '';
+      const reason = /you cannot send a (otp|transactional) with this sender/i.test(causeMessage) ? 'SENDER_ROUTE_NOT_ALLOWED' : 'DELIVERY_ERROR';
+      const channel = (req.body as { channel?: unknown } | null)?.channel;
+      req.log.warn({ reason, channel: channel === 'phone' || channel === 'email' ? channel : 'unknown' }, '[otp] delivery failed');
+      return fail(reply, 'SEND_FAILED', 'Could not deliver the code. Try again.', 502, true);
+    }
     throw e;
   }
 });
@@ -909,7 +917,7 @@ app.post('/v1/wallet/topup', async (req, reply) => {
   try {
     const session = await payments.createCheckout({
       bookingId: 'wallet_topup', amountKobo: BigInt(parsed.data.amountKobo),
-      customerEmail: user?.email || 'user@kendibo.com', reference: ref, idempotencyKey: idem,
+      ...(user?.email ? { customerEmail: user.email } : {}), reference: ref, idempotencyKey: idem,
     });
     observability.track('wallet.topup_initiated', { psp: session.psp });
     return { data: session };

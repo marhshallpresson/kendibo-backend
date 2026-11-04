@@ -13,7 +13,7 @@ import type { Understanding } from './nlu/index.js';
 
 export type Step = 'need' | 'trade' | 'photo' | 'budget' | 'location' | 'day' | 'window' | 'confirm';
 /** Per-conversation flags kept in messaging.whatsapp_session.data. */
-export interface Asked { photo?: boolean; budget?: boolean; dayPick?: boolean; lang?: 'en' | 'pcm' }
+export interface Asked { photo?: boolean; budget?: boolean; dayPick?: boolean; lang?: 'en' | 'pcm'; cancelDraftId?: string }
 
 const naira = (k: bigint | number | string) => `₦${(Number(k) / 100).toLocaleString('en-NG', { maximumFractionDigits: 0 })}`;
 const say = (lang: Asked['lang'], en: string, pcm?: string) => (lang === 'pcm' && pcm ? pcm : en);
@@ -93,22 +93,22 @@ export async function sendStep(waId: string, d: Draft, a: Asked, lead = ''): Pro
   const pre = lead ? `${lead}\n\n` : '';
   switch (step) {
     case 'need':
-      await wa.text(waId, pre + say(L, 'What needs doing? Tell me in a few words, for example "AC leaking water" or "3-bedroom deep clean".', 'Wetin you want make we do? Talk am short, like "AC dey leak water" or "clean 3-bedroom flat".'));
+      await wa.text(waId, pre + say(L, 'What needs fixing or cleaning?', 'Wetin you need help with?'));
       break;
     case 'trade':
       await wa.list(waId, pre + say(L, 'Which kind of job is it?', 'Which kind work be this?'), 'Choose a trade',
         (await trades()).map((c) => ({ id: `cat:${c.id}`, title: c.name, description: c.description ?? undefined })));
       break;
     case 'photo':
-      await wa.buttons(waId, pre + say(L, 'Can you send a photo of the problem? It helps vendors quote faster.', 'You fit send picture of the problem? E go help vendors price am quick.'),
+      await wa.buttons(waId, pre + say(L, 'Can you send a photo?', 'You fit send picture?'),
         [{ id: 'flow:skip_photo', title: say(L, 'Skip photo', 'No picture') }]);
       break;
     case 'budget':
-      await wa.buttons(waId, pre + say(L, 'Do you have a budget in naira? Type it, for example 15k. You can also skip this.', 'You get budget? Type am, like 15k. You fit skip am too.'),
+      await wa.buttons(waId, pre + say(L, 'Have a budget? Type it, like 15k, or skip.', 'You get budget? Type am, like 15k, or skip.'),
         [{ id: 'flow:skip_budget', title: say(L, 'No budget', 'No budget') }]);
       break;
     case 'location':
-      await wa.ctaUrl(waId, pre + say(L, 'Where is the job? Tap below to pin the exact spot and add a landmark, so the vendor finds you easily. You can also share your location here or type the address.', 'Where the work dey? Tap below to show the exact place and landmark. You fit also share your location or type the address.'),
+      await wa.ctaUrl(waId, pre + say(L, 'Where is the job? Share your location, type the address, or pin it below.', 'Where the work dey? Share location, type address, or pin am below.'),
         'Set location', locationLink(waId, d.id));
       break;
     case 'day': {
@@ -131,7 +131,7 @@ export async function sendStep(waId: string, d: Draft, a: Asked, lead = ''): Pro
       break;
     }
     case 'confirm':
-      await wa.buttons(waId, `${pre}Here's your request:\n${await summary(d)}\n\nShall I find verified vendors near you?`, [
+      await wa.buttons(waId, `${pre}Here's your request:\n${await summary(d)}\n\nShall I find vendors?`, [
         { id: 'flow:confirm', title: 'Find vendors' }, { id: 'flow:change', title: 'Change something' },
       ]);
       break;

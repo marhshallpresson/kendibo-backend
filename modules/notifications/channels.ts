@@ -135,7 +135,9 @@ export class SlingTruecallerAdapter implements TruecallerPort {
 export class EmailAdapter implements EmailPort {
   private readonly smtpHost = process.env.SMTP_HOST || '';
   private readonly smtpPort = Number(process.env.SMTP_PORT || 465);
-  private readonly smtpSecure = (process.env.SMTP_SECURE ?? 'true') !== 'false';
+  private readonly smtpSecure = process.env.SMTP_SECURE === undefined
+    ? this.smtpPort === 465
+    : process.env.SMTP_SECURE !== 'false';
   private readonly smtpUser = process.env.SMTP_USER || '';
   private readonly smtpPass = process.env.SMTP_PASS || '';
   private readonly from = process.env.EMAIL_FROM || (this.smtpUser ? `Kendibo <${this.smtpUser}>` : 'Kendibo <hello@kendibo.com>');

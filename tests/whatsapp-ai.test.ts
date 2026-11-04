@@ -45,6 +45,25 @@ describe('signed WhatsApp links', () => {
   });
 });
 
+it('an interactive location prompt is not followed by a duplicate AI message', async () => {
+  const { setLlmForTests, runAgent } = await import('../modules/whatsapp/agent.js');
+  const { wa } = await import('../modules/whatsapp/whatsapp.client.js');
+  const waId = `23481${Math.floor(Math.random() * 1e8)}`;
+  const user = (await q<{ id: string }>(`INSERT INTO identity.users (phone, role) VALUES ($1,'CUSTOMER') RETURNING id`, [`+${waId}`]))[0].id;
+  const originalCta = wa.ctaUrl, originalText = wa.text;
+  let ctaCount = 0, textCount = 0, calls = 0;
+  try {
+    wa.ctaUrl = async () => { ctaCount++; };
+    wa.text = async () => { textCount++; };
+    setLlmForTests(async () => ++calls === 1
+      ? msg([toolUse('request_location', {})], 'tool_use')
+      : msg([{ type: 'text', text: 'Please use the location button.' }], 'end_turn'));
+    assert.equal(await runAgent({ waId, userId: user, text: 'I need a plumber' }), true);
+    assert.equal(ctaCount, 1);
+    assert.equal(textCount, 0);
+  } finally { wa.ctaUrl = originalCta; wa.text = originalText; setLlmForTests(null); }
+});
+
 describe('WhatsApp webhook signature', () => {
   it('rejects unsigned posts and accepts a valid X-Hub-Signature-256', async () => {
     const payload = JSON.stringify({ entry: [] });

@@ -42,7 +42,7 @@ export class BachsAdapter implements PaymentPort {
       idempotencyKey: input.idempotencyKey,
       body: JSON.stringify({
         pricing: { currency: input.currency ?? 'NGN', amount },
-        customer: { email: input.customerEmail, name: input.customerName },
+        ...(input.customerEmail ? { customer: { email: input.customerEmail, ...(input.customerName ? { name: input.customerName } : {}) } } : {}),
         reference: input.reference,
         // Live Bachs rejects non-http(s) schemes ("success_url must use http://
         // or https:// scheme") — deep-link fallbacks belong on the https page.
@@ -58,6 +58,12 @@ export class BachsAdapter implements PaymentPort {
       reference: input.reference,
       status: 'open',
     };
+  }
+
+  async getCheckout(checkoutId: string, reference: string): Promise<CheckoutSession> {
+    const json = await bachsFetch(`/v1/checkout-sessions/${encodeURIComponent(checkoutId)}`, { method: 'GET' });
+    if (json.checkout_id !== checkoutId || json.status !== 'open' || (json.reference && json.reference !== reference)) throw new Error('CHECKOUT_NOT_OPEN');
+    return { psp: 'bachs', checkoutId, checkoutUrl: null, reference, status: 'open' };
   }
 
   async verifyByReference(reference: string): Promise<VerifiedPayment> {

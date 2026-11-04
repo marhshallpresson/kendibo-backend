@@ -8,7 +8,7 @@ export interface CreateCheckoutInput {
   bookingId: string;
   amountKobo: Kobo;
   currency?: 'NGN';
-  customerEmail: string;
+  customerEmail?: string;
   customerName?: string;
   reference: string; // our idempotency reference, max 128 chars
   metadata?: Record<string, string>;
@@ -51,6 +51,7 @@ export interface PayoutInput {
 export interface PaymentPort {
   readonly name: PSP;
   createCheckout(input: CreateCheckoutInput): Promise<CheckoutSession>;
+  getCheckout?(checkoutId: string, reference: string): Promise<CheckoutSession>;
   verifyByReference(reference: string): Promise<VerifiedPayment>;
   verifyByChargeId(chargeId: string): Promise<VerifiedPayment>;
   refund(input: RefundInput): Promise<{ refundId: string; status: string }>;

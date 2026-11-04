@@ -32,6 +32,16 @@ async function realUser(email: string) {
 }
 
 describe('unified login (account check + device history)', () => {
+  it('returns a safe error when the OTP sender is rejected', async () => {
+    const { sms } = await import('../modules/notifications/channels.js');
+    const original = sms.send;
+    try {
+      sms.send = async () => { throw new Error('You cannot send a otp with this sender'); };
+      const r = await app.inject({ method: 'POST', url: '/v1/auth/otp/request', payload: { channel: 'phone', identity: '07070000000' } });
+      assert.equal(r.statusCode, 502);
+      assert.doesNotMatch(JSON.stringify(r.json()), /You cannot send|07070000000/);
+    } finally { sms.send = original; }
+  });
   it('account-exists detects email and normalises phone', async () => {
     const email = `login-${randomUUID()}@kendibo.local`;
     const u = await realUser(email);

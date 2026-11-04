@@ -103,6 +103,31 @@ describe('understanding layer', () => {
 });
 
 describe('conversations through the router (no LLM)', () => {
+  it('does not cancel a draft from a predicted intent without customer confirmation', async () => {
+    const w = number();
+    await tap(w, 'menu:book', 'Book a service');
+    await tap(w, 'cancel:confirm', 'Yes, cancel');
+    assert.equal((await draftOf(w)).status, 'collecting');
+    const reply = await botReply(w, () => say(w, 'any progress on the request I submitted'));
+    assert.equal((await draftOf(w)).status, 'collecting');
+    if (/cancel your request/i.test(reply)) {
+      await tap(w, 'cancel:keep', 'Keep request');
+      assert.equal((await draftOf(w)).status, 'collecting');
+    }
+    await say(w, 'cancel my booking');
+    assert.equal((await draftOf(w)).status, 'collecting');
+    await tap(w, 'cancel:confirm', 'Yes, cancel');
+    assert.equal((await draftOf(w)).status, 'abandoned');
+  });
+  it('keeps a misspelled appliance problem in the active booking instead of showing status', async () => {
+    const w = number();
+    await tap(w, 'menu:book', 'Book a service');
+    const r = await botReply(w, () => say(w, 'Omo my frezzer is not working'));
+    const d = await draftOf(w);
+    assert.equal(d.need, 'Omo my frezzer is not working');
+    assert.equal(d.category_id, 'appliance');
+    assert.doesNotMatch(r, /You have no bookings yet/);
+  });
   it('first contact says it is an automated assistant and offers the menu', async () => {
     const w = number();
     const r = await botReply(w, () => say(w, 'hi'));

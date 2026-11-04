@@ -28,7 +28,6 @@ import { currentDraft, openDraft, patchDraft, addPhotoToDraft, saveDraftLocation
 import { nextStep, sendStep, handleFlowTap, patchFromUnderstanding, acknowledge, tradeName, type Asked, type Step } from './flow.js';
 import { FACTS, priceLines } from './facts.js';
 import { OPT_IN, OPT_OUT, llmAllowed, sendBusinessInitiated, notifyCustomer, setJobOfferConsent } from './policy.js';
-import { payToken } from './links.js';
 import { activeRelay, closeRelay, relayText, relayMedia } from './relay.js';
 
 type State = 'BOT' | 'HUMAN';
@@ -47,7 +46,7 @@ export interface InboundMessage {
 }
 
 interface Deps {
-  createCheckout: (input: { bookingId: string; amountKobo: bigint; customerEmail: string; reference: string; idempotencyKey: string }) => Promise<{ checkoutUrl?: string | null; psp?: string }>;
+  createCheckout: (input: { bookingId: string; amountKobo: bigint; customerEmail?: string; reference: string; idempotencyKey: string }) => Promise<{ checkoutUrl?: string | null; psp?: string }>;
 }
 let deps: Deps | null = null;
 export function configureWhatsappBot(d: Deps) { deps = d; }
@@ -132,7 +131,7 @@ const replyText = (m: InboundMessage) =>
 
 // ── Replies ──────────────────────────────────────────────────────────────────
 async function sendWelcome(to: string, name?: string) {
-  await wa.buttons(to, `${firstName(name) ? `Hi ${firstName(name)}! ` : 'Hi! '}I'm Kendibot, Kendibo's automated assistant. I can help you request a home-service pro and check your bookings, right here in WhatsApp. Type "agent" any time to reach a person.\n\nTo get started, tell me what needs doing. A photo, your budget and when you want it done all help. You'll confirm your request before it's sent.\n\nVendors: reply START OFFERS to receive job offers by WhatsApp or SMS. Reply STOP to opt out.`, MENU_BUTTONS);
+  await wa.buttons(to, `${firstName(name) ? `Hi ${firstName(name)}! ` : 'Hi! '}I'm Kendibot, Kendibo's automated assistant. What do you need help with?\n\nType AGENT for a person. Vendors: reply START OFFERS for job offers by WhatsApp or SMS, or STOP to opt out.`, MENU_BUTTONS);
 }
 const sendMenu = (to: string, body = 'What would you like to do?') => wa.buttons(to, body, MENU_BUTTONS);
 
@@ -280,7 +279,9 @@ async function processAndMark(m: InboundMessage, profileName?: string) {
     await processInbound(m, profileName);
   } catch (e) {
     observability.captureException(e);
-    console.error('[whatsapp] inbound processing failed');
+    const message = e instanceof Error ? e.message : '';
+    const reason = /^WHATSAPP_SEND_\d{3}(?:_META_\d{1,8})?$/.test(message) ? message : 'INBOUND_PROCESSING_ERROR';
+    console.error('[whatsapp] inbound processing failed', { reason });
     // If even the fallback cannot be delivered, leave the message unprocessed
     // for the bounded recovery sweep instead of silently discarding it.
     await wa.text(m.from, 'Something went wrong on our side. Please try again in a moment, or type "agent" to reach a person.');
@@ -372,6 +373,16 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
         await handOff(s, user.id, to, 'asked for a person from the menu');
       } else if (id === 'flow:resume') {
         if (draft) await sendStep(to, draft, s.data); else await sendMenu(to);
+      } else if (id === 'cancel:confirm') {
+        if (draft && s.data.cancelDraftId === draft.id) {
+          await cancelDraft(draft.id);
+          s.data = { lang: s.data.lang };
+          await sendMenu(to, 'Cancelled. Nothing was sent to vendors.');
+        } else await sendMenu(to, 'That cancellation confirmation has expired.');
+      } else if (id === 'cancel:keep') {
+        delete s.data.cancelDraftId;
+        if (draft) await sendStep(to, draft, s.data, 'Your request is still in progress.');
+        else await sendMenu(to);
       } else if (id === 'flow:confirm' && !draft) {
         await sendMenu(to, 'That request has already been sent. Want to do something else?');
       } else if (id.startsWith('flow:') || id.startsWith('cat:')) {
@@ -423,7 +434,7 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
       const d = draft ?? (await openDraft(to, user.id));
       await patchDraft(d.id, { preferred_provider_id: sf.id });
       await sendStep(to, { ...d, preferred_provider_id: sf.id }, s.data,
-        `${firstContact ? `${DISCLOSURE}\n\n` : ''}You're booking ${sf.name} through Kendibo. Your number stays private, you chat with them here, and your payment is held until the job is done.`);
+        `${firstContact ? `${DISCLOSURE}\n\n` : ''}You're requesting ${sf.name} through Kendibo. Tell me what you need.`);
       await saveSession(s);
       return;
     }
@@ -438,6 +449,11 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
   // ── Text ──────────────────────────────────────────────────────────────────
   const step: Step | null = draft ? nextStep(draft, s.data) : null;
   const u = await understand(text, { expectingBudget: step === 'budget' });
+  // An uncertain status prediction must not swallow a customer's description
+  // while we're asking what needs fixing. Keep explicit status requests usable.
+  if (draft && step === 'need' && u.intent === 'status' && !u.sure && !/\b(bookings?|orders?|requests?|jobs?|vendor|technician|appointment|status|update|history)\b/i.test(text)) {
+    u.intent = 'details';
+  }
   s.data.lang = u.language === 'pcm' ? 'pcm' : (s.data.lang ?? 'en');
   let route = 'flow';
   const lead = (x: string) => (firstContact ? `${DISCLOSURE}\n\n${x}`.trim() : x);
@@ -460,9 +476,11 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
     await sendStatus(to, user.id, draft);
   } else if (u.intent === 'cancel') {
     if (draft) {
-      await cancelDraft(draft.id);
-      s.data = { lang: s.data.lang };
-      await sendMenu(to, 'Cancelled. Nothing was sent to vendors.');
+      s.data.cancelDraftId = draft.id;
+      await wa.buttons(to, 'Would you like to cancel your request in progress?', [
+        { id: 'cancel:confirm', title: 'Yes, cancel' },
+        { id: 'cancel:keep', title: 'Keep request' },
+      ]);
     } else {
       await sendMenu(to, 'To cancel a booking that is already confirmed, open the Kendibo app and go to Bookings, or type "agent" and we\'ll do it for you.');
     }
@@ -522,7 +540,7 @@ export async function payLinkTarget(waId: string, bookingId: string): Promise<{ 
   if (!deps || amount <= 0n) return { done: 'Open the Kendibo app to pay for this booking.' };
   const email = await q<{ email: string | null }>(`SELECT email FROM identity.users WHERE id=$1`, [b[0].user_id]);
   const session = await deps.createCheckout({
-    bookingId, amountKobo: amount, customerEmail: email[0]?.email || `wa${waId.replace(/\D/g, '')}@customers.kendibo.ng`,
+    bookingId, amountKobo: amount, ...(email[0]?.email ? { customerEmail: email[0].email } : {}),
     reference: `bk_${bookingId}_wa`, idempotencyKey: `wa_accept_${bookingId}`,
   });
   return session.checkoutUrl ? { url: session.checkoutUrl } : { done: 'Open the Kendibo app to pay for this booking.' };
@@ -591,7 +609,7 @@ export async function notifyRequestAccepted(requestId: string, bookingId: string
     return;
   }
   const session = await deps.createCheckout({
-    bookingId, amountKobo: amount, customerEmail: email[0]?.email || `wa${to}@customers.kendibo.ng`,
+    bookingId, amountKobo: amount, ...(email[0]?.email ? { customerEmail: email[0].email } : {}),
     reference: `bk_${bookingId}_wa`, idempotencyKey: `wa_accept_${bookingId}`,
   });
   if (!session.checkoutUrl) {
@@ -599,11 +617,11 @@ export async function notifyRequestAccepted(requestId: string, bookingId: string
     return;
   }
   const checkoutUrl = session.checkoutUrl;
-  const line = `${who} accepted your job. Pay ${naira(amount)} to confirm. Kendibo holds it until you say the job is done.`;
+  const line = `${who} accepted your job. Pay ${naira(amount)} to confirm.`;
   await sendBusinessInitiated({
     waId: to,
     whatsapp: () => wa.ctaUrl(to, line, 'Pay securely', checkoutUrl),
-    template: { key: 'vendor_accepted', params: [who, naira(amount)], buttons: [{ index: 0, urlSuffix: encodeURIComponent(payToken(to, bookingId)) }] },
+    template: { key: 'request_update', params: [`${line} ${checkoutUrl}`] },
     sms: `${line} ${checkoutUrl}`,
   });
 }

@@ -3,7 +3,7 @@
 // With one PSP there is no failover, so transient Bachs failures (timeouts,
 // 429/5xx) get one quick retry with the SAME idempotency key — safe, because
 // Bachs dedupes on it — before the caller sees PSP_UNAVAILABLE.
-import type { PaymentPort, PSP, CreateCheckoutInput, VerifiedPayment } from './payment.port.js';
+import type { PaymentPort, PSP, CreateCheckoutInput, CheckoutSession, VerifiedPayment } from './payment.port.js';
 import { BachsAdapter } from './bachs.adapter.js';
 import { q } from '../../packages/database/db.js';
 
@@ -28,28 +28,44 @@ export class PaymentService {
     this.adapters = { bachs: adapters?.bachs ?? new BachsAdapter() };
   }
 
-  private async recordIntent(psp: PSP, checkoutId: string, input: CreateCheckoutInput): Promise<void> {
+  private async recordIntent(psp: PSP, checkoutId: string, checkoutUrl: string | null, input: CreateCheckoutInput): Promise<boolean> {
     const bookingId = input.bookingId === 'wallet_topup' ? '00000000-0000-0000-0000-000000000000' : input.bookingId;
     try {
       await q(
-        `INSERT INTO payment.payment (booking_id, psp, reference, charge_id, amount_kobo, status)
-         VALUES ($1, $2, $3, $4, $5, 'pending')`,
-        [bookingId, psp, input.reference, checkoutId, Number(input.amountKobo)],
+        `INSERT INTO payment.payment (booking_id, psp, reference, charge_id, amount_kobo, status, checkout_url)
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6)`,
+        [bookingId, psp, input.reference, checkoutId, Number(input.amountKobo), checkoutUrl],
       );
-    } catch { /* duplicate reference -> idempotent replay, ignore */ }
+      return true;
+    } catch (error) {
+      if ((error as { code?: string }).code !== '23505') throw error;
+      const existing = await q<{ booking_id: string; amount_kobo: string; psp: string }>(
+        `SELECT booking_id, amount_kobo, psp FROM payment.payment WHERE reference=$1`, [input.reference],
+      );
+      if (!existing[0] || String(existing[0].booking_id) !== bookingId || BigInt(String(existing[0].amount_kobo)) !== input.amountKobo || existing[0].psp !== psp) throw new Error('PAYMENT_REFERENCE_CONFLICT');
+      return false;
+    }
   }
 
-  async createCheckout(input: CreateCheckoutInput, preferred: PSP = 'bachs') {
+  async createCheckout(input: CreateCheckoutInput, preferred: PSP = 'bachs'): Promise<CheckoutSession> {
     // Check postgres for idempotency
-    const existing = await q<{ psp: PSP; charge_id: string }>(
-      `SELECT psp, charge_id FROM payment.payment WHERE reference=$1 LIMIT 1`,
+    const existing = await q<{ psp: PSP; charge_id: string; booking_id: string; amount_kobo: string; status: string; checkout_url: string | null }>(
+      `SELECT psp, charge_id, booking_id, amount_kobo, status, checkout_url FROM payment.payment WHERE reference=$1 LIMIT 1`,
       [input.reference]
     );
-    if (existing[0]) return { psp: existing[0].psp, checkoutId: existing[0].charge_id || '' };
+    if (existing[0]) {
+      const bookingId = input.bookingId === 'wallet_topup' ? '00000000-0000-0000-0000-000000000000' : input.bookingId;
+      if (String(existing[0].booking_id) !== bookingId || BigInt(String(existing[0].amount_kobo)) !== input.amountKobo || existing[0].psp !== preferred) throw new Error('PAYMENT_REFERENCE_CONFLICT');
+      if (existing[0].status !== 'pending' || !existing[0].charge_id || !existing[0].checkout_url) throw new Error('CHECKOUT_NOT_OPEN');
+      const getCheckout = this.adapters[preferred].getCheckout;
+      if (!getCheckout) throw new Error('CHECKOUT_RECOVERY_UNAVAILABLE');
+      const session = await withRetry(() => getCheckout.call(this.adapters[preferred], existing[0].charge_id, input.reference));
+      return { ...session, checkoutUrl: existing[0].checkout_url };
+    }
 
     const s = await withRetry(() => this.adapters[preferred].createCheckout(input));
-    await this.recordIntent(s.psp, s.checkoutId, input);
-    return s;
+    if (!s.checkoutId || !s.checkoutUrl) throw new Error('CHECKOUT_UNAVAILABLE');
+    return await this.recordIntent(s.psp, s.checkoutId, s.checkoutUrl, input) ? s : this.createCheckout(input, preferred);
   }
 
   /** Server-side verify of a charge (webhook is never trusted alone). */
@@ -127,7 +143,8 @@ export class PaymentService {
         `SELECT amount_kobo, status FROM payment.payment WHERE reference=$1`, [verified.reference],
       );
       const local = rows[0];
-      if (local && local.status !== 'successful' && BigInt(String(local.amount_kobo)) !== verified.amountKobo) {
+      if (!local) return { ok: true, notFound: true };
+      if (BigInt(String(local.amount_kobo)) !== verified.amountKobo) {
         return { ok: true, amountMismatch: true };
       }
       await q(

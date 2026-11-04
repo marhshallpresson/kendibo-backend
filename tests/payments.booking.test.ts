@@ -16,6 +16,7 @@ const fakePsp = {
     psp: 'bachs', checkoutId: `chk_test_${input.reference}`,
     checkoutUrl: 'https://pay.test/checkout', reference: input.reference, status: 'open',
   }),
+  getCheckout: async (checkoutId: string, reference: string) => ({ psp: 'bachs', checkoutId, checkoutUrl: 'https://pay.test/checkout', reference, status: 'open' }),
   verifyByReference: async (reference: string) => ({ psp: 'bachs', chargeId: `ch_${reference}`, reference, amountKobo: 0n, currency: 'NGN', status: 'pending' }),
   verifyByChargeId: async (chargeId: string) => ({ psp: 'bachs', chargeId, reference: chargeId, amountKobo: 0n, currency: 'NGN', status: 'pending' }),
   refund: async () => ({ refundId: 'rf_test', status: 'processing' }),
@@ -61,6 +62,57 @@ async function createBooking(userId: string) {
 }
 
 describe('booking payments are server-priced', () => {
+  it('omits a fabricated customer from Bachs guest checkout', async () => {
+    const { BachsAdapter } = await import('../modules/payments/bachs.adapter.js');
+    const originalFetch = globalThis.fetch;
+    let sent: Record<string, unknown> | undefined;
+    try {
+      globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+        sent = JSON.parse(String(init?.body));
+        return new Response(JSON.stringify({ checkout_id: 'chk_guest', checkout_url: 'https://pay.test/guest' }), { status: 200 });
+      }) as typeof fetch;
+      await new BachsAdapter().createCheckout({ bookingId: randomUUID(), amountKobo: 5000n, reference: 'guest_ref', idempotencyKey: 'guest_idem' });
+      assert.ok(sent);
+      assert.equal('customer' in sent, false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+  it('creates a storefront WhatsApp link from a formatted business number', async () => {
+    const { waConnect } = await import('../modules/storefront/storefront.service.js');
+    const previous = process.env.WHATSAPP_BUSINESS_NUMBER;
+    try {
+      process.env.WHATSAPP_BUSINESS_NUMBER = '+234 800 123 4567';
+      assert.match(waConnect({ name: 'Example business', slug: 'example-shop' }) ?? '', /^https:\/\/wa\.me\/2348001234567\?/);
+      process.env.WHATSAPP_BUSINESS_NUMBER = 'invalid';
+      assert.equal(waConnect({ name: 'Example business', slug: 'example-shop' }), null);
+    } finally {
+      if (previous === undefined) delete process.env.WHATSAPP_BUSINESS_NUMBER;
+      else process.env.WHATSAPP_BUSINESS_NUMBER = previous;
+    }
+  });
+  it('does not accept a verified PSP payment that has no matching local payment', async () => {
+    const { PaymentService } = await import('../modules/payments/payment.service.js');
+    const ref = `unknown_${randomUUID()}`;
+    const adapter = { ...fakePsp, verifyByChargeId: async () => ({ psp: 'bachs', chargeId: 'ch_unknown', reference: ref, amountKobo: 100n, currency: 'NGN', status: 'successful' }) };
+    const service = new PaymentService({ bachs: adapter as never });
+    const result = await service.handleWebhook('bachs', Buffer.from(JSON.stringify({ id: randomUUID(), data: { payment_id: 'ch_unknown' } })), {});
+    assert.equal(result.notFound, true);
+    assert.equal(result.verified, undefined);
+  });
+  it('recovers a checkout on replay and rejects a changed amount', async () => {
+    const { PaymentService } = await import('../modules/payments/payment.service.js');
+    const payments = new PaymentService({ bachs: fakePsp as never });
+    const booking = await createBooking(await testUser());
+    const input = { bookingId: booking.id, amountKobo: BigInt(booking.priceKobo), reference: `replay_${randomUUID()}`, idempotencyKey: `idem_${randomUUID()}` };
+    const first = await payments.createCheckout(input);
+    const replay = await payments.createCheckout(input);
+    assert.equal(replay.checkoutUrl, first.checkoutUrl);
+    assert.equal(replay.checkoutId, first.checkoutId);
+    await assert.rejects(() => payments.createCheckout({ ...input, amountKobo: input.amountKobo + 1n }), /PAYMENT_REFERENCE_CONFLICT/);
+    const expired = new PaymentService({ bachs: { ...fakePsp, getCheckout: async () => { throw new Error('CHECKOUT_NOT_OPEN'); } } as never });
+    await assert.rejects(() => expired.createCheckout(input), /CHECKOUT_NOT_OPEN/);
+  });
   it('charges the server price even when the client sends its own total', async () => {
     const owner = await testUser();
     const booking = await createBooking(owner);
