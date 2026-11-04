@@ -279,7 +279,9 @@ async function processAndMark(m: InboundMessage, profileName?: string) {
     await processInbound(m, profileName);
   } catch (e) {
     observability.captureException(e);
-    console.error('[whatsapp] inbound processing failed');
+    const message = e instanceof Error ? e.message : '';
+    const reason = /^WHATSAPP_SEND_\d{3}(?:_META_\d{1,8})?$/.test(message) ? message : 'INBOUND_PROCESSING_ERROR';
+    console.error('[whatsapp] inbound processing failed', { reason });
     // If even the fallback cannot be delivered, leave the message unprocessed
     // for the bounded recovery sweep instead of silently discarding it.
     await wa.text(m.from, 'Something went wrong on our side. Please try again in a moment, or type "agent" to reach a person.');

@@ -355,7 +355,14 @@ app.post('/v1/auth/otp/request', OTP_LIMIT, async (req, reply) => {
     if (e instanceof z.ZodError) return fail(reply, 'BAD_REQUEST', 'Enter a valid phone number or email address.', 400);
     const msg = (e as Error).message;
     if (msg === 'BAD_IDENTITY') return fail(reply, 'BAD_IDENTITY', 'Enter a valid phone number or email address.');
-    if (msg === 'SEND_FAILED') return fail(reply, 'SEND_FAILED', 'Could not deliver the code. Try again.', 502, true);
+    if (msg === 'SEND_FAILED') {
+      const cause = (e as Error & { cause?: unknown }).cause;
+      const causeMessage = cause instanceof Error ? cause.message : '';
+      const reason = /you cannot send a (otp|transactional) with this sender/i.test(causeMessage) ? 'SENDER_ROUTE_NOT_ALLOWED' : 'DELIVERY_ERROR';
+      const channel = (req.body as { channel?: unknown } | null)?.channel;
+      req.log.warn({ reason, channel: channel === 'phone' || channel === 'email' ? channel : 'unknown' }, '[otp] delivery failed');
+      return fail(reply, 'SEND_FAILED', 'Could not deliver the code. Try again.', 502, true);
+    }
     throw e;
   }
 });
