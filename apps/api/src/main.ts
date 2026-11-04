@@ -54,6 +54,7 @@ import { storefrontService } from '../../../modules/storefront/storefront.servic
 import { surfaceFor } from '../../../packages/shared/clients.js';
 void surfaceFor;
 import { Writable } from 'node:stream';
+import { safeRequestLog } from '../../../packages/observability/safe-request-log.js';
 import crypto from 'node:crypto';
 import { watchupTracing } from '../../../packages/observability/watchup/fastify.js';
 import { watchup as watchupClient } from '../../../packages/observability/watchup.adapter.js';
@@ -71,7 +72,7 @@ const logStream = new Writable({
 });
 
 const app = Fastify({
-  logger: { stream: logStream },
+  logger: { stream: logStream, serializers: { req: safeRequestLog } },
   genReqId: () => `req_${Date.now().toString(36)}${Math.floor(Math.random() * 1e6)}`,
   trustProxy: PROD, // Pxxl edge terminates TLS ahead of the container
 });
