@@ -2899,7 +2899,9 @@ app.post('/v1/provider/location/batch', async (req, reply) => {
 });
 // Media ingest writes through the object store (quarantine -> promote).
 // Preferred mobile flow is direct PUT to the presigned uploadUrl.
-app.post('/v1/media/:id/ingest', async (req, reply) => {
+// Base64 adds a third, so a 25MB file is ~34MB of JSON. Fastify's 1MB default
+// rejected every normal phone photo with 413 before this handler ran.
+app.post('/v1/media/:id/ingest', { bodyLimit: 36 * 1024 * 1024 }, async (req, reply) => {
   // Session-scoped: ingest writes bytes into the object store. Was public.
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   try {
