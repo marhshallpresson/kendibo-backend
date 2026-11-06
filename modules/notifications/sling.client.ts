@@ -199,7 +199,8 @@ export class SlingClient {
     const maxAttempts = method === 'GET' ? 3 : 1;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 10_000);
+      // Sends (SMS/OTP) can take well over 10s at Sling; reads stay quick.
+      const timeout = setTimeout(() => controller.abort(), method === 'GET' ? 10_000 : Number(process.env.SLING_SEND_TIMEOUT_MS || 25_000));
       try {
         const res = await fetch(url, {
           method,
@@ -330,6 +331,29 @@ export class SlingClient {
     send_on?: string;
     campaign_name?: string;
   }): Promise<SlingSendResponse> {
+    if (opts.type === 'otp' && this.isConfigured()) {
+      // Sling's v1 SMS API accepts an omitted route and selects the sender's
+      // configured route. Do not retry an ambiguous send or send via v2 too.
+      // (Restored: dropped by beea6f1, which sent OTPs through v2 /send.)
+      const to = normalizeNigerianPhone(opts.to);
+      const raw = await this.request<Record<string, unknown>>('/send-sms', {
+        method: 'POST', apiVersion: 'v1',
+        body: { sender: this.senders.sms, to, message: opts.message },
+      });
+      const data = (raw.data as Record<string, unknown> | undefined) ?? raw;
+      const messageId = data.message_id ?? data.id;
+      if (!messageId) throw new Error('SLING_INVALID_RESPONSE');
+      return {
+        status: String(data.status ?? raw.status ?? 'sent'),
+        message_id: String(messageId),
+        reference: String(data.reference ?? opts.reference ?? messageId),
+        channel: 'sms',
+        recipient: to,
+        credit_used: Number(data.credit_used ?? 0),
+        simulated: false,
+        raw,
+      };
+    }
     return this.sendUniversal({
       channel: 'sms',
       sender: this.senders.sms,
