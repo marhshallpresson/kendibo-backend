@@ -10,6 +10,12 @@ const BASE = process.env.BACHS_BASE_URL ?? 'https://sandbox-api.bachs.io';
 const KEY = process.env.BACHS_API_KEY ?? '';
 const WEBHOOK_SECRET = process.env.BACHS_WEBHOOK_SECRET ?? '';
 
+function returnUrl(reference: string): string {
+  const base = (process.env.BACHS_RETURN_URL
+    || `${(process.env.PUBLIC_API_URL || process.env.WHATSAPP_WEB_BASE_URL || 'https://api-kendibo.pxxlspace.cv').replace(/\/+$/, '')}/w/payment-return`);
+  return `${base}${base.includes('?') ? '&' : '?'}reference=${encodeURIComponent(reference)}`;
+}
+
 async function bachsFetch(path: string, init: RequestInit & { idempotencyKey?: string }) {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${KEY}`,
@@ -46,8 +52,11 @@ export class BachsAdapter implements PaymentPort {
         reference: input.reference,
         // Live Bachs rejects non-http(s) schemes ("success_url must use http://
         // or https:// scheme") — deep-link fallbacks belong on the https page.
-        success_url: process.env.BACHS_SUCCESS_URL ?? 'https://kendibo-app.pxxl.click/payment/callback',
-        cancel_url: process.env.BACHS_CANCEL_URL ?? 'https://kendibo-app.pxxl.click/payment/callback',
+        // Both land on the API's return page, which checks with Bachs and hands
+        // the customer back to WhatsApp or the app. The reference rides along so
+        // the page (and the app) know which payment to confirm.
+        success_url: returnUrl(input.reference),
+        cancel_url: returnUrl(input.reference),
         metadata: { bookingId: input.bookingId, ...(input.metadata ?? {}) },
       }),
     });

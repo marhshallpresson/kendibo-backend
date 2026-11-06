@@ -113,6 +113,31 @@ export function renderVendorsPage(opts: { token: string; nonce: string; vendors:
   return shell('Vendors near you — Kendibo', body, opts.nonce);
 }
 
+/**
+ * Where Bachs sends the customer after checkout. WhatsApp payers go back to
+ * the chat; app payers are handed back to the app (the kendibo:// link closes
+ * the in-app checkout browser; a web popup closes itself).
+ */
+export function renderPaymentReturnPage(opts: { status: string; reference: string; nonce: string; fromWhatsapp: boolean; waNumber?: string; appWebBase: string }): string {
+  const s = opts.status;
+  const title = s === 'successful' ? 'Payment received' : s === 'failed' ? "Payment didn't go through" : 'Payment processing';
+  const message = s === 'successful'
+    ? 'Thank you. Kendibo holds your payment safely until the job is done.'
+    : s === 'failed'
+      ? 'No money was taken. You can try again from the same link or from your bookings.'
+      : 'Your bank is still confirming. We will update you as soon as it clears; you do not need to pay again.';
+  const ref = encodeURIComponent(opts.reference);
+  const deep = `kendibo://payment/callback?reference=${ref}`;
+  const web = `${opts.appWebBase.replace(/\/+$/, '')}/payment/callback?reference=${ref}`;
+  const actions = opts.fromWhatsapp
+    ? back(opts.waNumber)
+    : `<a class="btn primary" id="app" href="${esc(deep)}">Return to the Kendibo app</a><a class="btn ghost" href="${esc(web)}" style="margin-top:8px">Continue on the web</a>`;
+  const script = opts.fromWhatsapp ? '' : `
+    if (window.opener) { setTimeout(function(){ try { window.close(); } catch (e) {} }, 1500); }
+    else if (/android|iphone|ipad|ipod/i.test(navigator.userAgent)) { setTimeout(function(){ location.href = ${JSON.stringify(deep)}; }, 600); }`;
+  return shell(`${title} — Kendibo`, `<section class="done" role="status"><h2>${esc(title)}</h2><p class="note">${esc(message)}</p>${actions}</section>`, opts.nonce, script);
+}
+
 export function renderMessagePage(opts: { title: string; message: string; nonce: string; waNumber?: string }): string {
   return shell(`${opts.title} — Kendibo`, `<section class="done"><h2>${esc(opts.title)}</h2><p class="note">${esc(opts.message)}</p>${back(opts.waNumber)}</section>`, opts.nonce);
 }

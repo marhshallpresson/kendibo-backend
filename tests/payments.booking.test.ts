@@ -154,6 +154,36 @@ describe('booking payments are server-priced', () => {
     assert.ok(res.json().data.checkoutUrl, 'hosted checkout url is returned');
   });
 
+  it('confirms a paid checkout without the webhook, settles once, and returns the customer', async () => {
+    const owner = await testUser();
+    const booking = await createBooking(owner);
+    const start = await app.inject({
+      method: 'POST', url: `/v1/bookings/${booking.id}/payments`,
+      headers: { ...auth(owner), ...idem() },
+      payload: { amountKobo: String(booking.priceKobo), email: 'buyer@kendibo.test' },
+    });
+    assert.equal(start.statusCode, 200);
+    const reference = String(start.json().data.reference);
+
+    const recorded = await q<{ amount_kobo: string; status: string; psp: string }>(`SELECT amount_kobo, status, psp FROM payment.payment WHERE reference=$1`, [reference]);
+    assert.equal(recorded[0]?.status, 'pending', `intent recorded as pending (${JSON.stringify(recorded[0])})`);
+    const original = fakePsp.verifyByReference;
+    fakePsp.verifyByReference = async (ref: string) => ({ psp: 'bachs', chargeId: `ch_${ref}`, reference: ref, amountKobo: BigInt(String(recorded[0].amount_kobo)), currency: 'NGN', status: 'successful' });
+    try {
+      const page = await app.inject({ method: 'GET', url: `/w/payment-return?reference=${encodeURIComponent(reference)}` });
+      assert.equal(page.statusCode, 200);
+      assert.match((page as unknown as { body: string }).body, /Payment received/);
+      assert.match((page as unknown as { body: string }).body, /kendibo:\/\/payment\/callback\?reference=/);
+
+      const status = await app.inject({ method: 'GET', url: `/v1/payments/${encodeURIComponent(reference)}`, headers: auth(owner) });
+      assert.equal(status.json().data.status, 'successful');
+      const journals = await q(`SELECT 1 FROM ledger.journal WHERE reference=$1`, [reference]);
+      assert.equal(journals.length, 1, 'collection is posted exactly once');
+    } finally {
+      fakePsp.verifyByReference = original;
+    }
+  });
+
   it('requires a session and refuses someone else\'s booking', async () => {
     const owner = await testUser();
     const stranger = await testUser();

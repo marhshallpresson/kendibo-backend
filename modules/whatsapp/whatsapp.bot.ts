@@ -536,6 +536,8 @@ export async function payLinkTarget(waId: string, bookingId: string): Promise<{ 
   ).catch(() => []);
   if (!b[0]) return { done: 'This payment link is not valid for this number.' };
   if (!['REQUESTED', 'PAYMENT_PENDING'].includes(String(b[0].status).toUpperCase())) return { done: 'This booking is already paid or no longer needs payment.' };
+  const paid = await q(`SELECT 1 FROM payment.payment WHERE booking_id=$1 AND status='successful' LIMIT 1`, [bookingId]).catch(() => []);
+  if (paid[0]) return { done: 'This booking is already paid. Thank you! We will keep you posted here.' };
   const amount = BigInt(String(b[0].price_kobo ?? '0').split('.')[0] || '0');
   if (!deps || amount <= 0n) return { done: 'Open the Kendibo app to pay for this booking.' };
   const email = await q<{ email: string | null }>(`SELECT email FROM identity.users WHERE id=$1`, [b[0].user_id]);
