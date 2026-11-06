@@ -323,6 +323,10 @@ export const identityService = {
   async facebookDataDeletion(facebookId: string): Promise<{ code: string }> {
     const { facebookHash } = await import('./facebook.js');
     await q(`UPDATE identity.users SET profile_image = NULL WHERE facebook_sub=$1 AND (profile_image LIKE '%fbcdn%' OR profile_image LIKE '%facebook%' OR profile_image LIKE '%fbsbx%')`, [facebookId]);
+    // A Facebook-only account (no phone, no Google) got its name and email from
+    // Facebook: anonymise them too. Accounts with another sign-in keep theirs.
+    await q(`UPDATE identity.users SET email = NULL, name = 'Deleted user', nickname = NULL
+              WHERE facebook_sub=$1 AND phone IS NULL AND google_sub IS NULL`, [facebookId]);
     await q(`UPDATE identity.users SET facebook_sub = NULL WHERE facebook_sub=$1`, [facebookId]);
     const code = `fbdel_${createHash('sha256').update(`${facebookId}:${Date.now()}:${Math.random()}`).digest('hex').slice(0, 20)}`;
     await q(`INSERT INTO identity.facebook_deletion (code, facebook_hash) VALUES ($1,$2)`, [code, facebookHash(facebookId)]);

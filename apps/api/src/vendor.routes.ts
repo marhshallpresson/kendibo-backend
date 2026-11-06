@@ -344,7 +344,10 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
     const d = await draftFor(claims);
     if (!d?.request_id || d.lat == null || d.lng == null) return expired(reply, nonce);
     const requestId = d.request_id;
-    const sr = await q<{ preferred_provider_id: string | null; title: string }>(`SELECT preferred_provider_id, title FROM booking.service_request WHERE id=$1`, [requestId]);
+    const sr = await q<{ preferred_provider_id: string | null; title: string; status: string }>(`SELECT preferred_provider_id, title, status FROM booking.service_request WHERE id=$1`, [requestId]);
+    if (!sr[0] || !['SUBMITTED', 'MATCHING', 'OFFERED'].includes(String(sr[0].status).toUpperCase())) {
+      return html(reply, nonce, false, renderMessagePage({ title: 'This job is closed', message: 'This request is no longer open for vendors. Message us on WhatsApp to start a new one.', nonce, waNumber: waNumber() }), 409);
+    }
     if (sr[0]?.preferred_provider_id) {
       return html(reply, nonce, false, renderMessagePage({ title: 'Already sent', message: "You've already chosen a vendor for this job. We'll update you on WhatsApp.", nonce, waNumber: waNumber() }));
     }

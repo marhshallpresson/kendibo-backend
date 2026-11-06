@@ -6,7 +6,7 @@
 import { q } from '../../packages/database/db.js';
 import { emit } from '../../packages/observability/emit.js';
 import { wa } from './whatsapp.client.js';
-import { notifyCustomer } from './policy.js';
+import { notifyCustomer, inServiceWindow } from './policy.js';
 
 const LIFETIME_MS = 14 * 86_400_000;
 export interface Relay { id: string; side: 'customer' | 'vendor'; counterpart: string; vendorName: string; requestId: string }
@@ -16,7 +16,7 @@ export function maskContacts(text: string): string {
   return text
     .replace(/[\w.+-]+@[\w-]+\.[\w.]+/g, '[email hidden]')
     .replace(/https?:\/\/\S+|www\.\S+|wa\.me\/\S+/gi, '[link hidden]')
-    .replace(/(\+?\d[\d\s-]{8,}\d)/g, (m) => (m.replace(/\D/g, '').length >= 10 ? '[number hidden]' : m));
+    .replace(/(\+?\(?\d[\d\s().-]{8,}\d)/g, (m) => (m.replace(/\D/g, '').length >= 10 ? '[number hidden]' : m));
 }
 
 export async function openRelay(requestId: string): Promise<void> {
@@ -73,5 +73,9 @@ export async function relayText(relay: Relay, text: string): Promise<void> {
 /** Pass a photo, voice note, video or document on (by signed storage link). */
 export async function relayMedia(relay: Relay, kind: 'image' | 'audio' | 'video' | 'document', url: string, caption?: string): Promise<void> {
   const label = relay.side === 'vendor' ? relay.vendorName : 'Customer';
-  await wa.media(relay.counterpart, kind, url, caption ? `${label}: ${maskContacts(caption)}` : `From ${label}`);
+  const text = caption ? `${label}: ${maskContacts(caption)}` : `From ${label}`;
+  // Free-form media only reaches someone who wrote to us in the last 24 hours;
+  // otherwise send a template notice that carries the link.
+  if (await inServiceWindow(relay.counterpart)) return wa.media(relay.counterpart, kind, url, text);
+  await notifyCustomer(relay.counterpart, `${label} sent you a ${kind === 'audio' ? 'voice note' : kind}: ${url}`);
 }
