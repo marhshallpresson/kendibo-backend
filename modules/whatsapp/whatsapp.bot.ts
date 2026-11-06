@@ -566,7 +566,15 @@ export function startInboundSweeper(everyMs = 60_000) {
   sweeper = setInterval(() => { void sweepInbound().catch((e) => observability.captureException(e)); }, everyMs);
   sweeper.unref?.();
 }
+const PAYLOAD_RETENTION_MS = 7 * 86_400_000;
+let lastPurge = 0;
+/** Raw message bodies are only kept for crash retries; drop them after a week (the row and timestamp stay). */
+export async function purgeInboundPayloads(now = Date.now()): Promise<void> {
+  await q(`UPDATE messaging.whatsapp_inbound SET payload = NULL, profile_name = NULL WHERE payload IS NOT NULL AND received_at < $1`,
+    [new Date(now - PAYLOAD_RETENTION_MS).toISOString()]);
+}
 export async function sweepInbound(now = Date.now()): Promise<number> {
+  if (now - lastPurge > 3600_000) { lastPurge = now; await purgeInboundPayloads(now).catch((e) => observability.captureException(e)); }
   const rows = await q<{ message_id: string; payload: unknown; profile_name: string | null }>(
     `SELECT message_id, payload, profile_name FROM messaging.whatsapp_inbound
       WHERE processed_at IS NULL AND payload IS NOT NULL AND attempts < 2 AND received_at > $1

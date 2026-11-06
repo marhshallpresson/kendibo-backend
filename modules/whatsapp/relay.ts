@@ -48,9 +48,19 @@ export async function activeRelay(waId: string): Promise<Relay | null> {
   const rows = await q<{ id: string; customer_wa: string; vendor_wa: string; request_id: string; created_at: string; name: string | null }>(
     `SELECT r.id, r.customer_wa, r.vendor_wa, r.request_id, r.created_at, p.business_name AS name
        FROM messaging.whatsapp_relay r JOIN provider.provider p ON p.id = r.provider_id
-      WHERE r.status='active' AND (r.customer_wa=$1 OR r.vendor_wa=$1) ORDER BY r.created_at DESC LIMIT 1`, [waId],
+      WHERE r.status='active' AND (r.customer_wa=$1 OR r.vendor_wa=$1) ORDER BY r.created_at DESC LIMIT 10`, [waId],
   ).catch(() => []);
-  const r = rows[0];
+  let r = rows[0];
+  // A vendor with several live chats answers the customer who wrote last.
+  const vendorChats = rows.filter((x) => String(x.vendor_wa) === waId);
+  if (vendorChats.length > 1) {
+    let best = -1;
+    for (const x of vendorChats) {
+      const last = await q<{ at: string | null }>(`SELECT MAX(received_at) AS at FROM messaging.whatsapp_inbound WHERE wa_id=$1`, [String(x.customer_wa)]).catch(() => []);
+      const t = Math.max(Date.parse(String(last[0]?.at ?? '')) || 0, Date.parse(String(x.created_at)) || 0);
+      if (t > best) { best = t; r = x; }
+    }
+  }
   if (!r) return null;
   if (Date.now() - new Date(String(r.created_at)).getTime() > LIFETIME_MS) {
     await closeRelay(String(r.id));
