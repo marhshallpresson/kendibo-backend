@@ -236,15 +236,16 @@ class PremblyKycAdapter implements KycAdapter {
 
   private async post(path: string, body: Record<string, unknown>, fallbackPath?: string): Promise<Record<string, unknown>> {
     const base = this.baseUrl.replace(/\/$/, '').replace(/\/identitypass$/, '');
-    const cleanPath = path.replace(/^\/identitypass/, '');
-    const candidateUrls = [
-      `${base}/identitypass${cleanPath}`,
-      `${base}${cleanPath}`,
-    ];
-    if (fallbackPath) {
-      const cleanFallback = fallbackPath.replace(/^\/identitypass/, '');
-      candidateUrls.push(`${base}/identitypass${cleanFallback}`, `${base}${cleanFallback}`);
-    }
+    // Current API (d11cbf3): NIN and BVN live at bare /verification/... paths;
+    // other checks still try /identitypass first. (Restored: beea6f1 reverted it.)
+    const urlsFor = (candidatePath: string) => {
+      if (candidatePath.startsWith('/api/v1/')) return [`${base}${candidatePath}`];
+      if (candidatePath === '/verification/vnin' || candidatePath === '/verification/bvn_validation') return [`${base}${candidatePath}`];
+      const cleanPath = candidatePath.replace(/^\/identitypass/, '');
+      return [`${base}/identitypass${cleanPath}`, `${base}${cleanPath}`];
+    };
+    const candidateUrls = urlsFor(path);
+    if (fallbackPath) candidateUrls.push(...urlsFor(fallbackPath));
 
     let lastStatus = 0;
     for (const url of candidateUrls) {
@@ -253,9 +254,7 @@ class PremblyKycAdapter implements KycAdapter {
         'Accept': 'application/json',
         'x-api-key': this.apiKey,
       };
-      if (this.appId && this.appId.trim()) {
-        headers['app-id'] = this.appId.trim();
-      }
+      // Current Prembly server API is X-API-Key only; an app-id header is not sent (d11cbf3).
       const res = await fetch(url, {
         method: 'POST',
         headers,
@@ -322,9 +321,9 @@ class PremblyKycAdapter implements KycAdapter {
     if (!NIN_RE.test(nin)) return { passed: false, provider: this.name, reason: 'NIN_FORMAT' };
     try {
       const r = await this.post(
+        '/verification/vnin',
+        { number_nin: nin },
         '/verification/vnin-basic',
-        { number_nin: nin, number: nin },
-        '/verification/nin',
       );
       return this.interpret(r);
     } catch (e) {
