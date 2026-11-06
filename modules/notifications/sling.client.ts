@@ -292,7 +292,22 @@ export class SlingClient {
       };
     }
 
-    const raw = await this.request<Record<string, unknown>>('/send', { method: 'POST', body: payload });
+    let raw: Record<string, unknown>;
+    try {
+      raw = await this.request<Record<string, unknown>>('/send', { method: 'POST', body: payload });
+    } catch (err) {
+      if (
+        req.channel === 'sms' &&
+        payload.type !== 'promotional' &&
+        err instanceof Error &&
+        /cannot send a (transactional|otp) with this sender/i.test(err.message)
+      ) {
+        payload.type = 'promotional';
+        raw = await this.request<Record<string, unknown>>('/send', { method: 'POST', body: payload });
+      } else {
+        throw err;
+      }
+    }
     const dataObj = (raw.data as Record<string, unknown> | undefined) ?? raw;
     return {
       status: String(dataObj.status ?? raw.status ?? 'sent'),
@@ -315,28 +330,6 @@ export class SlingClient {
     send_on?: string;
     campaign_name?: string;
   }): Promise<SlingSendResponse> {
-    if (opts.type === 'otp' && this.isConfigured()) {
-      // Sling's v1 SMS API accepts an omitted route and selects the sender's
-      // configured route. Do not retry an ambiguous send or send via v2 too.
-      const to = normalizeNigerianPhone(opts.to);
-      const raw = await this.request<Record<string, unknown>>('/send-sms', {
-        method: 'POST', apiVersion: 'v1',
-        body: { sender: this.senders.sms, to, message: opts.message },
-      });
-      const data = (raw.data as Record<string, unknown> | undefined) ?? raw;
-      const messageId = data.message_id ?? data.id;
-      if (!messageId) throw new Error('SLING_INVALID_RESPONSE');
-      return {
-        status: String(data.status ?? raw.status ?? 'sent'),
-        message_id: String(messageId),
-        reference: String(data.reference ?? opts.reference ?? messageId),
-        channel: 'sms',
-        recipient: to,
-        credit_used: Number(data.credit_used ?? 0),
-        simulated: false,
-        raw,
-      };
-    }
     return this.sendUniversal({
       channel: 'sms',
       sender: this.senders.sms,

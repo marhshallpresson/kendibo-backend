@@ -198,18 +198,51 @@ export const identityService = {
     } catch { /* history must never break login */ }
     return { ok: true };
   },
-  /** Google SSO: verify ID token, match-or-create verified user, same session bundle. */
+  /** Google SSO: verify ID token (or OAuth2 access token), match-or-create verified user, same session bundle. */
   async googleVerify(idToken: string, device?: { fp?: string; platform?: string; model?: string; os?: string; appVersion?: string; ip?: string; city?: string }) {
     // Fail fast on obvious junk without network (keeps tests hermetic, avoids
     // useless external round-trip on garbage that can never verify).
-    if (!idToken || idToken.length < 20 || idToken.split('.').length !== 3) throw new Error('BAD_GOOGLE_TOKEN');
-    const res = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`);
-    if (!res.ok) throw new Error('BAD_GOOGLE_TOKEN');
-    const claims = (await res.json()) as { aud?: string; exp?: string; email?: string; email_verified?: string; sub?: string; name?: string; picture?: string };
+    const trimmedToken = (idToken ?? '').trim();
+    if (!trimmedToken || trimmedToken.length < 20) throw new Error('BAD_GOOGLE_TOKEN');
+
     const allowed = (process.env.GOOGLE_CLIENT_IDS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-    if (allowed.length > 0 && !allowed.includes(String(claims.aud ?? ''))) throw new Error('BAD_GOOGLE_AUDIENCE');
-    if (Number(claims.exp ?? 0) * 1000 < Date.now()) throw new Error('GOOGLE_TOKEN_EXPIRED');
-    if (claims.email_verified !== 'true' || !claims.email || !claims.sub) throw new Error('GOOGLE_UNVERIFIED');
+    let claims: { aud?: string; azp?: string; exp?: string | number; email?: string; email_verified?: string | boolean; sub?: string; name?: string; picture?: string };
+
+    if (trimmedToken.split('.').length === 3) {
+      const res = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(trimmedToken)}`);
+      if (!res.ok) throw new Error('BAD_GOOGLE_TOKEN');
+      claims = (await res.json()) as typeof claims;
+      if (
+        allowed.length > 0 &&
+        !allowed.includes(String(claims.aud ?? '')) &&
+        !allowed.includes(String(claims.azp ?? ''))
+      ) {
+        throw new Error('BAD_GOOGLE_AUDIENCE');
+      }
+      if (Number(claims.exp ?? 0) * 1000 < Date.now()) throw new Error('GOOGLE_TOKEN_EXPIRED');
+    } else {
+      // Fallback for Web OAuth2 access_token when third-party cookies block implicit id_token
+      const [tokenInfoRes, userInfoRes] = await Promise.all([
+        fetch(`https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(trimmedToken)}`),
+        fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+          headers: { Authorization: `Bearer ${trimmedToken}` },
+        }),
+      ]);
+      if (!tokenInfoRes.ok || !userInfoRes.ok) throw new Error('BAD_GOOGLE_TOKEN');
+      const tokenInfo = (await tokenInfoRes.json()) as { aud?: string; azp?: string; exp?: string | number };
+      const userInfo = (await userInfoRes.json()) as { sub?: string; email?: string; email_verified?: boolean | string; name?: string; picture?: string };
+      if (
+        allowed.length > 0 &&
+        !allowed.includes(String(tokenInfo.aud ?? '')) &&
+        !allowed.includes(String(tokenInfo.azp ?? ''))
+      ) {
+        throw new Error('BAD_GOOGLE_AUDIENCE');
+      }
+      if (tokenInfo.exp && Number(tokenInfo.exp) * 1000 < Date.now()) throw new Error('GOOGLE_TOKEN_EXPIRED');
+      claims = { ...tokenInfo, ...userInfo };
+    }
+
+    if (String(claims.email_verified) !== 'true' || !claims.email || !claims.sub) throw new Error('GOOGLE_UNVERIFIED');
     const email = String(claims.email).toLowerCase();
     const picture = claims.picture ? String(claims.picture).slice(0, 500) : null;
     let rows = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE google_sub=$1`, [String(claims.sub)]);
@@ -235,9 +268,22 @@ export const identityService = {
         }).catch(() => {});
       }
     }
-    const user = row(rows[0]);
+    let userRow = rows[0];
+    const bootstrap = process.env.ADMIN_BOOTSTRAP
+      ?.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean) ?? [];
+    if (bootstrap.includes(email) && String(userRow.role ?? 'CUSTOMER').toUpperCase() === 'CUSTOMER') {
+      const upd = await q<Record<string, unknown>>(
+        `UPDATE identity.users SET role='SUPER_ADMIN', updated_at=now() WHERE id=$1 RETURNING *`, [userRow.id],
+      );
+      if (upd[0]) userRow = upd[0];
+    }
+    const user = row(userRow);
+    const role = String(userRow.role ?? 'CUSTOMER').toUpperCase();
+    const permissions = isAdminRole(role)
+      ? [...rolePerms(role)]
+      : ['booking:create', 'booking:view:self', 'booking:cancel'];
     const deviceId = `dev_${Date.now().toString(36)}`;
-    const access = signAccess(user.id, ['booking:create', 'booking:view:self']);
+    const access = signAccess(user.id, permissions);
     const refresh = await signRefresh(user.id, deviceId);
     await this.logDevice(user.id, device ?? {});
     return { user, access, refresh: refresh.token, deviceId, isNew };

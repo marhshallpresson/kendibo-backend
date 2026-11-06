@@ -7,6 +7,15 @@ import { localDb } from './local.js';
 
 type PgPool = { query: (text: string, params?: unknown[]) => Promise<{ rows: unknown[] }> };
 let pool: PgPool | null = null;
+let memPool: PgPool | null = null;
+
+function getMemPool(): PgPool {
+  if (memPool) return memPool;
+  const mem = localDb();
+  const { Pool: MemPool } = mem.adapters.createPg() as unknown as { Pool: new () => PgPool };
+  memPool = new MemPool();
+  return memPool;
+}
 
 export function db(): PgPool {
   if (pool) return pool;
@@ -14,6 +23,7 @@ export function db(): PgPool {
     const real = new Pool({
       connectionString: process.env.DATABASE_URL,
       max: 10,
+      connectionTimeoutMillis: 5000,
       // Pxxl managed Postgres terminates TLS with a self-signed chain.
       // Encryption stays on; chain validation off (same as ?sslmode=require).
       ssl: { rejectUnauthorized: false },
@@ -22,18 +32,37 @@ export function db(): PgPool {
     pool = real as unknown as PgPool;
     return pool;
   }
-  const mem = localDb();
-  const { Pool: MemPool } = mem.adapters.createPg() as unknown as { Pool: new () => PgPool };
-  pool = new MemPool();
+  pool = getMemPool();
   return pool;
+}
+
+function isConnectionOutage(err: unknown): boolean {
+  const code = String((err as { code?: string })?.code ?? '');
+  const msg = String((err as Error)?.message ?? '');
+  return (
+    ['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET'].includes(code) ||
+    /getaddrinfo ENOTFOUND|connect ECONNREFUSED|Connection terminated unexpectedly/i.test(msg)
+  );
 }
 
 /** Parameterised query. BIGINT comes back as string — wrap with BigInt()/String() at use. */
 export async function q<T = Record<string, unknown>>(text: string, params: unknown[] = []): Promise<T[]> {
   const t0 = process.hrtime.bigint();
   try {
-    const r = await db().query(text, params);
-    return r.rows as T[];
+    try {
+      const r = await db().query(text, params);
+      return r.rows as T[];
+    } catch (err) {
+      if (process.env.DATABASE_URL && isConnectionOutage(err) && pool !== memPool) {
+        console.warn(
+          `[db] Remote Postgres unreachable (${(err as Error).message}); switching to embedded pg-mem fallback.`,
+        );
+        pool = getMemPool();
+        const r = await pool.query(text, params);
+        return r.rows as T[];
+      }
+      throw err;
+    }
   } finally {
     // Slow-query trace (>1s) without importing the client (avoids a cycle):
     // dynamic import keeps db.ts dependency-free at module load.

@@ -388,24 +388,41 @@ app.post('/v1/auth/otp/verify', { config: { rateLimit: { max: 10, timeWindow: '1
 // benefit — the response body is already uniform and OTP/refresh routes have
 // their own rate limits. Removed in the latency audit.
 app.post('/v1/auth/account-exists', async (req, reply) => {
+  const parsed = z.object({
+    identity: z.string().optional(),
+    email: z.string().optional(),
+    phone: z.string().optional(),
+  }).safeParse(req.body ?? {});
+  const rawIdentity = (parsed.success ? (parsed.data.identity ?? parsed.data.email ?? parsed.data.phone ?? '') : '').trim();
+  if (!rawIdentity) {
+    return fail(reply, 'BAD_IDENTITY', 'Enter a valid phone number or email address.', 400);
+  }
   try {
-    const { identity } = z.object({ identity: z.string() }).parse(req.body);
-    const r = await identityService.accountExists(identity);
+    const r = await identityService.accountExists(rawIdentity);
     observability.track('auth.account_checked', { channel: r.channel, exists: r.exists });
     return { data: r };
-  } catch {
-    return fail(reply, 'BAD_IDENTITY', 'Enter a valid phone number or email address.');
+  } catch (e: unknown) {
+    const code = String((e as Error)?.message ?? '');
+    if (code === 'BAD_IDENTITY') {
+      return fail(reply, 'BAD_IDENTITY', 'Enter a valid phone number or email address.', 400);
+    }
+    return fail(reply, 'ACCOUNT_CHECK_UNAVAILABLE', 'Account check temporarily unavailable. Please try again.', 503, true);
   }
 });
 // Google SSO (in-app browser now, native SDK later — same endpoint either way).
 app.post('/v1/auth/google', async (req, reply) => {
-  const { idToken, device } = z.object({
-    idToken: z.string(),
+  const body = z.object({
+    idToken: z.string().optional(),
+    accessToken: z.string().optional(),
+    token: z.string().optional(),
     device: z.object({
       fp: z.string().optional(), platform: z.string().optional(), model: z.string().optional(),
       os: z.string().optional(), appVersion: z.string().optional(), city: z.string().optional(),
     }).optional(),
-  }).parse(req.body);
+  }).safeParse(req.body ?? {});
+  const idToken = (body.success ? (body.data.idToken ?? body.data.accessToken ?? body.data.token ?? '') : '').trim();
+  const device = body.success ? body.data.device : undefined;
+  if (!idToken) return fail(reply, 'GOOGLE_REJECTED', 'Google sign-in failed. Try again.', 401);
   try {
     const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip;
     const s = await identityService.googleVerify(idToken, { ...device, ip });
