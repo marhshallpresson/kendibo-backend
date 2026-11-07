@@ -239,6 +239,7 @@ const ROUTE_POLICY: Record<string, RoutePolicy> = {
   'GET /v1/media/:id/file': 'public', // HMAC-signed URL checked in the handler
   'POST /webhooks/payments/bachs': 'public', // PSP signature checked in the handler
   'GET /w/payment-return': 'public', // shows status only; reference is unguessable
+  'GET /w/delete-account': 'public', // Google Play account-deletion instructions
   'POST /webhooks/sling': 'public', // Sling signature checked in the handler
   // Operational / back-office routes that live outside /v1/admin.
   'GET /health/dependencies': 'configuration:edit',
@@ -2100,9 +2101,38 @@ app.patch('/v1/me', async (req, reply) => {
     return { data: await identityService.updateProfile(a.sub, patch) };
   } catch (e: unknown) { return fail(reply, 'BAD_PROFILE', (e as Error).message); }
 });
+// Account deletion (NDPA s.34; Google Play): erases personal details. Refused
+// while a job is still open or money is in the wallet, so nobody loses either.
 app.delete('/v1/me', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
-  return { data: await identityService.deactivate(a.sub) };
+  const open = await q(
+    `SELECT 1 FROM booking.booking WHERE (user_id=$1 OR provider_id IN (SELECT id FROM provider.provider WHERE user_id=$1))
+       AND upper(status) NOT IN ('COMPLETED','CANCELLED','CANCELED','REFUNDED','CLOSED','DECLINED','EXPIRED') LIMIT 1`, [a.sub],
+  ).catch(() => []);
+  if (open[0]) return fail(reply, 'OPEN_BOOKINGS', 'Finish or cancel your open bookings before deleting your account.', 409);
+  const balance = await walletService.getBalance(a.sub).catch(() => 0);
+  if (balance > 0) return fail(reply, 'WALLET_NOT_EMPTY', 'Withdraw or use your wallet balance before deleting your account. Contact support if you need help.', 409);
+  return { data: await identityService.eraseAccount(a.sub) };
+});
+// NDPA s.34(1)(b) / s.38: a machine-readable copy of the user's data.
+app.get('/v1/me/export', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  void reply.header('Content-Disposition', 'attachment; filename="kendibo-my-data.json"');
+  return { data: await identityService.exportData(a.sub) };
+});
+// Public page Google Play links to: how to delete an account without the app installed.
+app.get('/w/delete-account', async (_req, reply) => {
+  const support = process.env.SUPPORT_EMAIL || 'support@kendibo.com';
+  const page = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Delete your Kendibo account</title><style>body{font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#0F172A;max-width:640px;margin:0 auto;padding:24px}h1{font-size:24px}li{margin:6px 0}.note{color:#475569;font-size:14px}a{color:#1D5BD6}</style></head><body>
+<h1>Delete your Kendibo account</h1>
+<h2>In the app</h2><ol><li>Open Kendibo and go to <b>Profile</b>, then <b>Settings</b>.</li><li>Tap <b>Manage account</b>, then <b>Delete account</b>.</li><li>Confirm. You are signed out everywhere.</li></ol>
+<h2>Without the app</h2><p>Email <a href="mailto:${support}?subject=Delete%20my%20Kendibo%20account">${support}</a> from the email on your account, or include the phone number you signed up with. We confirm before deleting.</p>
+<h2>What is deleted</h2><p>Your name, email, phone number, photo, saved addresses, linked Google or Facebook sign-in, PIN and devices.</p>
+<h2>What we keep, and why</h2><p>Records of bookings, payments and identity checks are kept for as long as Nigerian law requires (tax, anti-fraud and consumer-protection rules), linked only to an anonymous id. Open bookings must be finished or cancelled, and any wallet balance withdrawn, before deletion.</p>
+<p class="note">Kendibo processes personal data under the Nigeria Data Protection Act 2023. You can also ask for a copy of your data or complain to the Nigeria Data Protection Commission.</p>
+</body></html>`;
+  return reply.header('Cache-Control', 'public, max-age=3600').type('text/html; charset=utf-8').send(page);
 });
 app.get('/v1/me/properties', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);

@@ -9,13 +9,16 @@ import { sms, email } from '../notifications/channels.js';
 import { templates } from '../notifications/mail.templates.js';
 
 export interface User {
-  id: string; phone?: string; email?: string; pinHash?: string; biometric: boolean;
+  id: string; phone?: string; email?: string; hasPin: boolean; biometric: boolean;
   name?: string; nickname?: string; dob?: string; avatarUrl?: string; role?: string; createdAt: string;
+  googleLinked: boolean; facebookLinked: boolean;
 }
 const hashPin = (pin: string) => createHash('sha256').update(`kendibo-pin:${pin}`).digest('hex');
 const row = (r: Record<string, unknown>): User => ({
   id: String(r.id), phone: (r.phone as string) ?? undefined, email: (r.email as string) ?? undefined,
-  pinHash: (r.pin_hash as string) ?? undefined, biometric: Boolean(r.biometric),
+  // Never send the PIN hash: a 4-digit PIN's SHA-256 is cracked in 10,000 tries.
+  hasPin: Boolean(r.pin_hash), biometric: Boolean(r.biometric),
+  googleLinked: Boolean(r.google_sub), facebookLinked: Boolean(r.facebook_sub),
   name: (r.name as string) ?? undefined, nickname: (r.nickname as string) ?? undefined,
   dob: r.dob ? String(r.dob).slice(0, 10) : undefined,
   avatarUrl: (r.profile_image as string) ?? undefined,
@@ -169,6 +172,49 @@ export const identityService = {
     return me;
   },
   /** Account deactivation: status flag + all refresh tokens revoked. Row retained for audit/finance. */
+  /**
+   * NDPA 2023 s.34(1)(b)/s.38: a copy of the user's data in a machine-readable
+   * format. Secrets (PIN hash, tokens) and raw ID numbers are never included.
+   */
+  async exportData(userId: string) {
+    const safe = async (sql: string) => q<Record<string, unknown>>(sql, [userId]).catch(() => []);
+    const profile = await this.me(userId);
+    return {
+      exportedAt: new Date().toISOString(),
+      profile,
+      addresses: await safe(`SELECT * FROM property.address WHERE user_id=$1`),
+      bookings: await safe(`SELECT * FROM booking.booking WHERE user_id=$1 ORDER BY created_at DESC`),
+      serviceRequests: await safe(`SELECT * FROM booking.service_request WHERE user_id=$1 ORDER BY created_at DESC`),
+      payments: await safe(`SELECT p.reference, p.psp, p.amount_kobo, p.status, p.created_at, p.booking_id
+                              FROM payment.payment p JOIN booking.booking b ON b.id = p.booking_id WHERE b.user_id=$1`),
+      walletTransactions: await safe(`SELECT * FROM payment.wallet_txn WHERE user_id=$1 ORDER BY created_at DESC`),
+      identityVerification: await safe(`SELECT status, tier, created_at, updated_at FROM kyc.customer WHERE user_id=$1`),
+      notificationPreferences: await safe(`SELECT * FROM notification.user_preference WHERE user_id=$1`),
+      supportTickets: await safe(`SELECT * FROM support.ticket WHERE user_id=$1 ORDER BY created_at DESC`),
+      devices: await safe(`SELECT platform, model, os, app_version, created_at FROM identity.device WHERE user_id=$1`),
+    };
+  },
+  /**
+   * Erase an account (NDPA s.34(1)(d); Google Play account deletion). Personal
+   * details are wiped and sign-in is revoked everywhere. Booking, payment and
+   * verification records are kept where the law requires, tied only to the
+   * anonymous id. Callers check open bookings / wallet balance first.
+   */
+  async eraseAccount(userId: string) {
+    await q(
+      `UPDATE identity.users SET name='Deleted user', nickname=NULL, email=NULL, phone=NULL, dob=NULL,
+         profile_image=NULL, google_sub=NULL, facebook_sub=NULL, pin_hash=NULL, biometric=false,
+         status='deleted', updated_at=now() WHERE id=$1`, [userId],
+    );
+    for (const sql of [
+      `DELETE FROM property.address WHERE user_id=$1`,
+      `DELETE FROM notification.user_preference WHERE user_id=$1`,
+      `DELETE FROM identity.device WHERE user_id=$1`,
+      `DELETE FROM identity.customer_profile WHERE user_id=$1`,
+    ]) await q(sql, [userId]).catch(() => undefined); // rows still referenced by bookings stay
+    await this.logoutAll(userId);
+    return { ok: true };
+  },
   async deactivate(userId: string) {
     await q(`UPDATE identity.users SET status='inactive' WHERE id=$1`, [userId]);
     await this.logoutAll(userId);
