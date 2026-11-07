@@ -9,6 +9,7 @@ import { postCollection, postSettlement, trialBalance, openPeriod, currentPeriod
 import { transition, type JobStatus } from '../../../modules/job-engine/job.machine.js';
 import { whyNot, checkStartCode, ensureStartCode, afterTransition, confirmCompletion, startCompletionSweeper } from '../../../modules/job-engine/job-guard.js';
 import { checkInDistance, selfieRequired, selfiePassed, recordCheckinSelfie, ratingsFor, rateParty, startReminderSweeper } from '../../../modules/job-engine/journey.js';
+import { offeringService, earningsFor } from '../../../modules/vendors/offering.service.js';
 import { observability } from '../../../packages/observability/watchup.adapter.js';
 import { identityService } from '../../../modules/identity/identity.service.js';
 import { authorize, isAdminRole, adminCan, type Permission } from '../../../modules/authorization/rbac.js';
@@ -2386,6 +2387,8 @@ app.post('/v1/service-requests', async (req, reply) => {
     contactName: z.string().optional(), contactPhone: z.string().optional(), contactEmail: z.string().optional(),
     notes: z.string().optional(), smsUpdates: z.boolean().optional(),
     scheduledDate: z.string().optional(), timeWindow: z.string().optional(),
+    // From a pro's profile: that pro gets first refusal (eligibility still checked in matching).
+    preferredProviderId: z.string().uuid().optional(),
   }).parse(req.body);
   return { data: await requestService.create(a.sub, { ...body, idempotencyKey: idem }) };
 });
@@ -2675,6 +2678,71 @@ app.post('/v1/provider/jobs/:id/quote', async (req, reply) => {
   return { data: q };
 });
 // providerId / id query params are ignored for scoping: always the caller's own rows.
+// ---- Provider price lists (commission model: customer pays the listed price,
+// Kendibo keeps the trade's commission, the provider gets the rest) ----
+const offeringBody = z.object({
+  categoryId: z.string().min(1).max(60), name: z.string().min(2).max(80), description: z.string().max(500).optional(),
+  priceKobo: z.union([z.string().regex(/^\d+$/), z.number().int().positive()]), priceUnit: z.enum(['job', 'hour', 'visit', 'item']).optional(),
+  durationMinutes: z.number().int().min(5).max(24 * 60).optional(),
+});
+const offeringError = (reply: FastifyReply, e: unknown) => {
+  const m = (e as Error).message;
+  if (m.startsWith('BELOW_MINIMUM')) return fail(reply, 'BELOW_MINIMUM', `The lowest price is ₦${(Number(m.split(':')[1]) / 100).toLocaleString('en-NG')}.`, 400);
+  if (m === 'NOT_FOUND') return fail(reply, 'NOT_FOUND', 'Price not found', 404);
+  return fail(reply, 'OFFERING_ERROR', m, 400);
+};
+app.get('/v1/provider/offerings', async (req, reply) => {
+  const me = await providerActor(req as never, reply); if (!me) return reply;
+  return { data: await offeringService.listForProvider(me.id, true) };
+});
+// "You receive ₦X after Kendibo's Y% commission" while the provider types a price.
+app.get('/v1/provider/offerings/preview', async (req, reply) => {
+  const me = await providerActor(req as never, reply); if (!me) return reply;
+  const { categoryId, priceKobo } = z.object({ categoryId: z.string().min(1), priceKobo: z.string().regex(/^\d+$/) }).parse(req.query);
+  return { data: await earningsFor(categoryId, BigInt(priceKobo)) };
+});
+app.post('/v1/provider/offerings', async (req, reply) => {
+  const me = await providerActor(req as never, reply); if (!me) return reply;
+  const b = offeringBody.parse(req.body);
+  const cat = await q(`SELECT 1 FROM catalog.category WHERE id=$1`, [b.categoryId]);
+  if (!cat[0]) return fail(reply, 'BAD_CATEGORY', 'Choose one of Kendibo\'s trades.', 400);
+  try { return { data: await offeringService.create(me.id, { ...b, priceKobo: BigInt(b.priceKobo) }) }; }
+  catch (e) { return offeringError(reply, e); }
+});
+app.patch('/v1/provider/offerings/:id', async (req, reply) => {
+  const me = await providerActor(req as never, reply); if (!me) return reply;
+  const b = offeringBody.partial().extend({ active: z.boolean().optional() }).parse(req.body);
+  try { return { data: await offeringService.update(me.id, (req.params as { id: string }).id, { ...b, priceKobo: b.priceKobo !== undefined ? BigInt(b.priceKobo) : undefined }) }; }
+  catch (e) { return offeringError(reply, e); }
+});
+// A provider's prices, for signed-in customers (members-only marketplace).
+app.get('/v1/providers/:id/offerings', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const rows = await offeringService.listForProvider((req.params as { id: string }).id);
+  return { data: rows.map(({ earnings: _e, ...o }) => o) }; // customers see the price, not the split
+});
+// Customer books a listed price with that provider.
+app.post('/v1/offerings/:id/book', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const idem = req.headers['idempotency-key'];
+  if (typeof idem !== 'string') return fail(reply, 'IDEMPOTENCY_REQUIRED', 'Idempotency-Key header required');
+  const b = z.object({
+    lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180), addressText: z.string().max(200).optional(),
+    notes: z.string().max(500).optional(), scheduledDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    timeWindow: z.string().max(20).optional(),
+  }).parse(req.body);
+  try { return { data: await offeringService.book(a.sub, (req.params as { id: string }).id, { ...b, idempotencyKey: idem }) }; }
+  catch (e) {
+    const m = (e as Error).message;
+    if (m === 'OFFERING_GONE') return fail(reply, 'OFFERING_GONE', 'This price is no longer available.', 404);
+    if (m === 'PROVIDER_UNAVAILABLE') return fail(reply, 'PROVIDER_UNAVAILABLE', 'This pro cannot take new jobs right now. Try another pro.', 409);
+    throw e;
+  }
+});
+app.get('/v1/provider/earnings/summary', async (req, reply) => {
+  const me = await providerActor(req as never, reply); if (!me) return reply;
+  return { data: await vendorFinanceService.summary(me.id) };
+});
 app.get('/v1/provider/earnings', async (req, reply) => {
   const me = await providerActor(req as never, reply); if (!me) return reply;
   return { data: await earningsService.forProvider(me.id) };

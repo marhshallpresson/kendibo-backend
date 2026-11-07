@@ -21,10 +21,16 @@ export const vendorFinanceService = {
       `SELECT COALESCE(SUM(amount_kobo),0) AS total FROM payment.payment WHERE booking_id=$1 AND status='successful'`, [bookingId],
     );
     const collected = big(paid[0]?.total);
+    // The trade: a catalog service's category, else the request the booking came
+    // from (agreed-price and listed-price bookings have no catalog service).
     const cat = await q<{ category_id: string }>(
       `SELECT s.category_id FROM booking.booking b JOIN catalog.service s ON s.id=b.service_id WHERE b.id=$1`, [bookingId],
     ).catch(() => []);
-    const categoryId = cat[0]?.category_id ? String(cat[0].category_id) : null;
+    let categoryId = cat[0]?.category_id ? String(cat[0].category_id) : null;
+    if (!categoryId) {
+      const fromReq = await q<{ category_id: string | null }>(`SELECT category_id FROM booking.service_request WHERE booking_id=$1 LIMIT 1`, [bookingId]).catch(() => []);
+      categoryId = fromReq[0]?.category_id ? String(fromReq[0].category_id) : null;
+    }
     const bps = categoryId ? (await categoryRulesService.ruleFor(categoryId)).commissionBps : 1500;
     const commission = (collected * BigInt(bps)) / 10000n;
     return { bookingId, categoryId, collectedKobo: collected, commissionBps: bps, commissionKobo: commission, providerKobo: collected - commission };
@@ -81,6 +87,44 @@ export const vendorFinanceService = {
     return {
       earnedKobo: earnedK.toString(), paidOutKobo: paidK.toString(), outstandingFeesKobo: feesK.toString(),
       availableKobo: (available > 0n ? available : 0n).toString(),
+    };
+  },
+
+  /**
+   * The provider's money at a glance: available to withdraw, held in escrow
+   * (customers paid, job not yet confirmed), paid out, commission so far, this
+   * month's net, and the latest jobs with gross / commission / net.
+   */
+  async summary(providerId: string) {
+    const bal = await this.balance(providerId);
+    const totals = await q<{ gross: string; commission: string }>(
+      `SELECT COALESCE(SUM(gross_kobo),0) AS gross, COALESCE(SUM(commission_kobo),0) AS commission FROM provider.earning WHERE provider_id=$1`, [providerId],
+    );
+    const monthStart = new Date(); monthStart.setUTCDate(1); monthStart.setUTCHours(0, 0, 0, 0);
+    const month = await q<{ t: string }>(`SELECT COALESCE(SUM(amount_kobo + tip_kobo),0) AS t FROM provider.earning WHERE provider_id=$1 AND created_at >= $2`, [providerId, monthStart.toISOString()]);
+    // Paid by the customer, assigned to this provider, not yet credited (awaiting confirmation).
+    const jobs = await q<{ job_id: string }>(`SELECT job_id FROM dispatch.assignment WHERE provider_id=$1 AND status='accepted'`, [providerId]);
+    const credited = new Set((await q<{ job_id: string }>(`SELECT job_id FROM provider.earning WHERE provider_id=$1`, [providerId])).map((r) => String(r.job_id)));
+    let escrowGross = 0n;
+    for (const j of jobs.slice(0, 200)) {
+      if (credited.has(String(j.job_id))) continue;
+      const paid = await q<{ t: string }>(`SELECT COALESCE(SUM(amount_kobo),0) AS t FROM payment.payment WHERE booking_id=$1 AND status='successful'`, [String(j.job_id)]).catch(() => []);
+      escrowGross += big(paid[0]?.t);
+    }
+    const recent = await q<Record<string, unknown>>(
+      `SELECT job_id, gross_kobo, commission_kobo, commission_bps, amount_kobo, tip_kobo, created_at FROM provider.earning WHERE provider_id=$1 ORDER BY created_at DESC LIMIT 30`, [providerId],
+    );
+    return {
+      ...bal,
+      heldInEscrowKobo: escrowGross.toString(),
+      grossKobo: big(totals[0]?.gross).toString(),
+      commissionKobo: big(totals[0]?.commission).toString(),
+      thisMonthKobo: big(month[0]?.t).toString(),
+      jobs: recent.map((r) => ({
+        jobId: String(r.job_id), grossKobo: String(r.gross_kobo ?? r.amount_kobo), commissionKobo: String(r.commission_kobo ?? 0),
+        commissionBps: r.commission_bps != null ? Number(r.commission_bps) : null, netKobo: String(r.amount_kobo), tipKobo: String(r.tip_kobo ?? 0),
+        at: String(r.created_at),
+      })),
     };
   },
 

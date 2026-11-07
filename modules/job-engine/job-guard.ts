@@ -91,7 +91,40 @@ export async function confirmCompletion(bookingId: string, actor: Party): Promis
   await transition(bookingId, 'COMPLETED', 'CUSTOMER_CONFIRMATION', actor);
   await afterTransition(bookingId, 'CUSTOMER_CONFIRMATION');
   emit('job.customer_confirmed', { bookingId, actor });
+  await settleJob(bookingId).catch((e) => observability.captureException(e));
   return 'confirmed';
+}
+
+/**
+ * Pay the provider their share once the customer has confirmed (or the 48h
+ * timer did): credit the earning (gross, commission, net), post the ledger
+ * entry, and move the job into its warranty period. Idempotent per job.
+ * A job with nothing collected yet (unpaid) is left for finance to settle.
+ */
+export async function settleJob(bookingId: string): Promise<'settled' | 'unpaid' | 'no_provider'> {
+  const assigned = await q<{ provider_id: string }>(`SELECT provider_id FROM dispatch.assignment WHERE job_id=$1 AND status='accepted' LIMIT 1`, [bookingId]).catch(() => []);
+  if (!assigned[0]) return 'no_provider';
+  const providerId = String(assigned[0].provider_id);
+  const { vendorFinanceService } = await import('../vendors/vendor-finance.service.js');
+  let split;
+  try { split = await vendorFinanceService.creditEarning(providerId, bookingId); }
+  catch (e) { if ((e as Error).message === 'NOTHING_COLLECTED') return 'unpaid'; throw e; }
+  const { postSettlement, currentPeriod } = await import('../ledger/ledger.service.js');
+  await postSettlement(`settle_${bookingId}`, split.collectedKobo, split.providerKobo, currentPeriod()).catch(() => undefined); // already posted on a retry
+  if ((await latestStatus(bookingId)) === 'CUSTOMER_CONFIRMATION') {
+    await transition(bookingId, 'CUSTOMER_CONFIRMATION', 'SETTLEMENT', 'system');
+    await transition(bookingId, 'SETTLEMENT', 'WARRANTY_ACTIVE', 'system');
+  }
+  emit('job.settled', { bookingId, providerId, providerKobo: String(split.providerKobo), commissionKobo: String(split.commissionKobo) });
+  const p = await q<{ phone: string | null }>(`SELECT u.phone FROM provider.provider pr JOIN identity.users u ON u.id=pr.user_id WHERE pr.id=$1`, [providerId]).catch(() => []);
+  if (p[0]?.phone) {
+    const n = (k: bigint) => `₦${(Number(k) / 100).toLocaleString('en-NG')}`;
+    try {
+      const { notifyCustomer } = await import('../whatsapp/policy.js');
+      await notifyCustomer(String(p[0].phone).replace(/\D/g, ''), `The customer confirmed the job. ${n(split.providerKobo)} has been added to your Kendibo earnings (${n(split.collectedKobo)} minus Kendibo's ${split.commissionBps / 100}% commission).`);
+    } catch { /* best effort */ }
+  }
+  return 'settled';
 }
 
 /** Jobs marked done by the pro with no answer from the customer for 48h, and no dispute. */

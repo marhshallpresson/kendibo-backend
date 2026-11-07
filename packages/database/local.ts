@@ -107,6 +107,7 @@ export function localDb(): IMemoryDb {
   run('035_kyc_customer_provider.sql');
   run('036_onboarding_email_job_codes.sql');
   run('037_bargaining_reminders_ratings_device.sql');
+  run('038_provider_offerings.sql');
   console.log('[localdb] pg-mem ready (001-019, 021-032)');
   return mem;
 }
