@@ -12,7 +12,7 @@ const WEBHOOK_SECRET = process.env.BACHS_WEBHOOK_SECRET ?? '';
 
 function returnUrl(reference: string): string {
   const base = (process.env.BACHS_RETURN_URL
-    || `${(process.env.PUBLIC_API_URL || process.env.WHATSAPP_WEB_BASE_URL || 'https://api-kendibo.pxxlspace.cv').replace(/\/+$/, '')}/w/payment-return`);
+    || `${(process.env.PUBLIC_API_URL || process.env.WHATSAPP_WEB_BASE_URL || 'https://kendibo-backend.stackshift.cloud').replace(/\/+$/, '')}/w/payment-return`);
   return `${base}${base.includes('?') ? '&' : '?'}reference=${encodeURIComponent(reference)}`;
 }
 
