@@ -86,8 +86,11 @@ export const supportService = {
     await q(`UPDATE support.ticket SET status='resolved' WHERE id=$1`, [id]);
     return this.get(id);
   },
-  async list(cursor?: string) {
-    const rows = await q<Record<string, unknown>>(`SELECT * FROM support.ticket ORDER BY created_at DESC LIMIT 20`, []);
+  /** A customer's own tickets; pass customerId=null only for support agents. */
+  async list(customerId: string | null, cursor?: string) {
+    const rows = customerId
+      ? await q<Record<string, unknown>>(`SELECT * FROM support.ticket WHERE customer_id=$1 ORDER BY created_at DESC LIMIT 20`, [customerId])
+      : await q<Record<string, unknown>>(`SELECT * FROM support.ticket ORDER BY created_at DESC LIMIT 20`, []);
     void cursor;
     return { items: rows.map((r) => toTicket(r, [])), nextCursor: null as string | null };
   },

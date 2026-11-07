@@ -262,7 +262,7 @@ const ROUTE_POLICY: Record<string, RoutePolicy> = {
   'POST /v1/jobs/:id/settle': 'payout:approve',
   'POST /v1/payouts': 'payout:approve',
   'POST /v1/warranties': 'booking:override',
-  'GET /v1/support/tickets': 'booking:view:any',
+  // GET /v1/support/tickets: any signed-in user; the handler scopes customers to their own tickets.
 };
 // Vendor platform routes (storefronts, trade rules, WhatsApp) declare their own
 // public/permission entries next to the handlers; merged into the same gate.
@@ -2451,7 +2451,13 @@ app.post('/v1/support/tickets', async (req, reply) => {
   const { reason, jobId } = z.object({ reason: z.string(), jobId: z.string().optional() }).parse(req.body);
   return { data: await supportService.open(a.sub, reason, jobId) };
 });
-app.get('/v1/support/tickets', async (req) => ({ data: await supportService.list((req.query as { cursor?: string }).cursor) }));
+// Customers see only their own tickets; support agents see the queue.
+app.get('/v1/support/tickets', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const roleRows = await q<{ role: string }>(`SELECT role FROM identity.users WHERE id=$1`, [a.sub]);
+  const isAgent = adminCan(roleRows[0]?.role, 'booking:view:any');
+  return { data: await supportService.list(isAgent ? null : a.sub, (req.query as { cursor?: string }).cursor) };
+});
 app.post('/v1/support/tickets/:id/messages', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   const id = (req.params as { id: string }).id;
