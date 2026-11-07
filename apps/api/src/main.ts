@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { PaymentService } from '../../../modules/payments/payment.service.js';
 import { postCollection, postSettlement, trialBalance, openPeriod, currentPeriod } from '../../../modules/ledger/ledger.service.js';
 import { transition, type JobStatus } from '../../../modules/job-engine/job.machine.js';
+import { whyNot, checkStartCode, ensureStartCode, afterTransition, confirmCompletion, startCompletionSweeper } from '../../../modules/job-engine/job-guard.js';
 import { observability } from '../../../packages/observability/watchup.adapter.js';
 import { identityService } from '../../../modules/identity/identity.service.js';
 import { authorize, isAdminRole, adminCan, type Permission } from '../../../modules/authorization/rbac.js';
@@ -1573,11 +1574,41 @@ app.post('/v1/jobs/:id/transition', async (req, reply) => {
   const party = await bookingParty(req as never, reply, jobId); if (!party) return reply;
   // `from` and `actor` are accepted for older clients but never trusted: the
   // current status comes from the event log and the actor from the session.
-  const { to } = z.object({ from: z.string().optional(), to: z.string(), actor: z.string().optional() }).parse(req.body);
+  const { to, code } = z.object({ from: z.string().optional(), to: z.string(), actor: z.string().optional(), code: z.string().max(8).optional() }).parse(req.body);
   const from = await currentJobStatus(jobId);
   if (!from) return fail(reply, 'NOT_FOUND', 'No job events for this job', 404);
-  try { return await transition(jobId, from, to as JobStatus, party.as); }
-  catch (e: unknown) { return fail(reply, 'ILLEGAL_TRANSITION', (e as Error).message, 409); }
+  // Each side may only make its own moves (a provider can't confirm for the customer).
+  const reason = whyNot(party.as, from, to as JobStatus);
+  if (reason) return fail(reply, 'NOT_YOUR_STEP', reason, 403);
+  // Check-in needs the start code the customer reads out at the door.
+  if (to === 'CHECK_IN' && party.as === 'provider') {
+    const check = await checkStartCode(jobId, code);
+    if (check === 'missing') return fail(reply, 'START_CODE_MISSING', 'Ask the customer to open the booking for their start code.', 409);
+    if (check === 'locked') return fail(reply, 'START_CODE_LOCKED', 'Too many wrong codes. Contact Kendibo support to continue.', 423);
+    if (check === 'wrong') return fail(reply, 'START_CODE_WRONG', 'That code is not right. Ask the customer to read it again.', 400);
+  }
+  try {
+    const out = await transition(jobId, from, to as JobStatus, party.as);
+    void afterTransition(jobId, to as JobStatus).catch((e) => observability.captureException(e));
+    return out;
+  } catch (e: unknown) { return fail(reply, 'ILLEGAL_TRANSITION', (e as Error).message, 409); }
+});
+// The customer's start code, shown only to them (never to the provider).
+app.get('/v1/bookings/:id/start-code', async (req, reply) => {
+  const id = (req.params as { id: string }).id;
+  const party = await bookingParty(req as never, reply, id); if (!party) return reply;
+  if (party.as !== 'customer') return fail(reply, 'FORBIDDEN', 'Only the customer can see the start code', 403);
+  return { data: { code: await ensureStartCode(id) } };
+});
+// Customer confirms the work is done (also: WhatsApp "DONE", or auto after 48h).
+app.post('/v1/bookings/:id/confirm-done', async (req, reply) => {
+  const id = (req.params as { id: string }).id;
+  const party = await bookingParty(req as never, reply, id); if (!party) return reply;
+  if (party.as !== 'customer') return fail(reply, 'FORBIDDEN', 'Only the customer can confirm the job is done', 403);
+  const out = await confirmCompletion(id, 'customer');
+  if (out === 'not_ready') return fail(reply, 'NOT_COMPLETED', 'The provider has not marked this job as done yet.', 409);
+  if (out === 'disputed') return fail(reply, 'DISPUTED', 'This job has an open report. Our team will settle it with you.', 409);
+  return { data: { status: 'CUSTOMER_CONFIRMATION' } };
 });
 app.post('/v1/jobs/:id/settle', async (req, reply) => {
   // The split is computed server-side from what was actually collected and the
@@ -2105,10 +2136,13 @@ app.patch('/v1/me', async (req, reply) => {
 // while a job is still open or money is in the wallet, so nobody loses either.
 app.delete('/v1/me', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  // Customer bookings, plus jobs assigned to this user as a provider.
   const open = await q(
-    `SELECT 1 FROM booking.booking WHERE (user_id=$1 OR provider_id IN (SELECT id FROM provider.provider WHERE user_id=$1))
-       AND upper(status) NOT IN ('COMPLETED','CANCELLED','CANCELED','REFUNDED','CLOSED','DECLINED','EXPIRED') LIMIT 1`, [a.sub],
-  ).catch(() => []);
+    `SELECT 1 FROM booking.booking b
+      WHERE (b.user_id=$1 OR b.id::text IN (SELECT da.job_id FROM dispatch.assignment da JOIN provider.provider p ON p.id=da.provider_id
+                                              WHERE p.user_id=$1 AND da.status='accepted'))
+        AND upper(b.status) NOT IN ('COMPLETED','CANCELLED','CANCELED','REFUNDED','CLOSED','DECLINED','EXPIRED') LIMIT 1`, [a.sub],
+  );
   if (open[0]) return fail(reply, 'OPEN_BOOKINGS', 'Finish or cancel your open bookings before deleting your account.', 409);
   const balance = await walletService.getBalance(a.sub).catch(() => 0);
   if (balance > 0) return fail(reply, 'WALLET_NOT_EMPTY', 'Withdraw or use your wallet balance before deleting your account. Contact support if you need help.', 409);
@@ -3008,6 +3042,7 @@ app.get('/v1/media/:id/file', async (req, reply) => {
 const port = Number(process.env.PORT ?? 3000);
 // ---------- vendor platform: storefronts, trade rules, credentials, WhatsApp ----------
 registerVendorRoutes(app, { authed: authed as never, fail: fail as never, providerActor });
+if (process.env.NODE_ENV !== 'test') startCompletionSweeper();
 registerAdminOpsRoutes(app, { authed: authed as never, fail: fail as never });
 configureWhatsappBot({ createCheckout: (input) => payments.createCheckout(input) });
 

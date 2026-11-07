@@ -145,6 +145,20 @@ export const templates = {
     };
   },
 
+  /** Email added on WhatsApp: one tap confirms it is theirs before we attach it. */
+  confirmEmail(input: { name?: string; link: string }, opts: { recipientEmail?: string; appUrl?: string } = {}): MailPiece {
+    const content = `
+      <p style="${styles.p}">Hi ${escapeHtml(firstNameOf(input.name))},</p>
+      <p style="${styles.p}">You added this email to your Kendibo account on WhatsApp. Tap below to confirm it is yours. We will send your booking receipts here, and you can use it to sign in to the app.</p>
+      <p style="text-align:center;margin:24px 0"><a href="${escapeHtml(input.link)}" style="display:inline-block;background:#1D5BD6;color:#ffffff;text-decoration:none;font-weight:700;padding:14px 28px;border-radius:999px">Confirm my email</a></p>
+      <p style="${styles.p}">The link works for 24 hours. If you did not add this email, ignore this message and nothing changes.</p>
+    `;
+    return {
+      html: renderLayout(content, 'Confirm your email for Kendibo', opts),
+      text: `Hi ${firstNameOf(input.name)},\nConfirm your email for Kendibo: ${input.link}\nThe link works for 24 hours. If you did not add this email, ignore this message.`,
+    };
+  },
+
   bookingConfirmed(input: { name?: string; service: string; when: string; where: string; ref: string }, opts: { recipientEmail?: string; appUrl?: string } = {}): MailPiece {
     const row = (k: string, v: string) => `<p style="${styles.p}"><strong>${escapeHtml(k)}:</strong> ${escapeHtml(v)}</p>`;
     const content = `

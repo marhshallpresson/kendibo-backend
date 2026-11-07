@@ -29,7 +29,7 @@ import { nextStep, sendStep, handleFlowTap, patchFromUnderstanding, acknowledge,
 import { FACTS, priceLines } from './facts.js';
 import { OPT_IN, OPT_OUT, llmAllowed, sendBusinessInitiated, notifyCustomer, setJobOfferConsent } from './policy.js';
 import { activeRelay, closeRelay, relayText, relayMedia } from './relay.js';
-import { idCheckLink, termsLink, payToken, webBase } from './links.js';
+import { idCheckLink, termsLink, payToken, webBase, emailConfirmLink } from './links.js';
 
 type State = 'BOT' | 'HUMAN';
 interface Session { waId: string; userId: string | null; state: State; data: Asked; updatedAt: number }
@@ -342,11 +342,9 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
       if (id === 'consent:agree') {
         await q(`UPDATE identity.users SET terms_accepted_at=now(), terms_source='whatsapp' WHERE id=$1`, [user.id]);
         emit('whatsapp.terms_accepted', { userId: user.id });
-        const pending = s.data.pendingText ?? '';
-        delete s.data.pendingText;
+        await sendWelcomeSms(to, user.id, profileName);
+        await askName(to, s, profileName);
         await saveSession(s);
-        if (pending) return processInbound({ id: `${m.id}:pending`, from: to, type: 'text', text: { body: pending } }, profileName);
-        await sendWelcome(to, profileName);
         return;
       }
       if (text && !id) s.data.pendingText = text.slice(0, 500);
@@ -357,8 +355,43 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
     }
   }
 
+  // Onboarding steps after consent: name (one tap), then email (or skip).
+  if (s.data.onboard) {
+    const done = await handleOnboarding(to, s, user.id, text, id, profileName);
+    if (!done) { await saveSession(s); return; }
+    const pending = s.data.pendingText ?? '';
+    delete s.data.pendingText;
+    await saveSession(s);
+    if (pending) return processInbound({ id: `${m.id}:pending`, from: to, type: 'text', text: { body: pending } }, profileName);
+    await sendWelcome(to, profileName);
+    return;
+  }
+
   // Shortcuts that work at any point: resend the pay button, or the ID check.
   if (!id && /^(pay|pay now|payment|make payment)[.!]*$/.test(lower)) { await sendPayButton(to, user.id); return; }
+  // Completion: DONE confirms the job the pro marked finished; PROBLEM freezes it
+  // (no payout) and hands the chat to a person.
+  if (!id && /^(done|it'?s done|job done|confirm|confirmed|yes it'?s done)[.!]*$/.test(lower)) {
+    const { awaitingConfirmationFor, confirmCompletion } = await import('../job-engine/job-guard.js');
+    const bookingId = await awaitingConfirmationFor(user.id);
+    if (!bookingId) { await sendMenu(to, "There's no finished job waiting for your confirmation right now."); return; }
+    const out = await confirmCompletion(bookingId, 'customer');
+    await wa.text(to, out === 'confirmed'
+      ? 'Thanks for confirming! Your pro will be paid. Rate them in the app to help other customers.'
+      : out === 'disputed' ? 'This job has an open report. Our team will settle it with you here.' : 'That job is not ready to confirm yet.');
+    return;
+  }
+  if (!id && /^(problem|report|not done|issue|complain|complaint)[.!]*$/.test(lower)) {
+    const { awaitingConfirmationFor } = await import('../job-engine/job-guard.js');
+    const bookingId = await awaitingConfirmationFor(user.id);
+    if (bookingId) {
+      const { flag } = await import('../job-engine/job.machine.js');
+      await flag(bookingId, 'DISPUTED', 'customer', 'reported on WhatsApp').catch(() => undefined);
+    }
+    await handOff(s, user.id, to, `Customer reported a problem${bookingId ? ` with booking ${bookingId.slice(0, 8)}` : ''}. Payment is on hold.`);
+    await saveSession(s);
+    return;
+  }
   if (!id && /^(verify|verify me|verify id|kyc|id check)[.!]*$/.test(lower)) {
     await wa.ctaUrl(to, "Verify your ID on Kendibo's secure page. It takes about a minute. Never send your NIN or BVN in this chat.", 'Verify my ID', idCheckLink(to, user.id));
     return;
@@ -578,6 +611,102 @@ export async function payLinkTarget(waId: string, bookingId: string): Promise<{ 
     reference: `bk_${bookingId}_wa`, idempotencyKey: `wa_accept_${bookingId}`,
   });
   return session.checkoutUrl ? { url: session.checkoutUrl } : { done: 'Open the Kendibo app to pay for this booking.' };
+}
+
+// ── Onboarding (after consent) ─────────────────────────────────────────────
+// Number = account (created on first message). Here we add a name and an email
+// the person has confirmed, without slowing the booking down.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+/** One welcome text message per number, by SMS so it lands even off WhatsApp. */
+async function sendWelcomeSms(to: string, userId: string, name?: string): Promise<void> {
+  const first = await q<{ id: string }>(`UPDATE identity.users SET welcome_sent_at=now() WHERE id=$1 AND welcome_sent_at IS NULL RETURNING id`, [userId]).catch(() => []);
+  if (!first[0]) return;
+  const app = (process.env.APP_URL || 'https://kendibo-app.pxxl.click').replace(/\/+$/, '');
+  const hi = firstName(name) ? `Welcome to Kendibo, ${firstName(name)}!` : 'Welcome to Kendibo!';
+  try {
+    const { sms } = await import('../notifications/channels.js');
+    await sms.send(`+${to.replace(/\D/g, '')}`, `${hi} Book ID-checked pros on WhatsApp any time, or in the app: ${app} . Kendibo will never ask for your PIN or OTP.`, { type: 'transactional' });
+  } catch (e) { observability.captureException(e); }
+}
+
+async function askName(to: string, s: Session, profileName?: string): Promise<void> {
+  if (firstName(profileName)) {
+    s.data.onboard = 'name';
+    await wa.buttons(to, `Thanks! Shall I call you ${firstName(profileName)}?`, [
+      { id: 'onb:name:yes', title: "Yes, that's me" },
+      { id: 'onb:name:change', title: 'Use another name' },
+    ]);
+  } else {
+    s.data.onboard = 'name_text';
+    await wa.text(to, "Thanks! What's your name?");
+  }
+}
+
+async function askEmail(to: string, s: Session, userId: string): Promise<boolean> {
+  const has = await q<{ email: string | null }>(`SELECT email FROM identity.users WHERE id=$1`, [userId]).catch(() => []);
+  if (has[0]?.email) return true; // already have it (e.g. signed up in the app)
+  s.data.onboard = 'email';
+  await wa.buttons(to, "What's your email? We send receipts there, and you can use it to sign in to the Kendibo app.", [{ id: 'onb:email:skip', title: 'Skip for now' }]);
+  return false;
+}
+
+/** Returns true when onboarding is finished (caller resumes the first request). */
+async function handleOnboarding(to: string, s: Session, userId: string, text: string, id: string, profileName?: string): Promise<boolean> {
+  const step = s.data.onboard;
+  if (step === 'name') {
+    if (id === 'onb:name:change') { s.data.onboard = 'name_text'; await wa.text(to, 'Type the name you would like us to use.'); return false; }
+    const name = id === 'onb:name:yes' ? (profileName ?? '').trim() : text.trim();
+    if (name.length >= 2) await q(`UPDATE identity.users SET name=$2, updated_at=now() WHERE id=$1`, [userId, name.slice(0, 80)]);
+    if (await askEmail(to, s, userId)) { delete s.data.onboard; return true; }
+    return false;
+  }
+  if (step === 'name_text') {
+    const name = text.trim();
+    if (name.length < 2 || name.length > 80 || /\d{4,}/.test(name)) { await wa.text(to, 'Please type your name (just your name is fine).'); return false; }
+    await q(`UPDATE identity.users SET name=$2, updated_at=now() WHERE id=$1`, [userId, name]);
+    if (await askEmail(to, s, userId)) { delete s.data.onboard; return true; }
+    return false;
+  }
+  // step === 'email'
+  if (id === 'onb:email:skip') {
+    delete s.data.onboard;
+    await wa.text(to, 'No problem. You can add it later in the app.');
+    return true;
+  }
+  const email = text.trim().toLowerCase();
+  if (!EMAIL_RE.test(email)) { await wa.buttons(to, "That doesn't look like an email. Type it again, or tap Skip.", [{ id: 'onb:email:skip', title: 'Skip for now' }]); return false; }
+  const taken = await q(`SELECT 1 FROM identity.users WHERE lower(email)=$1 AND id<>$2`, [email, userId]).catch(() => []);
+  delete s.data.onboard;
+  if (taken[0]) {
+    await wa.text(to, 'That email is already on another Kendibo account, so we have not added it here. You can sign in with it in the app.');
+    return true;
+  }
+  await q(`UPDATE identity.users SET email_pending=$2 WHERE id=$1`, [userId, email]);
+  const nameRow = await q<{ name: string | null }>(`SELECT name FROM identity.users WHERE id=$1`, [userId]).catch(() => []);
+  try {
+    const [{ email: mailer }, { templates }] = await Promise.all([import('../notifications/channels.js'), import('../notifications/mail.templates.js')]);
+    const mail = templates.confirmEmail({ name: nameRow[0]?.name ?? undefined, link: emailConfirmLink(to, userId) }, { recipientEmail: email });
+    await mailer.send(email, 'Confirm your email for Kendibo', mail.html);
+    await wa.text(to, `I've sent a link to ${email}. Tap it to confirm. Meanwhile, let's get your job sorted.`);
+  } catch (e) {
+    observability.captureException(e);
+    await wa.text(to, "I couldn't send the confirmation email just now. You can add it later in the app.");
+  }
+  return true;
+}
+
+/** The email link was opened: attach the confirmed email and say so in the chat. */
+export async function confirmPendingEmail(waId: string, userId: string): Promise<'confirmed' | 'taken' | 'none'> {
+  const r = await q<{ email_pending: string | null }>(`SELECT email_pending FROM identity.users WHERE id=$1`, [userId]).catch(() => []);
+  const email = r[0]?.email_pending;
+  if (!email) return 'none';
+  const taken = await q(`SELECT 1 FROM identity.users WHERE lower(email)=$1 AND id<>$2`, [email, userId]).catch(() => []);
+  if (taken[0]) { await q(`UPDATE identity.users SET email_pending=NULL WHERE id=$1`, [userId]); return 'taken'; }
+  await q(`UPDATE identity.users SET email=$2, email_verified_at=now(), email_pending=NULL, updated_at=now() WHERE id=$1`, [userId, email]);
+  emit('whatsapp.email_confirmed', { userId });
+  await notifyCustomer(waId, `Email confirmed: ${email}. Your receipts will go there, and you can use it to sign in to the app.`).catch(() => undefined);
+  return 'confirmed';
 }
 
 /** PAY: the latest booking still waiting for payment gets a fresh pay button. */

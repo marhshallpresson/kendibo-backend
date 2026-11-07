@@ -19,7 +19,7 @@ import { Readable } from 'node:stream';
 import { verifySubscription, verifySignature, whatsappConfigured } from '../../../modules/whatsapp/whatsapp.client.js';
 import { verifyLink } from '../../../modules/whatsapp/links.js';
 import { renderLocationPage, renderVendorsPage, renderMessagePage, renderVerifyPage, renderTermsPage, pageCsp } from '../../../modules/whatsapp/web-pages.js';
-import { enqueueInbound, continueAfterLocation, startInboundSweeper, payLinkTarget, continueAfterVerification, type InboundMessage } from '../../../modules/whatsapp/whatsapp.bot.js';
+import { enqueueInbound, continueAfterLocation, startInboundSweeper, payLinkTarget, continueAfterVerification, confirmPendingEmail, type InboundMessage } from '../../../modules/whatsapp/whatsapp.bot.js';
 import { applyTemplateWebhook, startTemplateStatusSync } from '../../../modules/whatsapp/templates.js';
 import { saveDraftLocation } from '../../../modules/whatsapp/draft.js';
 import { notifyCustomer } from '../../../modules/whatsapp/policy.js';
@@ -48,6 +48,7 @@ export const VENDOR_ROUTE_POLICY: Record<string, 'public' | Permission> = {
   'GET /w/verify': 'public',
   'POST /w/verify': 'public',
   'GET /w/terms': 'public',
+  'GET /w/confirm-email': 'public',
   'GET /v1/admin/category-rules': 'provider:verify',
   'PUT /v1/admin/category-rules/:id': 'configuration:edit',
   'GET /v1/admin/category-proposals': 'provider:verify',
@@ -436,6 +437,19 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
       : status === 'REJECTED'
         ? { title: "We couldn't verify you", message: "The details didn't match. Go back to WhatsApp and reply AGENT if you need help." }
         : { title: 'Check in progress', message: "We're confirming your details. We'll message you on WhatsApp as soon as it's done." };
+    return html(reply, nonce, false, renderMessagePage({ ...page, nonce, waNumber: waNumber() }));
+  });
+  // Email added on WhatsApp: attached only when its owner opens this link.
+  app.get('/w/confirm-email', async (req, reply) => {
+    const nonce = newNonce();
+    const claims = verifyLink(String((req.query as { t?: string }).t ?? ''), 'email');
+    if (!claims) return expired(reply, nonce);
+    const out = await confirmPendingEmail(claims.w, claims.d).catch((e) => { observability.captureException(e); return 'none' as const; });
+    const page = out === 'confirmed'
+      ? { title: 'Email confirmed', message: 'Thanks. Your receipts will come here, and you can use this email to sign in to the Kendibo app.' }
+      : out === 'taken'
+        ? { title: 'Email already in use', message: 'This email is on another Kendibo account, so we did not add it. Sign in with it in the app instead.' }
+        : { title: 'Nothing to confirm', message: 'This email is already confirmed, or the request was replaced. You can add an email in the app.' };
     return html(reply, nonce, false, renderMessagePage({ ...page, nonce, waNumber: waNumber() }));
   });
   app.get('/w/terms', async (_req, reply) => {

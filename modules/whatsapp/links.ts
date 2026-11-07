@@ -4,7 +4,7 @@
 // bound to one WhatsApp user + one job draft + one purpose, with an expiry.
 import crypto from 'node:crypto';
 
-export type LinkPurpose = 'loc' | 'vendors' | 'pay' | 'verify';
+export type LinkPurpose = 'loc' | 'vendors' | 'pay' | 'verify' | 'email';
 export interface LinkClaims { w: string; d: string; p: LinkPurpose; exp: number }
 
 const secret = () => process.env.WHATSAPP_LINK_SECRET || process.env.JWT_ACCESS_SECRET || 'dev-wa-links-INSECURE';
@@ -42,3 +42,5 @@ export const vendorsLink = (waId: string, draftId: string) => `${webBase()}/w/ve
 export const idCheckLink = (waId: string, userId: string) => `${webBase()}/w/verify?t=${encodeURIComponent(signLink({ w: waId, d: userId, p: 'verify' }, 24 * 3600))}`;
 /** Public terms & privacy summary the onboarding message links to. */
 export const termsLink = () => `${webBase()}/w/terms`;
+/** Email confirmation link (d = user id). The email is attached only once this is opened. */
+export const emailConfirmLink = (waId: string, userId: string) => `${webBase()}/w/confirm-email?t=${encodeURIComponent(signLink({ w: waId, d: userId, p: 'email' }, 24 * 3600))}`;
