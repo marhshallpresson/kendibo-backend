@@ -7,8 +7,12 @@ import { categoryRulesService } from './category-rules.service.js';
 
 export interface SettlementSplit {
   bookingId: string; categoryId: string | null; collectedKobo: bigint;
-  commissionBps: number; commissionKobo: bigint; providerKobo: bigint;
+  commissionBps: number; commissionKobo: bigint; vatKobo: bigint; providerKobo: bigint;
 }
+
+/** VAT on Kendibo's commission (Nigeria 7.5%); deducted from the provider's share. */
+export const COMMISSION_VAT_BPS = () => Number(process.env.COMMISSION_VAT_BPS ?? 750);
+export const vatOn = (commissionKobo: bigint) => (commissionKobo * BigInt(COMMISSION_VAT_BPS())) / 10000n;
 
 const big = (v: unknown) => BigInt(String(v ?? 0).split('.')[0] || '0');
 
@@ -33,7 +37,8 @@ export const vendorFinanceService = {
     }
     const bps = categoryId ? (await categoryRulesService.ruleFor(categoryId)).commissionBps : 1500;
     const commission = (collected * BigInt(bps)) / 10000n;
-    return { bookingId, categoryId, collectedKobo: collected, commissionBps: bps, commissionKobo: commission, providerKobo: collected - commission };
+    const vat = vatOn(commission);
+    return { bookingId, categoryId, collectedKobo: collected, commissionBps: bps, commissionKobo: commission, vatKobo: vat, providerKobo: collected - commission - vat };
   },
 
   /** Idempotent per (provider, job): a retried settlement never double-credits. */
@@ -43,9 +48,9 @@ export const vendorFinanceService = {
     const existing = await q(`SELECT 1 FROM provider.earning WHERE provider_id=$1 AND job_id=$2`, [providerId, bookingId]);
     if (!existing[0]) {
       await q(
-        `INSERT INTO provider.earning (provider_id, job_id, amount_kobo, gross_kobo, commission_kobo, commission_bps)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [providerId, bookingId, String(split.providerKobo), String(split.collectedKobo), String(split.commissionKobo), split.commissionBps],
+        `INSERT INTO provider.earning (provider_id, job_id, amount_kobo, gross_kobo, commission_kobo, commission_bps, vat_kobo)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [providerId, bookingId, String(split.providerKobo), String(split.collectedKobo), String(split.commissionKobo), split.commissionBps, String(split.vatKobo)],
       );
       emit('vendor.earning_credited', { providerId, bookingId, providerKobo: String(split.providerKobo) });
     }
@@ -97,8 +102,8 @@ export const vendorFinanceService = {
    */
   async summary(providerId: string) {
     const bal = await this.balance(providerId);
-    const totals = await q<{ gross: string; commission: string }>(
-      `SELECT COALESCE(SUM(gross_kobo),0) AS gross, COALESCE(SUM(commission_kobo),0) AS commission FROM provider.earning WHERE provider_id=$1`, [providerId],
+    const totals = await q<{ gross: string; commission: string; vat: string }>(
+      `SELECT COALESCE(SUM(gross_kobo),0) AS gross, COALESCE(SUM(commission_kobo),0) AS commission, COALESCE(SUM(vat_kobo),0) AS vat FROM provider.earning WHERE provider_id=$1`, [providerId],
     );
     const monthStart = new Date(); monthStart.setUTCDate(1); monthStart.setUTCHours(0, 0, 0, 0);
     const month = await q<{ t: string }>(`SELECT COALESCE(SUM(amount_kobo + tip_kobo),0) AS t FROM provider.earning WHERE provider_id=$1 AND created_at >= $2`, [providerId, monthStart.toISOString()]);
@@ -112,17 +117,18 @@ export const vendorFinanceService = {
       escrowGross += big(paid[0]?.t);
     }
     const recent = await q<Record<string, unknown>>(
-      `SELECT job_id, gross_kobo, commission_kobo, commission_bps, amount_kobo, tip_kobo, created_at FROM provider.earning WHERE provider_id=$1 ORDER BY created_at DESC LIMIT 30`, [providerId],
+      `SELECT job_id, gross_kobo, commission_kobo, commission_bps, vat_kobo, amount_kobo, tip_kobo, created_at FROM provider.earning WHERE provider_id=$1 ORDER BY created_at DESC LIMIT 30`, [providerId],
     );
     return {
       ...bal,
       heldInEscrowKobo: escrowGross.toString(),
       grossKobo: big(totals[0]?.gross).toString(),
       commissionKobo: big(totals[0]?.commission).toString(),
+      vatOnCommissionKobo: big(totals[0]?.vat).toString(),
       thisMonthKobo: big(month[0]?.t).toString(),
       jobs: recent.map((r) => ({
         jobId: String(r.job_id), grossKobo: String(r.gross_kobo ?? r.amount_kobo), commissionKobo: String(r.commission_kobo ?? 0),
-        commissionBps: r.commission_bps != null ? Number(r.commission_bps) : null, netKobo: String(r.amount_kobo), tipKobo: String(r.tip_kobo ?? 0),
+        commissionBps: r.commission_bps != null ? Number(r.commission_bps) : null, vatKobo: String(r.vat_kobo ?? 0), netKobo: String(r.amount_kobo), tipKobo: String(r.tip_kobo ?? 0),
         at: String(r.created_at),
       })),
     };

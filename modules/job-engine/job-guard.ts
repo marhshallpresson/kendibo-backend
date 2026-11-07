@@ -110,7 +110,7 @@ export async function settleJob(bookingId: string): Promise<'settled' | 'unpaid'
   try { split = await vendorFinanceService.creditEarning(providerId, bookingId); }
   catch (e) { if ((e as Error).message === 'NOTHING_COLLECTED') return 'unpaid'; throw e; }
   const { postSettlement, currentPeriod } = await import('../ledger/ledger.service.js');
-  await postSettlement(`settle_${bookingId}`, split.collectedKobo, split.providerKobo, currentPeriod()).catch(() => undefined); // already posted on a retry
+  await postSettlement(`settle_${bookingId}`, split.collectedKobo, split.providerKobo, currentPeriod(), split.vatKobo).catch(() => undefined); // already posted on a retry
   if ((await latestStatus(bookingId)) === 'CUSTOMER_CONFIRMATION') {
     await transition(bookingId, 'CUSTOMER_CONFIRMATION', 'SETTLEMENT', 'system');
     await transition(bookingId, 'SETTLEMENT', 'WARRANTY_ACTIVE', 'system');
@@ -121,7 +121,7 @@ export async function settleJob(bookingId: string): Promise<'settled' | 'unpaid'
     const n = (k: bigint) => `₦${(Number(k) / 100).toLocaleString('en-NG')}`;
     try {
       const { notifyCustomer } = await import('../whatsapp/policy.js');
-      await notifyCustomer(String(p[0].phone).replace(/\D/g, ''), `The customer confirmed the job. ${n(split.providerKobo)} has been added to your Kendibo earnings (${n(split.collectedKobo)} minus Kendibo's ${split.commissionBps / 100}% commission).`);
+      await notifyCustomer(String(p[0].phone).replace(/\D/g, ''), `The customer confirmed the job. ${n(split.providerKobo)} has been added to your Kendibo earnings (${n(split.collectedKobo)} minus Kendibo's ${split.commissionBps / 100}% commission and VAT on it).`);
     } catch { /* best effort */ }
   }
   return 'settled';

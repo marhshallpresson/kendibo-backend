@@ -78,16 +78,16 @@ export function postCollection(reference: string, amountKobo: Kobo, period: stri
   });
 }
 
-export function postSettlement(reference: string, totalKobo: Kobo, providerKobo: Kobo, period: string): Promise<Journal> {
-  const fee = totalKobo - providerKobo;
-  return postJournal({
-    id: '', reference, period, createdAt: new Date().toISOString(),
-    lines: [
-      { accountCode: '1100', debitKobo: totalKobo, creditKobo: 0n },
-      { accountCode: '2000', debitKobo: 0n, creditKobo: providerKobo },
-      { accountCode: '3000', debitKobo: 0n, creditKobo: fee },
-    ],
-  });
+/** Escrow released: provider payable, Kendibo's commission (revenue) and the VAT on it (owed, 3100). */
+export function postSettlement(reference: string, totalKobo: Kobo, providerKobo: Kobo, period: string, vatKobo: Kobo = 0n): Promise<Journal> {
+  const fee = totalKobo - providerKobo - vatKobo;
+  const lines = [
+    { accountCode: '1100', debitKobo: totalKobo, creditKobo: 0n },
+    { accountCode: '2000', debitKobo: 0n, creditKobo: providerKobo },
+    { accountCode: '3000', debitKobo: 0n, creditKobo: fee },
+    { accountCode: '3100', debitKobo: 0n, creditKobo: vatKobo },
+  ].filter((l) => l.debitKobo > 0n || l.creditKobo > 0n); // entries may not be zero
+  return postJournal({ id: '', reference, period, createdAt: new Date().toISOString(), lines });
 }
 
 export async function reverseJournal(original: Journal, period: string): Promise<Journal> {

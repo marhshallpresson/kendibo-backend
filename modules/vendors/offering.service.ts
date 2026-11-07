@@ -12,7 +12,7 @@ export interface Offering {
   id: string; providerId: string; categoryId: string; name: string; description: string | null;
   priceKobo: string; priceUnit: PriceUnit; durationMinutes: number | null; active: boolean;
 }
-export interface Earnings { priceKobo: string; commissionBps: number; commissionKobo: string; providerKobo: string }
+export interface Earnings { priceKobo: string; commissionBps: number; commissionKobo: string; vatKobo: string; vatBps: number; providerKobo: string }
 
 const MIN_KOBO = () => BigInt(process.env.MIN_JOB_PRICE_KOBO || '300000');
 const toOffering = (r: Record<string, unknown>): Offering => ({
@@ -25,7 +25,9 @@ const toOffering = (r: Record<string, unknown>): Offering => ({
 export async function earningsFor(categoryId: string | null, priceKobo: bigint): Promise<Earnings> {
   const bps = categoryId ? (await categoryRulesService.ruleFor(categoryId)).commissionBps : 1500;
   const commission = (priceKobo * BigInt(bps)) / 10000n; // rounded down: the provider never loses a kobo
-  return { priceKobo: String(priceKobo), commissionBps: bps, commissionKobo: String(commission), providerKobo: String(priceKobo - commission) };
+  const { vatOn, COMMISSION_VAT_BPS } = await import('./vendor-finance.service.js');
+  const vat = vatOn(commission); // VAT on Kendibo's commission, from the provider's share
+  return { priceKobo: String(priceKobo), commissionBps: bps, commissionKobo: String(commission), vatKobo: String(vat), vatBps: COMMISSION_VAT_BPS(), providerKobo: String(priceKobo - commission - vat) };
 }
 
 export const offeringService = {

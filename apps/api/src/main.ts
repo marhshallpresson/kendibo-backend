@@ -1663,9 +1663,9 @@ app.post('/v1/jobs/:id/settle', async (req, reply) => {
   if (!assigned[0]) return fail(reply, 'NO_PROVIDER', 'No accepted provider for this job', 409);
   try {
     const split = await vendorFinanceService.creditEarning(String(assigned[0].provider_id), jobId);
-    const j = await postSettlement(`settle_${jobId}`, split.collectedKobo, split.providerKobo, currentPeriod());
+    const j = await postSettlement(`settle_${jobId}`, split.collectedKobo, split.providerKobo, currentPeriod(), split.vatKobo);
     const tb = await trialBalance();
-    return { data: { balanced: tb.balanced, journal: j.reference, split: { ...split, collectedKobo: String(split.collectedKobo), commissionKobo: String(split.commissionKobo), providerKobo: String(split.providerKobo) } } };
+    return { data: { balanced: tb.balanced, journal: j.reference, split: { ...split, collectedKobo: String(split.collectedKobo), commissionKobo: String(split.commissionKobo), providerKobo: String(split.providerKobo), vatKobo: String(split.vatKobo) } } };
   } catch (e: unknown) { return fail(reply, 'SETTLEMENT_BLOCKED', (e as Error).message, 409); }
 });
 app.get('/v1/bookings/:id/eta', async (req, reply) => {
