@@ -104,6 +104,7 @@ export function localDb(): IMemoryDb {
   run('032_whatsapp_marketing_consent.sql');
   run('033_payment_checkout_url.sql');
   run('034_whatsapp_onboarding_consent.sql');
+  run('035_kyc_customer_provider.sql');
   console.log('[localdb] pg-mem ready (001-019, 021-032)');
   return mem;
 }
