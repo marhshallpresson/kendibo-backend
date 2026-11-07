@@ -160,6 +160,20 @@ if (!process.env.DATABASE_URL) {
 function fail(reply: { code: (n: number) => { send: (b: unknown) => unknown } }, code: string, message: string, status = 400, retryable = false) {
   return reply.code(status).send({ error: { code, message, retryable } });
 }
+
+// Routes validate with schema.parse(); a rejected body used to surface as a
+// 500 "server error". Answer it as what it is: a 400 naming the bad field.
+// Every other error keeps Fastify's normal handling.
+app.setErrorHandler((err, req, reply) => {
+  if (err instanceof z.ZodError) {
+    const first = err.issues[0];
+    const field = first?.path?.length ? `${first.path.join('.')}: ` : '';
+    return fail(reply, 'BAD_REQUEST', `${field}${first?.message ?? 'Invalid request'}`.slice(0, 200), 400);
+  }
+  const status = (err as { statusCode?: number }).statusCode ?? 500;
+  if (status >= 500) req.log.error({ err }, 'request failed');
+  return reply.code(status).send(err);
+});
 function authed(req: { headers: Record<string, string | undefined> }): { sub: string; permissions: string[] } | null {
   const h = req.headers.authorization;
   if (!h?.startsWith('Bearer ')) return null;
