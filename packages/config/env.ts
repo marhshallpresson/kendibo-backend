@@ -65,6 +65,10 @@ if (config.NODE_ENV === 'production') {
   if (missing.length > 0) {
     throw new Error(`REFUSED TO BOOT IN PRODUCTION — missing env: ${missing.join(', ')}`);
   }
+  const weak = required.filter((k) => String(config[k]).length < 32);
+  // Warn rather than refuse: tightening these on a running deploy must not take it down.
+  if (weak.length > 0) console.warn(`[config] SECURITY: secrets shorter than 32 characters: ${weak.join(', ')} — rotate them`);
+  if (config.JWT_ACCESS_SECRET === config.JWT_REFRESH_SECRET) console.warn('[config] SECURITY: JWT_ACCESS_SECRET and JWT_REFRESH_SECRET are identical — refresh tokens could pass as access tokens');
   if (config.ALLOW_OTP_DEBUG === 'true') throw new Error('REFUSED TO BOOT — ALLOW_OTP_DEBUG must never be true in production');
   for (const [k, v] of [['BACHS_API_KEY', config.BACHS_API_KEY], ['SLING_API_TOKEN', config.SLING_API_TOKEN],
       ['SMTP_HOST', config.SMTP_HOST], ['WATCHUP_API_KEY', config.WATCHUP_API_KEY],

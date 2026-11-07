@@ -33,7 +33,9 @@ export async function verifyOtp(channel: string, identity: string, code: string)
   );
   const rec = rows[0];
   if (!rec || new Date(rec.expires_at).getTime() < Date.now() || rec.attempts >= 5) return false;
-  await q(`UPDATE identity.otp_code SET attempts = attempts + 1 WHERE id=$1`, [rec.id]);
+  // Claim the attempt atomically so parallel guesses can't all slip under the limit.
+  const claimed = await q(`UPDATE identity.otp_code SET attempts = attempts + 1 WHERE id=$1 AND attempts < 5 RETURNING id`, [rec.id]);
+  if (!claimed[0]) return false;
   const given = Buffer.from(otpDigest(channel, identity, String(code)));
   const stored = Buffer.from(String(rec.code));
   if (given.length !== stored.length || !crypto.timingSafeEqual(given, stored)) return false;
@@ -53,7 +55,7 @@ export async function signRefresh(userId: string, deviceId: string): Promise<{ t
 }
 export async function rotateRefresh(token: string): Promise<{ access: string; refresh: string } | null> {
   try {
-    const p = jwt.verify(token, REFRESH_SECRET) as { sub: string; deviceId: string; jti: string };
+    const p = jwt.verify(token, REFRESH_SECRET, { algorithms: ['HS256'] }) as { sub: string; deviceId: string; jti: string };
     const rows = await q<{ revoked: boolean }>(`SELECT revoked FROM identity.refresh_token WHERE id=$1`, [p.jti]);
     const rec = rows[0];
     if (!rec) return null;
