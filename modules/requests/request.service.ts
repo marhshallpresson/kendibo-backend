@@ -52,6 +52,23 @@ async function defaultServiceFor(categoryId: string | null): Promise<string | nu
 /** Record the winning provider as an accepted assignment for the job so
  *  /v1/bookings/:id/tracking resolves a provider and the job can advance.
  *  pg-mem misses direct TEXT job_id lookups, so scan by indexed provider_id. */
+/** Lowest price a customer can propose or a pro can counter (default ₦3,000). */
+export const MIN_JOB_KOBO = () => BigInt(process.env.MIN_JOB_PRICE_KOBO || '300000');
+const naira = (k: bigint) => `₦${(Number(k) / 100).toLocaleString('en-NG', { maximumFractionDigits: 0 })}`;
+
+/** Tell the customer a pro answered with their own price. */
+async function notifyCounter(requestId: string, counterKobo: bigint): Promise<void> {
+  try {
+    const r = await q<{ phone: string | null; contact_phone: string | null }>(
+      `SELECT u.phone, sr.contact_phone FROM booking.service_request sr JOIN identity.users u ON u.id=sr.user_id WHERE sr.id=$1`, [requestId],
+    );
+    const phone = r[0]?.contact_phone ?? r[0]?.phone;
+    if (!phone) return;
+    const { notifyCustomer } = await import('../whatsapp/policy.js');
+    await notifyCustomer(String(phone).replace(/\D/g, ''), `A verified pro can do your job for ${naira(counterKobo)}. Open the Kendibo app to accept or decline their price.`);
+  } catch { /* best effort */ }
+}
+
 async function assignAccepted(jobId: string, providerId: string): Promise<void> {
   const mine = await q<Record<string, unknown>>(
     `SELECT id, job_id, status FROM dispatch.assignment WHERE provider_id=$1`, [providerId],
@@ -242,6 +259,23 @@ export const requestService = {
     const requestId = String(o.request_id);
     const providerId = String(o.provider_id);
     const req = toReq(took[0]);
+    // A price the two sides agreed (the customer's proposal accepted, or the pro's
+    // counter accepted by the customer) becomes the booking price directly.
+    const agreedRaw = took[0].agreed_kobo ?? took[0].proposed_kobo;
+    if (agreedRaw != null && BigInt(String(agreedRaw).split('.')[0] || '0') > 0n) {
+      const agreedKobo = BigInt(String(agreedRaw).split('.')[0]);
+      await q(`UPDATE booking.service_request SET agreed_kobo=$2 WHERE id=$1`, [requestId, String(agreedKobo)]);
+      const booking = await bookingService.createAgreed(req.userId, {
+        serviceId: req.serviceId ?? `custom:${req.categoryId ?? 'general'}`, addressId: req.addressId ?? '',
+        scheduledAt: req.scheduledDate ?? new Date().toISOString(), agreedKobo,
+        idempotencyKey: `req_${requestId}`, lat: req.lat, lng: req.lng,
+      });
+      await assignAccepted(booking.id, providerId);
+      await q(`UPDATE booking.service_request SET status='BOOKED', booking_id=$2 WHERE id=$1`, [requestId, booking.id]);
+      emit('request.booked', { requestId, bookingId: booking.id, providerId, agreed: true });
+      void notifyWhatsappCustomer(requestId, booking.id);
+      return { id: offerId, status: 'accepted', requestId, bookingId: booking.id, agreedKobo: String(agreedKobo) };
+    }
     // Resolve a catalog service: prefer the explicit one, else a category default.
     const serviceId = req.serviceId ?? await defaultServiceFor(req.categoryId);
     if (!serviceId) return { id: offerId, status: 'accepted', requestId };
@@ -269,6 +303,50 @@ export const requestService = {
     emit('request.booked', { requestId, bookingId: booking.id, providerId });
     void notifyWhatsappCustomer(requestId, booking.id);
     return { id: offerId, status: 'accepted', requestId, bookingId: booking.id };
+  },
+
+  // ── Price proposal and one counter-offer (inDrive pattern) ────────────────
+  /** Customer names their price (at least the minimum job price). */
+  async proposePrice(requestId: string, userId: string, amountKobo: bigint) {
+    if (amountKobo < MIN_JOB_KOBO()) throw new Error(`BELOW_MINIMUM:${MIN_JOB_KOBO()}`);
+    const r = await q<Record<string, unknown>>(
+      `UPDATE booking.service_request SET proposed_kobo=$3 WHERE id=$1 AND user_id=$2 AND status IN ('SUBMITTED','MATCHING','OFFERED') RETURNING id`,
+      [requestId, userId, String(amountKobo)],
+    );
+    if (!r[0]) throw new Error('REQUEST_CLOSED');
+    emit('request.price_proposed', { requestId, amountKobo: Number(amountKobo) });
+    return { requestId, proposedKobo: String(amountKobo) };
+  },
+  /** A pro answers with their own price, once per offer. */
+  async counterOffer(offerId: string, providerId: string, counterKobo: bigint) {
+    if (counterKobo < MIN_JOB_KOBO()) throw new Error(`BELOW_MINIMUM:${MIN_JOB_KOBO()}`);
+    const r = await q<{ request_id: string }>(
+      `UPDATE booking.request_offer SET counter_kobo=$3, countered_at=now(), status='countered'
+        WHERE id=$1 AND provider_id=$2 AND status='offered' AND counter_kobo IS NULL RETURNING request_id`,
+      [offerId, providerId, String(counterKobo)],
+    );
+    if (!r[0]) throw new Error('OFFER_GONE');
+    emit('request.countered', { offerId, counterKobo: Number(counterKobo) });
+    void notifyCounter(String(r[0].request_id), counterKobo);
+    return { id: offerId, status: 'countered', counterKobo: String(counterKobo) };
+  },
+  /** Customer takes the pro's counter: that price is agreed and the job is booked. */
+  async acceptCounter(requestId: string, offerId: string, userId: string) {
+    const rows = await q<{ counter_kobo: string | null; status: string }>(
+      `SELECT o.counter_kobo, o.status FROM booking.request_offer o JOIN booking.service_request r ON r.id=o.request_id
+        WHERE o.id=$1 AND o.request_id=$2 AND r.user_id=$3`, [offerId, requestId, userId],
+    );
+    if (!rows[0] || rows[0].status !== 'countered' || !rows[0].counter_kobo) throw new Error('COUNTER_GONE');
+    await q(`UPDATE booking.service_request SET agreed_kobo=$2 WHERE id=$1`, [requestId, String(rows[0].counter_kobo)]);
+    await q(`UPDATE booking.request_offer SET status='offered' WHERE id=$1`, [offerId]);
+    return this.respondOffer(offerId, true);
+  },
+  async declineCounter(requestId: string, offerId: string, userId: string) {
+    const own = await q(`SELECT 1 FROM booking.service_request WHERE id=$1 AND user_id=$2`, [requestId, userId]);
+    if (!own[0]) throw new Error('COUNTER_GONE');
+    const r = await q(`UPDATE booking.request_offer SET status='declined' WHERE id=$1 AND request_id=$2 AND status='countered' RETURNING id`, [offerId, requestId]);
+    if (!r[0]) throw new Error('COUNTER_GONE');
+    return { id: offerId, status: 'declined' };
   },
 
   /** Convert an accepted request into a booking (needs a catalog service).

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { issueOtp, verifyOtp, signAccess, signRefresh, rotateRefresh, revokeAll } from '../../packages/auth/auth.js';
 import { welcomeService } from '../notifications/welcome.js';
 import { q } from '../../packages/database/db.js';
+import { emit } from '../../packages/observability/emit.js';
 import { providerService } from '../providers/provider.service.js';
 import { isAdminRole, rolePerms } from '../authorization/rbac.js';
 import { sms, email } from '../notifications/channels.js';
@@ -237,12 +238,26 @@ export const identityService = {
       if (rows[0]) {
         await q(`UPDATE identity.device_session SET last_seen=now(), ip=$3, city=$4 WHERE id=$1`, [String(rows[0].id), userId, d.ip ?? null, d.city ?? null]);
       } else {
+        const others = await q(`SELECT 1 FROM identity.device_session WHERE user_id=$1 LIMIT 1`, [userId]);
         await q(`INSERT INTO identity.device_session (user_id, device_fp, platform, model, os, app_version, ip, city)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
           [userId, fp, d.platform ?? 'unknown', d.model ?? null, d.os ?? null, d.appVersion ?? null, d.ip ?? null, d.city ?? null]);
+        // A new phone on an existing account (possible SIM swap): alert the owner
+        // and hold payouts for 24h (payoutService.bankEligible).
+        if (others[0]) await this.flagNewDevice(userId, d.model ?? d.platform ?? 'a new device');
       }
     } catch { /* history must never break login */ }
     return { ok: true };
+  },
+  async flagNewDevice(userId: string, deviceName: string) {
+    await q(`UPDATE identity.users SET new_device_at=now() WHERE id=$1`, [userId]);
+    emit('identity.new_device', { userId });
+    const u = await q<{ phone: string | null; email: string | null }>(`SELECT phone, email FROM identity.users WHERE id=$1`, [userId]).catch(() => []);
+    const text = `Kendibo: your account was just signed in on ${String(deviceName).slice(0, 40)}. If this wasn't you, contact Kendibo support now. Payouts are paused for 24 hours to keep your money safe.`;
+    try {
+      if (u[0]?.phone) await sms.send(String(u[0].phone), text, { type: 'transactional' });
+      if (u[0]?.email) await email.send(String(u[0].email), 'New sign-in to your Kendibo account', `<p>${text}</p>`);
+    } catch { /* alert is best effort */ }
   },
   /** Google SSO: verify ID token (or OAuth2 access token), match-or-create verified user, same session bundle. */
   async googleVerify(idToken: string, device?: { fp?: string; platform?: string; model?: string; os?: string; appVersion?: string; ip?: string; city?: string }) {

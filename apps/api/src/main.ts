@@ -8,6 +8,7 @@ import { PaymentService } from '../../../modules/payments/payment.service.js';
 import { postCollection, postSettlement, trialBalance, openPeriod, currentPeriod } from '../../../modules/ledger/ledger.service.js';
 import { transition, type JobStatus } from '../../../modules/job-engine/job.machine.js';
 import { whyNot, checkStartCode, ensureStartCode, afterTransition, confirmCompletion, startCompletionSweeper } from '../../../modules/job-engine/job-guard.js';
+import { checkInDistance, selfieRequired, selfiePassed, recordCheckinSelfie, ratingsFor, rateParty, startReminderSweeper } from '../../../modules/job-engine/journey.js';
 import { observability } from '../../../packages/observability/watchup.adapter.js';
 import { identityService } from '../../../modules/identity/identity.service.js';
 import { authorize, isAdminRole, adminCan, type Permission } from '../../../modules/authorization/rbac.js';
@@ -1586,12 +1587,38 @@ app.post('/v1/jobs/:id/transition', async (req, reply) => {
     if (check === 'missing') return fail(reply, 'START_CODE_MISSING', 'Ask the customer to open the booking for their start code.', 409);
     if (check === 'locked') return fail(reply, 'START_CODE_LOCKED', 'Too many wrong codes. Contact Kendibo support to continue.', 423);
     if (check === 'wrong') return fail(reply, 'START_CODE_WRONG', 'That code is not right. Ask the customer to read it again.', 400);
+    // The pro must actually be at the address (when we have a fresh location).
+    const assigned = await q<{ provider_id: string }>(`SELECT provider_id FROM dispatch.assignment WHERE job_id=$1 AND status='accepted' LIMIT 1`, [jobId]);
+    if (assigned[0]) {
+      const near = await checkInDistance(jobId, String(assigned[0].provider_id));
+      if (near.result === 'far') return fail(reply, 'TOO_FAR', `You seem to be about ${near.metres} m from the job address. Check in when you are there.`, 403);
+    }
+    if (selfieRequired() && !(await selfiePassed(jobId))) {
+      return fail(reply, 'SELFIE_REQUIRED', 'Take your check-in selfie first so the customer knows it is you.', 409);
+    }
   }
   try {
     const out = await transition(jobId, from, to as JobStatus, party.as);
     void afterTransition(jobId, to as JobStatus).catch((e) => observability.captureException(e));
     return out;
   } catch (e: unknown) { return fail(reply, 'ILLEGAL_TRANSITION', (e as Error).message, 409); }
+});
+// The pro's check-in selfie for this job (liveness via the KYC provider; kept as evidence).
+app.post('/v1/provider/jobs/:id/checkin-selfie', { bodyLimit: 12 * 1024 * 1024 }, async (req, reply) => {
+  const id = (req.params as { id: string }).id;
+  const party = await bookingParty(req as never, reply, id); if (!party) return reply;
+  if (party.as !== 'provider') return fail(reply, 'FORBIDDEN', 'Only the assigned provider can do this', 403);
+  const { selfieBase64 } = z.object({ selfieBase64: z.string().min(100).max(11_000_000) }).parse(req.body);
+  const out = await recordCheckinSelfie(id, selfieBase64);
+  if (!out.ok) return fail(reply, 'SELFIE_NOT_VERIFIED', out.reason === 'PHOTO_REJECTED' ? 'That photo could not be used. Take a clear selfie in good light.' : 'We could not verify that selfie. Try again facing the camera.', 422);
+  return { data: { verified: true } };
+});
+// Ratings both ways; each side sees the other's only once both have rated (or after 14 days).
+app.get('/v1/bookings/:id/ratings', async (req, reply) => {
+  const id = (req.params as { id: string }).id;
+  const party = await bookingParty(req as never, reply, id); if (!party) return reply;
+  if (party.as === 'admin') return fail(reply, 'FORBIDDEN', 'Use the admin console', 403);
+  return { data: await ratingsFor(id, party.as) };
 });
 // The customer's start code, shown only to them (never to the provider).
 app.get('/v1/bookings/:id/start-code', async (req, reply) => {
@@ -2104,9 +2131,16 @@ app.post('/v1/reviews', async (req, reply) => {
   if (!parsed.success) return fail(reply, 'BAD_RATING', 'Rating 1-5 required');
   const { bookingId, rating, tags, comment } = parsed.data;
   const party = await bookingParty(req as never, reply, bookingId); if (!party) return reply;
-  if (party.as !== 'customer') return fail(reply, 'FORBIDDEN', 'Only the customer can review this booking', 403);
+  if (party.as === 'admin') return fail(reply, 'FORBIDDEN', 'Reviews come from the customer or the provider', 403);
+  // The pro rates the customer (held until the customer rates too).
+  if (party.as === 'provider') {
+    await rateParty(bookingId, 'provider', party.sub, rating, comment);
+    return { data: { bookingId, rating, visibleToCustomer: false } };
+  }
   try {
-    return { data: await reviewService.add(bookingId, { provider: rating, quality: rating, punctuality: rating, professionalism: rating, result: rating }, tags, comment) };
+    const out = await reviewService.add(bookingId, { provider: rating, quality: rating, punctuality: rating, professionalism: rating, result: rating }, tags, comment);
+    await rateParty(bookingId, 'customer', party.sub, rating, comment);
+    return { data: out };
   } catch (e: unknown) { return fail(reply, 'BAD_REVIEW', (e as Error).message, 409); }
 });
 
@@ -2393,16 +2427,71 @@ app.get('/v1/provider/bookings', async (req, reply) => {
   const me = await providerActor(req as never, reply); if (!me) return reply;
   return { data: await bookingService.listForProvider(me.id) };
 });
+// Customer names their price for a request (inDrive-style; at least the minimum).
+app.post('/v1/service-requests/:id/propose-price', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const { amountKobo } = z.object({ amountKobo: z.union([z.string().regex(/^\d+$/), z.number().int().positive()]) }).parse(req.body);
+  try { return { data: await requestService.proposePrice((req.params as { id: string }).id, a.sub, BigInt(amountKobo)) }; }
+  catch (e: unknown) {
+    const m = (e as Error).message;
+    if (m.startsWith('BELOW_MINIMUM')) return fail(reply, 'BELOW_MINIMUM', `The lowest price you can offer is ₦${(Number(m.split(':')[1]) / 100).toLocaleString('en-NG')}.`, 400);
+    return fail(reply, 'REQUEST_CLOSED', 'This request is no longer open for price changes.', 409);
+  }
+});
+// The offers on a customer's request, with any counter-price a pro sent.
+app.get('/v1/service-requests/:id/offers', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const id = (req.params as { id: string }).id;
+  const own = await q(`SELECT 1 FROM booking.service_request WHERE id=$1 AND user_id=$2`, [id, a.sub]);
+  if (!own[0]) return fail(reply, 'NOT_FOUND', 'Request not found', 404);
+  const rows = await q<Record<string, unknown>>(
+    `SELECT o.id, o.status, o.counter_kobo, o.eta_minutes, p.business_name, p.rating FROM booking.request_offer o
+       JOIN provider.provider p ON p.id=o.provider_id WHERE o.request_id=$1`, [id],
+  );
+  return { data: rows.map((r) => ({ id: String(r.id), status: String(r.status), counterKobo: r.counter_kobo != null ? String(r.counter_kobo) : null, etaMinutes: r.eta_minutes ?? null, provider: { name: String(r.business_name ?? 'Verified pro'), rating: r.rating ?? null } })) };
+});
+app.post('/v1/service-requests/:id/offers/:offerId/accept-counter', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const { id, offerId } = req.params as { id: string; offerId: string };
+  try {
+    const result = (await requestService.acceptCounter(id, offerId, a.sub)) as Record<string, unknown>;
+    if (result.bookingId) {
+      await bookingService.setStatus(String(result.bookingId), 'MATCHING', 'system').catch((e) => observability.captureException(e));
+      await advanceBookingAfterAccept(String(result.bookingId));
+    }
+    return { data: result };
+  } catch { return fail(reply, 'COUNTER_GONE', 'That price is no longer available.', 409); }
+});
+app.post('/v1/service-requests/:id/offers/:offerId/decline-counter', async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  const { id, offerId } = req.params as { id: string; offerId: string };
+  try { return { data: await requestService.declineCounter(id, offerId, a.sub) }; }
+  catch { return fail(reply, 'COUNTER_GONE', 'That price is no longer available.', 409); }
+});
 app.post('/v1/provider/requests/:id/respond', async (req, reply) => {
-  const { accept } = z.object({ accept: z.boolean() }).parse(req.body);
+  const { accept, counterKobo } = z.object({ accept: z.boolean().optional(), counterKobo: z.union([z.string().regex(/^\d+$/), z.number().int().positive()]).optional() }).parse(req.body);
   const me = await providerActor(req as never, reply); if (!me) return reply;
   const offerId = (req.params as { id: string }).id;
   const offer = await q<{ provider_id: string; category_id: string | null }>(
     `SELECT o.provider_id, r.category_id FROM booking.request_offer o JOIN booking.service_request r ON r.id=o.request_id WHERE o.id=$1`, [offerId],
   );
   if (!offer[0] || String(offer[0].provider_id) !== me.id) return fail(reply, 'NOT_FOUND', 'Offer not found', 404);
-  // Re-check the category rules at the moment of acceptance: KYC can lapse,
-  // a licence can expire, or the vendor can hit their concurrent-job cap.
+  // Re-check the category rules at the moment of acceptance (or counter): KYC can
+  // lapse, a licence can expire, or the vendor can hit their concurrent-job cap.
+  if ((accept || counterKobo !== undefined) && !(await vendorEligibilityService.allowed(me.id, offer[0].category_id))) {
+    const why = await vendorEligibilityService.evaluate(me.id, String(offer[0].category_id ?? '')).catch(() => null);
+    return fail(reply, 'NOT_ELIGIBLE', `Complete these first: ${(why?.missing ?? ['verification']).join(', ')}`, 403);
+  }
+  // One counter-price per offer; the customer then accepts or declines it.
+  if (counterKobo !== undefined) {
+    try { return { data: await requestService.counterOffer(offerId, me.id, BigInt(counterKobo)) }; }
+    catch (e: unknown) {
+      const m = (e as Error).message;
+      if (m.startsWith('BELOW_MINIMUM')) return fail(reply, 'BELOW_MINIMUM', `The lowest price is ₦${(Number(m.split(':')[1]) / 100).toLocaleString('en-NG')}.`, 400);
+      return fail(reply, 'OFFER_GONE', 'You can send one price per job, while the offer is open.', 409);
+    }
+  }
+  if (accept === undefined) return fail(reply, 'BAD_REQUEST', 'Send accept (true/false) or a counterKobo price.', 400);
   if (accept && !(await vendorEligibilityService.allowed(me.id, offer[0].category_id))) {
     const why = await vendorEligibilityService.evaluate(me.id, String(offer[0].category_id ?? '')).catch(() => null);
     return fail(reply, 'NOT_ELIGIBLE', `Complete these first: ${(why?.missing ?? ['verification']).join(', ')}`, 403);
@@ -3042,7 +3131,7 @@ app.get('/v1/media/:id/file', async (req, reply) => {
 const port = Number(process.env.PORT ?? 3000);
 // ---------- vendor platform: storefronts, trade rules, credentials, WhatsApp ----------
 registerVendorRoutes(app, { authed: authed as never, fail: fail as never, providerActor });
-if (process.env.NODE_ENV !== 'test') startCompletionSweeper();
+if (process.env.NODE_ENV !== 'test') { startCompletionSweeper(); startReminderSweeper(); }
 registerAdminOpsRoutes(app, { authed: authed as never, fail: fail as never });
 configureWhatsappBot({ createCheckout: (input) => payments.createCheckout(input) });
 

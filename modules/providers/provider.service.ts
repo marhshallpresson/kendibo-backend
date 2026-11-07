@@ -259,8 +259,8 @@ export const providerService = {
 
   async setOnline(id: string, online: boolean, lat?: number, lng?: number): Promise<Provider> {
     const rows = await q<Record<string, unknown>>(
-      `UPDATE provider.provider SET online=$2, lat=COALESCE($3,lat), lng=COALESCE($4,lng) WHERE id=$1 RETURNING *`,
-      [id, online, lat ?? null, lng ?? null],
+      `UPDATE provider.provider SET online=$2, lat=COALESCE($3,lat), lng=COALESCE($4,lng), location_at=COALESCE($5,location_at) WHERE id=$1 RETURNING *`,
+      [id, online, lat ?? null, lng ?? null, lat !== undefined && lng !== undefined ? new Date().toISOString() : null],
     );
     if (!rows[0]) throw new Error('PROVIDER_NOT_FOUND');
     emit('provider.availability', { providerId: id, online });
@@ -268,7 +268,7 @@ export const providerService = {
   },
 
   async updateLocation(id: string, lat: number, lng: number): Promise<void> {
-    await q(`UPDATE provider.provider SET lat=$2, lng=$3 WHERE id=$1`, [id, lat, lng]);
+    await q(`UPDATE provider.provider SET lat=$2, lng=$3, location_at=now() WHERE id=$1`, [id, lat, lng]);
   },
 
   async allOnline(): Promise<Provider[]> {

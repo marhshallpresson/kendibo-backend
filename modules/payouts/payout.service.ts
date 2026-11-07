@@ -17,10 +17,13 @@ export const payoutService = {
   async requestBankChange(providerId: string) {
     await q(`UPDATE provider.provider SET bank_changed_at=now() WHERE id=$1`, [providerId]);
   },
+  /** Payouts wait 24h after a bank-details change or a sign-in on a new phone (SIM-swap guard). */
   async bankEligible(providerId: string): Promise<boolean> {
-    const rows = await q<{ bank_changed_at: string }>(`SELECT bank_changed_at FROM provider.provider WHERE id=$1`, [providerId]);
-    const t = rows[0]?.bank_changed_at;
-    return !t || Date.now() - new Date(t).getTime() >= COOLING_MS;
+    const rows = await q<{ bank_changed_at: string | null; new_device_at: string | null }>(
+      `SELECT p.bank_changed_at, u.new_device_at FROM provider.provider p LEFT JOIN identity.users u ON u.id=p.user_id WHERE p.id=$1`, [providerId],
+    );
+    const recent = (t: string | null | undefined) => Boolean(t) && Date.now() - new Date(String(t)).getTime() < COOLING_MS;
+    return !recent(rows[0]?.bank_changed_at) && !recent(rows[0]?.new_device_at);
   },
   async create(providerId: string, amountKobo: bigint, reference: string): Promise<Payout> {
     if (!(await this.bankEligible(providerId))) throw new Error('PAYOUT_COOLING');

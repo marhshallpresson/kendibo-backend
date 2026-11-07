@@ -47,6 +47,26 @@ export const bookingService = {
       throw e;
     }
   },
+  /**
+   * A booking at a price the customer and pro agreed (customer's proposal, or
+   * the pro's counter the customer accepted). Works without a catalog service,
+   * so quote-style trades get a payable booking straight away.
+   */
+  async createAgreed(userId: string, input: { serviceId: string; addressId?: string; scheduledAt: string; agreedKobo: bigint; idempotencyKey: string; lat?: number | null; lng?: number | null }): Promise<Booking> {
+    const prior = await q<Record<string, unknown>>(`SELECT * FROM booking.booking WHERE user_id=$1 AND idempotency_key=$2`, [userId, input.idempotencyKey]);
+    if (prior[0]) return toBooking(prior[0]);
+    if (input.agreedKobo <= 0n) throw new Error('AMOUNT_MUST_BE_POSITIVE');
+    const snapshot = { mode: 'agreed', totalKobo: String(input.agreedKobo), note: 'Price agreed between customer and provider' };
+    const rows = await q<Record<string, unknown>>(
+      `INSERT INTO booking.booking (user_id, service_id, address_id, status, price_kobo, price_snapshot, scheduled_at, idempotency_key, job_lat, job_lng)
+       VALUES ($1,$2,$3,'REQUESTED',$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [userId, input.serviceId, input.addressId || null, String(input.agreedKobo), JSON.stringify(snapshot), input.scheduledAt, input.idempotencyKey, input.lat ?? null, input.lng ?? null],
+    );
+    const b = toBooking(rows[0]);
+    await q(`INSERT INTO outbox_event (topic, payload) VALUES ('booking.created',$1)`, [JSON.stringify({ bookingId: b.id })]);
+    emit('booking.created', { bookingId: b.id, serviceId: b.serviceId, agreed: true });
+    return b;
+  },
   async get(id: string, userId?: string): Promise<Booking | null> {
     const rows = await q<Record<string, unknown>>(`SELECT * FROM booking.booking WHERE id=$1`, [id]);
     const b = rows[0];
