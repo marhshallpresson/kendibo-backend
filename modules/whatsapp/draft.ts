@@ -5,7 +5,7 @@
 import { q } from '../../packages/database/db.js';
 import { emit } from '../../packages/observability/emit.js';
 import { wa } from './whatsapp.client.js';
-import { vendorsLink } from './links.js';
+import { vendorsLink, idCheckLink } from './links.js';
 import { WINDOW_HOURS, type TimeWindow } from './nlu/entities.js';
 
 export interface Draft {
@@ -94,9 +94,21 @@ export async function cancelDraft(id: string): Promise<void> {
  * Turn the draft into a service request, rank nearby verified vendors with
  * our matching model, and send the "See vendors" button. Idempotent per draft.
  */
-export async function submitDraft(waId: string, userId: string, d: Draft): Promise<{ requestId: string; vendors: number }> {
+async function idCheckStatus(userId: string): Promise<string | null> {
+  const r = await q<{ status: string }>(`SELECT status FROM kyc.customer WHERE user_id=$1`, [userId]).catch(() => []);
+  return r[0] ? String(r[0].status).toUpperCase() : null;
+}
+
+export async function submitDraft(waId: string, userId: string, d: Draft): Promise<{ requestId: string; vendors: number; needsVerification?: boolean }> {
   const miss = missingFields(d).filter((m) => m === 'need' || m === 'trade' || m === 'location');
   if (miss.length) throw Object.assign(new Error('DRAFT_INCOMPLETE'), { missing: miss });
+  // Optional policy switch: verified customers only. The request stays saved and
+  // goes out as soon as the ID check passes (continueAfterVerification).
+  const idStatus = await idCheckStatus(userId);
+  if (process.env.WHATSAPP_REQUIRE_CUSTOMER_KYC === 'true' && idStatus !== 'VERIFIED') {
+    await wa.ctaUrl(waId, "Almost done. Kendibo asks customers to verify their ID before a pro comes to their home. It takes about a minute on our secure page; your request is saved.", 'Verify my ID', idCheckLink(waId, userId));
+    return { requestId: '', vendors: 0, needsVerification: true };
+  }
   const { requestService } = await import('../requests/request.service.js');
   const { matchingService } = await import('../matching/matching.service.js');
   const r = await requestService.create(userId, {
@@ -134,6 +146,10 @@ export async function submitDraft(waId: string, userId: string, d: Draft): Promi
     await wa.ctaUrl(waId, `Done, your request is in. ${ranked.length} verified vendor${ranked.length === 1 ? '' : 's'} near you can take it. Compare them and pick one, or we'll offer it to the best match.`, 'See vendors', vendorsLink(waId, d.id));
   } else {
     await wa.text(waId, "Your request is in. No verified vendor in that trade is free near you right now. Our team has been alerted, and we'll message you here as soon as one accepts.");
+  }
+  // Never tried an ID check: one optional nudge, on the secure page (not in chat).
+  if (idStatus === null) {
+    await wa.ctaUrl(waId, 'Optional: verify your ID while you wait, so pros know who they are working for. About a minute, on our secure page.', 'Verify my ID', idCheckLink(waId, userId)).catch(() => undefined);
   }
   return { requestId: r.id, vendors: ranked.length };
 }

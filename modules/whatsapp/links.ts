@@ -4,7 +4,7 @@
 // bound to one WhatsApp user + one job draft + one purpose, with an expiry.
 import crypto from 'node:crypto';
 
-export type LinkPurpose = 'loc' | 'vendors' | 'pay';
+export type LinkPurpose = 'loc' | 'vendors' | 'pay' | 'verify';
 export interface LinkClaims { w: string; d: string; p: LinkPurpose; exp: number }
 
 const secret = () => process.env.WHATSAPP_LINK_SECRET || process.env.JWT_ACCESS_SECRET || 'dev-wa-links-INSECURE';
@@ -38,3 +38,7 @@ export const locationLink = (waId: string, draftId: string) => `${webBase()}/w/l
 /** Token for the "Pay securely" template button (d = booking id). */
 export const payToken = (waId: string, bookingId: string) => signLink({ w: waId, d: bookingId, p: 'pay' }, 72 * 3600);
 export const vendorsLink = (waId: string, draftId: string) => `${webBase()}/w/vendors?t=${encodeURIComponent(signLink({ w: waId, d: draftId, p: 'vendors' }, 24 * 3600))}`;
+/** Secure ID-check page (d = user id). NIN is typed on Kendibo's page, never in the chat. */
+export const idCheckLink = (waId: string, userId: string) => `${webBase()}/w/verify?t=${encodeURIComponent(signLink({ w: waId, d: userId, p: 'verify' }, 24 * 3600))}`;
+/** Public terms & privacy summary the onboarding message links to. */
+export const termsLink = () => `${webBase()}/w/terms`;

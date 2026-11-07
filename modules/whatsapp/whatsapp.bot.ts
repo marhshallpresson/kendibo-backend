@@ -29,6 +29,7 @@ import { nextStep, sendStep, handleFlowTap, patchFromUnderstanding, acknowledge,
 import { FACTS, priceLines } from './facts.js';
 import { OPT_IN, OPT_OUT, llmAllowed, sendBusinessInitiated, notifyCustomer, setJobOfferConsent } from './policy.js';
 import { activeRelay, closeRelay, relayText, relayMedia } from './relay.js';
+import { idCheckLink, termsLink, payToken, webBase } from './links.js';
 
 type State = 'BOT' | 'HUMAN';
 interface Session { waId: string; userId: string | null; state: State; data: Asked; updatedAt: number }
@@ -332,6 +333,37 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
   ).catch(() => [{ n: '0' }]);
   if (Number(recent[0]?.n ?? 0) > 40) return;
 
+  // Onboarding: a short notice and one tap to agree before the first booking
+  // (NDPA 2023 notice + consent). Whatever they asked first is kept and
+  // answered straight after they agree, so nobody has to repeat themselves.
+  if ((process.env.WHATSAPP_CONSENT_GATE ?? 'on') !== 'off') {
+    const t = await q<{ at: string | null }>(`SELECT terms_accepted_at AS at FROM identity.users WHERE id=$1`, [user.id]).catch(() => [{ at: 'unknown' }]);
+    if (!t[0]?.at) {
+      if (id === 'consent:agree') {
+        await q(`UPDATE identity.users SET terms_accepted_at=now(), terms_source='whatsapp' WHERE id=$1`, [user.id]);
+        emit('whatsapp.terms_accepted', { userId: user.id });
+        const pending = s.data.pendingText ?? '';
+        delete s.data.pendingText;
+        await saveSession(s);
+        if (pending) return processInbound({ id: `${m.id}:pending`, from: to, type: 'text', text: { body: pending } }, profileName);
+        await sendWelcome(to, profileName);
+        return;
+      }
+      if (text && !id) s.data.pendingText = text.slice(0, 500);
+      await saveSession(s);
+      const hi = firstName(profileName) ? `Welcome to Kendibo, ${firstName(profileName)}!` : 'Welcome to Kendibo!';
+      await wa.buttons(to, `${hi} I can book ID-checked cleaners, plumbers, electricians, AC and generator repairers and more, right here in WhatsApp.\n\nBefore we start: we use your name, number and the location you share to run your bookings, and you pay through Kendibo so your money is held until the job is done.\n\nTerms and privacy: ${termsLink()}`, [{ id: 'consent:agree', title: 'Agree & continue' }]);
+      return;
+    }
+  }
+
+  // Shortcuts that work at any point: resend the pay button, or the ID check.
+  if (!id && /^(pay|pay now|payment|make payment)[.!]*$/.test(lower)) { await sendPayButton(to, user.id); return; }
+  if (!id && /^(verify|verify me|verify id|kyc|id check)[.!]*$/.test(lower)) {
+    await wa.ctaUrl(to, "Verify your ID on Kendibo's secure page. It takes about a minute. Never send your NIN or BVN in this chat.", 'Verify my ID', idCheckLink(to, user.id));
+    return;
+  }
+
   // Human hand-off: the team owns the chat while the customer keeps talking
   // (12h of quiet hands it back) or until they type "bot".
   if (s.state === 'HUMAN') {
@@ -493,8 +525,8 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
     route = 'menu';
     if (draft) await sendStep(to, draft, s.data, "You're welcome."); else await wa.text(to, 'You\'re welcome! Reply "menu" any time.');
   } else if (draft && step === 'confirm' && u.intent === 'affirm') {
-    await submitDraft(to, user.id, draft);
-    s.data = { lang: s.data.lang };
+    const out = await submitDraft(to, user.id, draft);
+    if (!out.needsVerification) s.data = { lang: s.data.lang };
   } else if (draft && (step === 'photo' || step === 'budget') && u.intent === 'deny' && !u.budgetKobo) {
     if (step === 'photo') s.data.photo = true; else s.data.budget = true;
     await sendStep(to, draft, s.data);
@@ -546,6 +578,39 @@ export async function payLinkTarget(waId: string, bookingId: string): Promise<{ 
     reference: `bk_${bookingId}_wa`, idempotencyKey: `wa_accept_${bookingId}`,
   });
   return session.checkoutUrl ? { url: session.checkoutUrl } : { done: 'Open the Kendibo app to pay for this booking.' };
+}
+
+/** PAY: the latest booking still waiting for payment gets a fresh pay button. */
+async function sendPayButton(to: string, userId: string): Promise<void> {
+  const b = await q<{ id: string; price_kobo: string | null }>(
+    `SELECT b.id, b.price_kobo FROM booking.booking b
+      WHERE b.user_id=$1 AND upper(b.status) IN ('REQUESTED','PAYMENT_PENDING')
+        AND NOT EXISTS (SELECT 1 FROM payment.payment p WHERE p.booking_id=b.id AND p.status='successful')
+      ORDER BY b.created_at DESC LIMIT 1`, [userId],
+  ).catch(() => []);
+  if (!b[0]) { await sendMenu(to, "You don't have anything to pay right now. When a pro accepts a job, the pay button comes here."); return; }
+  const amount = String(b[0].price_kobo ?? '0').split('.')[0] || '0';
+  const url = `${webBase()}/w/pay?t=${encodeURIComponent(payToken(to, String(b[0].id)))}`;
+  await wa.ctaUrl(to, Number(amount) > 0 ? `Pay ${naira(amount)} to confirm your booking. Kendibo holds it until the job is done.` : 'Confirm and pay for your booking.', 'Pay securely', url);
+}
+
+/** The ID-check page finished: tell the customer and pick their request back up. */
+export async function continueAfterVerification(waId: string, status: string): Promise<void> {
+  await runSerially(waId, async () => {
+    if (status === 'VERIFIED') {
+      const d = await currentDraft(waId);
+      if (d) {
+        const s = await loadSession(waId);
+        await sendStep(waId, d, s.data, "You're verified.");
+      } else {
+        await notifyCustomer(waId, "You're verified. Thanks! Reply MENU when you're ready to book.");
+      }
+    } else if (status === 'REJECTED') {
+      await notifyCustomer(waId, "We couldn't verify that NIN. Check the number and reply VERIFY to try again, or AGENT for a person.");
+    } else {
+      await notifyCustomer(waId, "Thanks, we're confirming your details and will message you here as soon as it's done.");
+    }
+  });
 }
 
 /** The map page saved a pin: carry on in WhatsApp without waiting for the customer. */

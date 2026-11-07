@@ -114,6 +114,43 @@ export function renderVendorsPage(opts: { token: string; nonce: string; vendors:
 }
 
 /**
+ * Secure ID check opened from WhatsApp. The NIN is typed here, on Kendibo's
+ * HTTPS page, never in the chat (chats get screenshotted and forwarded).
+ */
+export function renderVerifyPage(opts: { token: string; nonce: string; error?: string; waNumber?: string }): string {
+  const body = `
+<header><h1>Verify your ID</h1><p>Takes about a minute. Your NIN is checked with the national identity database and is never shown to pros.</p></header>
+<main>
+  ${opts.error ? `<p class="note" role="alert" style="color:var(--err);font-weight:600">${esc(opts.error)}</p>` : ''}
+  <form method="post" action="/w/verify" novalidate>
+    <input type="hidden" name="t" value="${esc(opts.token)}">
+    <label for="nin">NIN (11 digits)</label>
+    <input id="nin" name="nin" inputmode="numeric" autocomplete="off" pattern="[0-9]{11}" maxlength="11" required aria-describedby="nin-help">
+    <p id="nin-help" class="note">Dial *346# on the phone linked to your NIN if you don't know it.</p>
+    <label style="display:flex;gap:10px;align-items:flex-start;font-weight:400"><input type="checkbox" name="consent" value="yes" required style="width:22px;min-height:22px;margin-top:2px"> I agree that Kendibo can check this NIN to confirm my identity.</label>
+    <button class="btn primary" type="submit" style="margin-top:16px">Verify my ID</button>
+  </form>
+  <p class="note" style="margin-top:16px">Kendibo will never ask for your NIN, BVN, PIN or OTP in a WhatsApp chat.</p>
+</main>`;
+  return shell('Verify your ID — Kendibo', body, opts.nonce);
+}
+
+/** Public terms & privacy summary linked from the WhatsApp onboarding message. */
+export function renderTermsPage(nonce: string): string {
+  const body = `
+<header><h1>Kendibo terms and privacy</h1><p>The short version. The full terms apply to every booking.</p></header>
+<main>
+  <h2 style="font-size:17px">Using Kendibo</h2>
+  <p class="note">Kendibo connects you with independent, ID-checked pros. You pay through Kendibo and we hold the money until the job is done. Payments made outside Kendibo are not protected. Cancel free before a pro sets off.</p>
+  <h2 style="font-size:17px">Your data</h2>
+  <p class="note">We use your name, phone number, the addresses you share and your booking and payment records to run your bookings, keep the platform safe and meet legal duties. The pro sees only what they need for your job. Our payment, identity-check, messaging and hosting partners process data for us. We keep records only as long as the law requires.</p>
+  <h2 style="font-size:17px">Your rights</h2>
+  <p class="note">Under the Nigeria Data Protection Act 2023 you can get a copy of your data, correct it, delete it and say no to marketing. Reply STOP on WhatsApp to stop promotions. You can complain to the Nigeria Data Protection Commission.</p>
+</main>`;
+  return shell('Kendibo terms and privacy', body, nonce);
+}
+
+/**
  * Where Bachs sends the customer after checkout. WhatsApp payers go back to
  * the chat; app payers are handed back to the app (the kendibo:// link closes
  * the in-app checkout browser; a web popup closes itself).

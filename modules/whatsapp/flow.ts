@@ -13,7 +13,7 @@ import type { Understanding } from './nlu/index.js';
 
 export type Step = 'need' | 'trade' | 'photo' | 'budget' | 'location' | 'day' | 'window' | 'confirm';
 /** Per-conversation flags kept in messaging.whatsapp_session.data. */
-export interface Asked { photo?: boolean; budget?: boolean; dayPick?: boolean; lang?: 'en' | 'pcm'; cancelDraftId?: string }
+export interface Asked { photo?: boolean; budget?: boolean; dayPick?: boolean; lang?: 'en' | 'pcm'; cancelDraftId?: string; pendingText?: string }
 
 const naira = (k: bigint | number | string) => `₦${(Number(k) / 100).toLocaleString('en-NG', { maximumFractionDigits: 0 })}`;
 const say = (lang: Asked['lang'], en: string, pcm?: string) => (lang === 'pcm' && pcm ? pcm : en);
@@ -176,7 +176,8 @@ export async function handleFlowTap(id: string, ctx: { waId: string; userId: str
     const w = id.slice(9) as TimeWindow;
     if (WINDOW_HOURS[w]) await set({ time_window: w });
   } else if (id === 'flow:confirm') {
-    await submitDraft(waId, userId, d);
+    const out = await submitDraft(waId, userId, d);
+    if (out.needsVerification) return { d, a, sent: true }; // request kept; goes out after the ID check
     return { d, a: {}, submitted: true, sent: true };
   } else if (id === 'flow:change') {
     await wa.list(waId, 'What would you like to change?', 'Choose', Object.entries(CHANGE_FIELDS).map(([k, v]) => ({ id: `flow:change:${k}`, title: v.label })));

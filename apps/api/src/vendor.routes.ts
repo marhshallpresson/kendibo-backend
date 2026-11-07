@@ -18,8 +18,8 @@ import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
 import { verifySubscription, verifySignature, whatsappConfigured } from '../../../modules/whatsapp/whatsapp.client.js';
 import { verifyLink } from '../../../modules/whatsapp/links.js';
-import { renderLocationPage, renderVendorsPage, renderMessagePage, pageCsp } from '../../../modules/whatsapp/web-pages.js';
-import { enqueueInbound, continueAfterLocation, startInboundSweeper, payLinkTarget, type InboundMessage } from '../../../modules/whatsapp/whatsapp.bot.js';
+import { renderLocationPage, renderVendorsPage, renderMessagePage, renderVerifyPage, renderTermsPage, pageCsp } from '../../../modules/whatsapp/web-pages.js';
+import { enqueueInbound, continueAfterLocation, startInboundSweeper, payLinkTarget, continueAfterVerification, type InboundMessage } from '../../../modules/whatsapp/whatsapp.bot.js';
 import { applyTemplateWebhook, startTemplateStatusSync } from '../../../modules/whatsapp/templates.js';
 import { saveDraftLocation } from '../../../modules/whatsapp/draft.js';
 import { notifyCustomer } from '../../../modules/whatsapp/policy.js';
@@ -45,6 +45,9 @@ export const VENDOR_ROUTE_POLICY: Record<string, 'public' | Permission> = {
   'POST /w/vendors/choose': 'public',
   'GET /w/pay': 'public',
   'GET /w/geocode': 'public',
+  'GET /w/verify': 'public',
+  'POST /w/verify': 'public',
+  'GET /w/terms': 'public',
   'GET /v1/admin/category-rules': 'provider:verify',
   'PUT /v1/admin/category-rules/:id': 'configuration:edit',
   'GET /v1/admin/category-proposals': 'provider:verify',
@@ -394,6 +397,52 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
 
   // "Pay securely" button of the vendor-accepted template: signed link → a
   // fresh, idempotent Bachs checkout for this customer's own booking.
+  // ── Secure ID check from WhatsApp (NIN typed here, never in the chat) ────────
+  const idAttempts = new Map<string, { day: string; n: number }>();
+  app.get('/w/verify', async (req, reply) => {
+    const nonce = newNonce();
+    const t = String((req.query as { t?: string }).t ?? '');
+    if (!verifyLink(t, 'verify')) return expired(reply, nonce);
+    return html(reply, nonce, false, renderVerifyPage({ token: t, nonce, waNumber: waNumber() }));
+  });
+  app.post('/w/verify', async (req, reply) => {
+    const nonce = newNonce();
+    const body = (req.body ?? {}) as { t?: string; nin?: string; consent?: string };
+    const t = String(body.t ?? '');
+    const claims = verifyLink(t, 'verify');
+    if (!claims) return expired(reply, nonce);
+    const nin = String(body.nin ?? '').replace(/\D/g, '');
+    if (!/^\d{11}$/.test(nin)) return html(reply, nonce, false, renderVerifyPage({ token: t, nonce, error: 'Enter the 11 digits of your NIN.' }), 400);
+    if (body.consent !== 'yes') return html(reply, nonce, false, renderVerifyPage({ token: t, nonce, error: 'Tick the box to let Kendibo check your NIN.' }), 400);
+    // Each check costs money: at most 3 tries per person per day.
+    const day = new Date().toISOString().slice(0, 10);
+    const tries = idAttempts.get(claims.d);
+    const n = tries?.day === day ? tries.n : 0;
+    if (n >= 3) return html(reply, nonce, false, renderMessagePage({ title: 'Try again tomorrow', message: 'You have tried 3 times today. Try again tomorrow, or reply AGENT on WhatsApp and a person will help.', nonce, waNumber: waNumber() }), 429);
+    idAttempts.set(claims.d, { day, n: n + 1 });
+    const { kycService } = await import('../../../modules/kyc/kyc.service.js');
+    let status = 'UNDER_REVIEW';
+    try {
+      const out = await kycService.submitUserApplication(claims.d, { nin, documents: [] } as never);
+      status = String((out as { status?: string }).status ?? 'UNDER_REVIEW').toUpperCase();
+    } catch (e) {
+      observability.captureException(e);
+      return html(reply, nonce, false, renderVerifyPage({ token: t, nonce, error: "We couldn't check that NIN right now. Check the number and try again in a few minutes." }), 502);
+    }
+    emit('whatsapp.id_check', { status });
+    void continueAfterVerification(claims.w, status).catch((e) => observability.captureException(e));
+    const page = status === 'VERIFIED'
+      ? { title: "You're verified", message: 'Thanks. Go back to WhatsApp to carry on with your booking.' }
+      : status === 'REJECTED'
+        ? { title: "We couldn't verify you", message: "The details didn't match. Go back to WhatsApp and reply AGENT if you need help." }
+        : { title: 'Check in progress', message: "We're confirming your details. We'll message you on WhatsApp as soon as it's done." };
+    return html(reply, nonce, false, renderMessagePage({ ...page, nonce, waNumber: waNumber() }));
+  });
+  app.get('/w/terms', async (_req, reply) => {
+    const nonce = newNonce();
+    return html(reply, nonce, false, renderTermsPage(nonce));
+  });
+
   app.get('/w/pay', async (req, reply) => {
     const nonce = newNonce();
     const claims = verifyLink(String((req.query as { t?: string }).t ?? ''), 'pay');
