@@ -41,8 +41,32 @@ function isConnectionOutage(err: unknown): boolean {
   const msg = String((err as Error)?.message ?? '');
   return (
     ['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET'].includes(code) ||
-    /getaddrinfo ENOTFOUND|connect ECONNREFUSED|Connection terminated unexpectedly/i.test(msg)
+    /getaddrinfo ENOTFOUND|connect ECONNREFUSED|Connection terminated/i.test(msg)
   );
+}
+
+/**
+ * The in-memory fallback is for local development only. In production a
+ * database outage must fail loudly: switching to memory would accept sign-ups,
+ * bookings and payments and lose them all on the next restart.
+ */
+const memoryFallbackAllowed = () =>
+  process.env.NODE_ENV !== 'production' && process.env.DB_MEMORY_FALLBACK !== 'false';
+
+/** Which database queries are going to right now. */
+export function databaseMode(): 'postgres' | 'memory-fallback' | 'local' {
+  if (!process.env.DATABASE_URL) return 'local';
+  return pool && pool === memPool ? 'memory-fallback' : 'postgres';
+}
+
+/** True when the database answers a trivial query (used by /health/ready). */
+export async function pingDb(): Promise<boolean> {
+  try {
+    await db().query('SELECT 1');
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Parameterised query. BIGINT comes back as string — wrap with BigInt()/String() at use. */
@@ -53,15 +77,21 @@ export async function q<T = Record<string, unknown>>(text: string, params: unkno
       const r = await db().query(text, params);
       return r.rows as T[];
     } catch (err) {
-      if (process.env.DATABASE_URL && isConnectionOutage(err) && pool !== memPool) {
-        console.warn(
-          `[db] Remote Postgres unreachable (${(err as Error).message}); switching to embedded pg-mem fallback.`,
-        );
-        pool = getMemPool();
-        const r = await pool.query(text, params);
+      if (!process.env.DATABASE_URL || !isConnectionOutage(err) || pool === memPool) throw err;
+      if (!memoryFallbackAllowed()) {
+        // A sleeping or restarting database often answers a second later:
+        // retry once, then let the request fail rather than lose the write.
+        console.error(`[db] Postgres unreachable (${(err as Error).message}); retrying once.`);
+        await new Promise((res) => setTimeout(res, 1000));
+        const r = await db().query(text, params);
         return r.rows as T[];
       }
-      throw err;
+      console.warn(
+        `[db] Remote Postgres unreachable (${(err as Error).message}); switching to embedded pg-mem fallback (development only).`,
+      );
+      pool = getMemPool();
+      const r = await pool.query(text, params);
+      return r.rows as T[];
     }
   } finally {
     // Slow-query trace (>1s) without importing the client (avoids a cycle):

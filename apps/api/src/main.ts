@@ -297,7 +297,19 @@ app.get('/', async () => ({
   docs: 'GET /health/live, /health/ready, /health/dependencies, /v1/mobile/config',
 }));
 app.get('/health/live', async () => ({ ok: true }));
-app.get('/health/ready', async () => ({ ok: true, db: process.env.DATABASE_URL ? 'postgres' : 'local', redis: process.env.REDIS_URL ? 'redis' : 'memory', storage: objectStore.driver }));
+// Readiness actually asks the database (it used to report "postgres" whenever
+// DATABASE_URL was set, even while every query was failing). 503 lets the
+// platform and uptime monitors see an outage.
+app.get('/health/ready', async (_req, reply) => {
+  const { pingDb, databaseMode } = await import('../../../packages/database/db.js');
+  const dbUp = await pingDb();
+  const mode = databaseMode();
+  const ok = dbUp && mode !== 'memory-fallback';
+  return reply.code(ok ? 200 : 503).send({
+    ok, db: mode, dbReachable: dbUp,
+    redis: process.env.REDIS_URL ? 'redis' : 'memory', storage: objectStore.driver,
+  });
+});
 app.get('/health/dependencies', async () => {
   const w = watchupClient as unknown as { enabled: boolean; environment: string; release: string; queueDepth: number };
   return {
