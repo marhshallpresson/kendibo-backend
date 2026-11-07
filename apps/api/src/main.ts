@@ -1300,12 +1300,28 @@ app.get('/v1/provider/dispatch-feed', async (req, reply) => {
 app.post('/v1/provider/dispatch-feed/respond', async (req, reply) => {
   const me = await providerActor(req as never, reply);
   if (!me) return reply;
-  const { feedType, offerId, requestId, accept } = z.object({
+  const { feedType, offerId, requestId, accept, counterKobo } = z.object({
     feedType: z.enum(['job_offer', 'request_offer', 'open_field_request']),
     offerId: z.string().optional(),
     requestId: z.string().optional(),
-    accept: z.boolean(),
+    accept: z.boolean().optional().default(false),
+    // Request offers only: the pro's own price, once (customer accepts or declines).
+    counterKobo: z.union([z.string().regex(/^\d+$/), z.number().int().positive()]).optional(),
   }).parse(req.body ?? {});
+  if (counterKobo !== undefined) {
+    if (feedType !== 'request_offer' || !offerId) return fail(reply, 'BAD_REQUEST', 'A counter-price applies to request offers only.', 400);
+    const own = await q<{ provider_id: string; category_id: string | null }>(
+      `SELECT o.provider_id, r.category_id FROM booking.request_offer o JOIN booking.service_request r ON r.id=o.request_id WHERE o.id=$1`, [offerId],
+    );
+    if (!own[0] || String(own[0].provider_id) !== me.id) return fail(reply, 'NOT_FOUND', 'Offer not found', 404);
+    if (!(await vendorEligibilityService.allowed(me.id, own[0].category_id))) return fail(reply, 'NOT_ELIGIBLE', 'Complete your verification first.', 403);
+    try { return { data: await requestService.counterOffer(offerId, me.id, BigInt(counterKobo)) }; }
+    catch (e: unknown) {
+      const m = (e as Error).message;
+      if (m.startsWith('BELOW_MINIMUM')) return fail(reply, 'BELOW_MINIMUM', `The lowest price is ₦${(Number(m.split(':')[1]) / 100).toLocaleString('en-NG')}.`, 400);
+      return fail(reply, 'OFFER_GONE', 'You can send one price per job, while the offer is open.', 409);
+    }
+  }
 
   // Ownership + category rules, whichever feed the item came from.
   let categoryId: string | null = null;

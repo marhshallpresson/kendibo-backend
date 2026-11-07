@@ -67,6 +67,8 @@ export interface BoltDispatchItem {
   urgency: string;
   scheduledAt?: string | null;
   totalKobo: string;
+  /** request offers: where totalKobo came from ('quote' = no price yet). */
+  priceKind?: 'proposed' | 'budget' | 'quote';
   distanceKm: number;
   etaMinutes: number;
   aiMatchScore: number;
@@ -360,7 +362,8 @@ export const providerService = {
       const serviceId = b.service_id ? String(b.service_id) : 'home_service';
       const svcRows = await q<Record<string, unknown>>(`SELECT name, base_price_kobo FROM catalog.service WHERE id=$1`, [serviceId]).catch(() => []);
       const svcName = svcRows[0]?.name ? String(svcRows[0].name) : serviceId.replace(/^svc_/, '').replace(/_/g, ' ').toUpperCase();
-      const totalKobo = String(b.total_kobo ?? svcRows[0]?.base_price_kobo ?? '1500000');
+      // The booking's real price (bookings store price_kobo; there is no total_kobo).
+      const totalKobo = String(b.price_kobo ?? svcRows[0]?.base_price_kobo ?? '0');
 
       let addrText = 'Customer Service Location';
       let addrLat: number | null = null;
@@ -373,10 +376,13 @@ export const providerService = {
           addrLng = aRows[0].lng != null ? Number(aRows[0].lng) : null;
         }
       }
-      let customerName = 'Verified Customer';
+      let customerName = 'Kendibo customer';
+      let customerVerified = false;
       if (b.user_id) {
         const uRows = await q<Record<string, unknown>>(`SELECT name FROM identity.users WHERE id=$1`, [b.user_id]).catch(() => []);
         if (uRows[0]?.name) customerName = String(uRows[0].name);
+        const kRows = await q<{ status: string }>(`SELECT status FROM kyc.customer WHERE user_id=$1`, [b.user_id]).catch(() => []);
+        customerVerified = kRows[0]?.status === 'VERIFIED';
       }
 
       const { distanceKm, etaMinutes } = calcDist(addrLat, addrLng);
@@ -393,7 +399,7 @@ export const providerService = {
         serviceId,
         serviceTitle: svcName,
         customerName,
-        customerVerified: true,
+        customerVerified,
         address: addrText,
         urgency: 'today',
         scheduledAt: b.scheduled_at ? String(b.scheduled_at) : null,
@@ -410,9 +416,11 @@ export const providerService = {
     // 2) Broadcasted Request Offers (`booking.request_offer` where status = 'offered')
     const reqOffers = await q<Record<string, unknown>>(
       `SELECT o.*, r.id AS req_id, r.service_id, r.category_id, r.title, r.details,
-              r.urgency, r.lat, r.lng, r.contact_name, r.scheduled_date, r.time_window
+              r.urgency, r.lat, r.lng, r.contact_name, r.scheduled_date, r.time_window,
+              r.proposed_kobo, r.budget_kobo, kc.status AS customer_kyc
          FROM booking.request_offer o
          JOIN booking.service_request r ON r.id = o.request_id
+         LEFT JOIN kyc.customer kc ON kc.user_id = r.user_id
         WHERE o.provider_id=$1 AND o.status='offered'
         ORDER BY o.created_at DESC LIMIT 20`,
       [providerId],
@@ -435,12 +443,14 @@ export const providerService = {
         categoryId: ro.category_id ? String(ro.category_id) : null,
         serviceTitle: String(ro.title ?? 'On-Demand Service Request'),
         details: ro.details ? String(ro.details) : undefined,
-        customerName: ro.contact_name ? String(ro.contact_name) : 'Verified Customer',
-        customerVerified: true,
+        customerName: ro.contact_name ? String(ro.contact_name) : 'Kendibo customer',
+        customerVerified: String(ro.customer_kyc ?? '') === 'VERIFIED',
         address: prov.officeCity ? `Near ${prov.officeCity} (${distanceKm} km)` : `${distanceKm} km from your office`,
         urgency: String(ro.urgency ?? 'today'),
         scheduledAt: ro.scheduled_date ? String(ro.scheduled_date) : null,
-        totalKobo: '1850000',
+        // The customer's own price (proposal, else budget); '0' = priced by quote.
+        totalKobo: String(ro.proposed_kobo ?? ro.budget_kobo ?? '0'),
+        priceKind: ro.proposed_kobo != null ? 'proposed' : ro.budget_kobo != null ? 'budget' : 'quote',
         distanceKm,
         etaMinutes: ro.eta_minutes ? Number(ro.eta_minutes) : etaMinutes,
         aiMatchScore: aiScore,
@@ -452,9 +462,10 @@ export const providerService = {
 
     // 3) Open Field-Matched Service Requests (`booking.service_request` in the vendor's field)
     const openReqs = await q<Record<string, unknown>>(
-      `SELECT * FROM booking.service_request
-        WHERE status IN ('SUBMITTED', 'MATCHING', 'OFFERED')
-        ORDER BY created_at DESC LIMIT 25`,
+      `SELECT r.*, kc.status AS customer_kyc FROM booking.service_request r
+         LEFT JOIN kyc.customer kc ON kc.user_id = r.user_id
+        WHERE r.status IN ('SUBMITTED', 'MATCHING', 'OFFERED')
+        ORDER BY r.created_at DESC LIMIT 25`,
     ).catch(() => []);
 
     for (const r of openReqs) {
@@ -489,12 +500,13 @@ export const providerService = {
         categoryId: r.category_id ? String(r.category_id) : null,
         serviceTitle: String(r.title ?? 'Service Request in Your Field'),
         details: r.details ? String(r.details) : undefined,
-        customerName: r.contact_name ? String(r.contact_name) : 'Kendibo Customer',
-        customerVerified: true,
+        customerName: r.contact_name ? String(r.contact_name) : 'Kendibo customer',
+        customerVerified: String(r.customer_kyc ?? '') === 'VERIFIED',
         address: prov.officeCity ? `${prov.officeCity} Area • ${distanceKm} km` : `${distanceKm} km away`,
         urgency: String(r.urgency ?? 'this_week'),
         scheduledAt: r.scheduled_date ? String(r.scheduled_date) : null,
-        totalKobo: '1650000',
+        totalKobo: String(r.proposed_kobo ?? r.budget_kobo ?? '0'),
+        priceKind: r.proposed_kobo != null ? 'proposed' : r.budget_kobo != null ? 'budget' : 'quote',
         distanceKm,
         etaMinutes,
         aiMatchScore: aiScore,
