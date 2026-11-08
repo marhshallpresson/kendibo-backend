@@ -36,8 +36,10 @@ export interface TruecallerPort {
   send(to: string, body: string, opts?: { type?: SlingMessageType; ttl?: number; reference?: string }): Promise<{ id: string; provider?: string; reference?: string }>;
 }
 export interface EmailPort {
-  send(to: string, subject: string, html: string, opts?: { reference?: string }): Promise<{ id: string; provider?: string; reference?: string }>;
+  send(to: string, subject: string, html: string, opts?: EmailSendOpts): Promise<{ id: string; provider?: string; reference?: string }>;
 }
+/** text: plain-text alternative; headers: e.g. List-Unsubscribe (SMTP route only). */
+export interface EmailSendOpts { reference?: string; text?: string; headers?: Record<string, string> }
 export interface PushPort {
   send(token: string, title: string, body: string, data?: Record<string, string>): Promise<{ id: string }>;
 }
@@ -160,10 +162,10 @@ export class EmailAdapter implements EmailPort {
     return this.transporter;
   }
 
-  async send(to: string, subject: string, html: string, opts?: { reference?: string }): Promise<{ id: string; provider?: string; reference?: string }> {
+  async send(to: string, subject: string, html: string, opts?: EmailSendOpts): Promise<{ id: string; provider?: string; reference?: string }> {
     const t = this.smtp();
     if (t) {
-      const info = await t.sendMail({ from: this.from, to, subject, html });
+      const info = await t.sendMail({ from: this.from, to, subject, html, text: opts?.text, headers: opts?.headers });
       return { id: String(info.messageId || `smtp_${Date.now()}`), provider: 'smtp', reference: opts?.reference };
     }
     if (this.sling.isConfigured()) {

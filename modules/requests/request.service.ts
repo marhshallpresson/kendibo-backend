@@ -133,6 +133,13 @@ export const requestService = {
         emit('request.automatch_failed', { requestId: req.id, error: String((e as Error).message) });
       }
     }
+    // Nobody to offer it to (no verified/online provider in range, no location,
+    // or a service we do not offer): tell the team. Listener de-duplicates.
+    // WhatsApp requests rank vendors afterwards; draft.ts reports those.
+    if (input.source !== 'whatsapp') emit('request.unserved', {
+      requestId: req.id,
+      reason: req.lat == null || req.lng == null ? 'NO_LOCATION' : !req.serviceId && !req.categoryId ? 'SERVICE_NOT_OFFERED' : 'NO_PROVIDER_IN_RANGE',
+    });
     return req;
   },
 

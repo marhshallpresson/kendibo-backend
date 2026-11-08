@@ -109,6 +109,7 @@ export function localDb(): IMemoryDb {
   run('037_bargaining_reminders_ratings_device.sql');
   run('038_provider_offerings.sql');
   run('039_commission_vat.sql');
+  run('042_email_alerts_lifecycle.sql');
   console.log('[localdb] pg-mem ready (001-019, 021-032)');
   return mem;
 }
