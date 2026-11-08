@@ -474,17 +474,24 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
   }
 
   // ── Photo, voice note, video or document (a caption is read as text below) ──
+  // Every file is kept as job evidence: on the open request/booking, or pending
+  // until the request being described (or the next one) is created.
   const images: { mime: string; base64: string }[] = [];
-  const upload = await saveUpload(m);
-  if (upload) {
-    if (upload.assetId) {
-      draft = await addPhotoToDraft(to, user.id, upload.assetId);
-      if (upload.kind === 'image' && upload.bytes) images.push({ mime: upload.mime, base64: upload.bytes.toString('base64') });
+  const { receiveWhatsappMedia } = await import('../media/evidence.service.js');
+  const ev = await receiveWhatsappMedia(m, user, { collecting: !!draft });
+  if (ev) {
+    if (ev.status === 'refused' || ev.status === 'attached') {
+      if (draft && ev.status === 'refused') await sendStep(to, draft, s.data, `${ev.message} Or carry on without it.`);
+      else await wa.text(to, ev.message);
+      await saveSession(s);
+      return;
     }
+    if (draft) draft = await addPhotoToDraft(to, user.id, ev.assetId);
+    if (ev.kind === 'image' && ev.bytes) images.push({ mime: ev.mime, base64: ev.bytes.toString('base64') });
     if (!text) {
-      const d = draft ?? (await openDraft(to, user.id));
-      const noun = { image: 'Photo', audio: 'Voice note', video: 'Video', document: 'Document' }[upload.kind];
-      await sendStep(to, d, s.data, upload.assetId ? `${noun} added.` : `I couldn't save that ${noun.toLowerCase()}. You can send it again (up to 16 MB), or carry on without it.`);
+      const noun = { image: 'Photo', audio: 'Voice note', video: 'Video', document: 'Document' }[ev.kind];
+      if (draft) await sendStep(to, draft, s.data, `${noun} added.`);
+      else await wa.text(to, ev.message);
       await saveSession(s);
       return;
     }

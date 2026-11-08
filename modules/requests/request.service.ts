@@ -119,6 +119,8 @@ export const requestService = {
     );
     const req = toReq(rows[0]);
     await q(`INSERT INTO outbox_event (topic, payload) VALUES ('request.submitted',$1)`, [JSON.stringify({ requestId: req.id })]);
+    // Photos/videos the customer sent before this request existed join it now.
+    await import('../media/evidence.service.js').then((m) => m.attachPendingEvidence(userId, req.id)).catch(() => 0);
     // Auto-match: only when we actually have coordinates AND candidates, so a
     // request with no reachable providers is not falsely marked OFFERED.
     if (req.lat != null && req.lng != null) {
