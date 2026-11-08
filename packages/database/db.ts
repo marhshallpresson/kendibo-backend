@@ -24,9 +24,10 @@ export function db(): PgPool {
       connectionString: process.env.DATABASE_URL,
       max: 10,
       connectionTimeoutMillis: 5000,
-      // Pxxl managed Postgres terminates TLS with a self-signed chain.
-      // Encryption stays on; chain validation off (same as ?sslmode=require).
-      ssl: { rejectUnauthorized: false },
+      // Managed Postgres (Aiven/Pxxl) terminates TLS with a self-signed chain:
+      // encryption on, chain validation off (same as ?sslmode=require). A local
+      // Unix socket (?host=/run/postgresql) has no TLS, nor does DATABASE_SSL=false.
+      ssl: process.env.DATABASE_SSL === 'false' || /[?&]host=\//.test(process.env.DATABASE_URL) ? false : { rejectUnauthorized: false },
     });
     real.on('error', () => {});
     pool = real as unknown as PgPool;

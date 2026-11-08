@@ -18,12 +18,15 @@ if (!url) {
   process.exit(1);
 }
 const u = new URL(url);
-const remote = !/^(localhost|127\.0\.0\.1)$/i.test(u.hostname);
-const ssl = remote ? { rejectUnauthorized: false } : undefined;
+const remote = !/^(localhost|127\.0\.0\.1)$/i.test(u.hostname) && !/^\//.test(u.searchParams.get('host') || '');
+const ssl = remote && process.env.DATABASE_SSL !== 'false' ? { rejectUnauthorized: false } : undefined;
 const pool = new Pool({ connectionString: url, ssl, connectionTimeoutMillis: 20000 });
 try {
+  // PostGIS is optional (lat/lng are plain doubles); skip it where the server lacks it.
+  const { rows: gis } = await pool.query(`SELECT 1 FROM pg_available_extensions WHERE name='postgis'`);
   for (const f of files) {
-    const sql = readFileSync(join(dir, f), 'utf-8');
+    let sql = readFileSync(join(dir, f), 'utf-8');
+    if (!gis.length) sql = sql.replace(/^CREATE EXTENSION IF NOT EXISTS postgis;\s*$/gim, '');
     await pool.query(sql);
     console.log(`[migrate] applied ${f}`);
   }
