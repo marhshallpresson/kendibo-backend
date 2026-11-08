@@ -12,8 +12,8 @@ APP=kendibo-api
 SSH="ssh -i $KEY -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=10"
 SCP="scp -q -i $KEY -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=10"
 
-[ -z "$(git status --porcelain --untracked-files=no -- apps modules packages scripts infra package.json package-lock.json)" ] \
-  || { echo "Commit your changes first: only committed code is deployed." >&2; exit 1; }
+DIRTY="$(git status --porcelain --untracked-files=no -- apps modules packages scripts infra package.json package-lock.json)"
+[ -z "$DIRTY" ] || printf 'Note: these uncommitted changes are NOT deployed (only HEAD is):\n%s\n' "$DIRTY" >&2
 SHA="$(git rev-parse --short HEAD)"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 git archive --format=tar.gz -o "$TMP/$APP-$SHA.tgz" HEAD
