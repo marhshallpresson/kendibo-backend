@@ -51,7 +51,12 @@ export const disputeService = {
   },
   async get(id: string) {
     const rows = await q<Record<string, unknown>>(`SELECT * FROM payment.dispute WHERE id=$1`, [id]);
-    return rows[0] ? toDispute(rows[0]) : null;
+    if (!rows[0]) return null;
+    const d = toDispute(rows[0]);
+    // The case file shows every photo/video both sides sent (hidden ones flagged).
+    const { evidenceFor, withSignedUrls } = await import('../media/evidence.service.js');
+    const evidence = await withSignedUrls(await evidenceFor(d.bookingId, { includeHidden: true }).catch(() => []));
+    return { ...d, evidence };
   },
 };
 

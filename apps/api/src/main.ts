@@ -54,6 +54,7 @@ import { vendorFinanceService } from '../../../modules/vendors/vendor-finance.se
 import { configureWhatsappBot } from '../../../modules/whatsapp/whatsapp.bot.js';
 import { registerVendorRoutes, VENDOR_ROUTE_POLICY } from './vendor.routes.js';
 import { registerAdminOpsRoutes, ADMIN_OPS_POLICY } from './admin-ops.routes.js';
+import { registerEvidenceRoutes } from './evidence.routes.js';
 import { storefrontService } from '../../../modules/storefront/storefront.service.js';
 import { surfaceFor } from '../../../packages/shared/clients.js';
 void surfaceFor;
@@ -3230,6 +3231,7 @@ const port = Number(process.env.PORT ?? 3000);
 registerVendorRoutes(app, { authed: authed as never, fail: fail as never, providerActor });
 if (process.env.NODE_ENV !== 'test') { startCompletionSweeper(); startReminderSweeper(); startBackupSweeper(); }
 registerAdminOpsRoutes(app, { authed: authed as never, fail: fail as never });
+registerEvidenceRoutes(app, { fail: fail as never, bookingParty: bookingParty as never, adminActor: adminActor as never });
 configureWhatsappBot({ createCheckout: (input) => payments.createCheckout(input) });
 
 if (process.env.VITEST !== 'true' && process.env.NODE_ENV !== 'test') {

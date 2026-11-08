@@ -167,6 +167,32 @@ export const wa = {
     return bytes.length <= MEDIA_MAX ? { bytes, mime: String(m.mime_type).split(';')[0].trim() } : null;
   },
 
+  /**
+   * Download an inbound file for job evidence. `precheck` sees Meta's declared
+   * MIME type and size first, so an oversize or blocked file is refused before
+   * any bytes are fetched. Returns why it failed, so the bot can say so kindly.
+   */
+  fetchMedia: async (mediaId: string, precheck: (mime: string, size: number) => 'too_large' | 'type' | null, ceiling = 50 * 1024 * 1024):
+    Promise<{ ok: true; bytes: Buffer; mime: string } | { ok: false; reason: 'unavailable' | 'too_large' | 'type'; mime?: string }> => {
+    const c = cfg();
+    if (!c.token) return { ok: false, reason: 'unavailable' };
+    const meta = await fetch(`https://graph.facebook.com/${c.version}/${encodeURIComponent(mediaId)}`, {
+      signal: AbortSignal.timeout(8_000), headers: { Authorization: `Bearer ${c.token}` },
+    });
+    if (!meta.ok) return { ok: false, reason: 'unavailable' };
+    const m = (await meta.json()) as { url?: string; mime_type?: string; file_size?: number };
+    const mime = String(m.mime_type ?? '').split(';')[0].trim().toLowerCase();
+    const refused = precheck(mime, Number(m.file_size ?? 0));
+    if (refused) return { ok: false, reason: refused, mime };
+    // Only follow Meta's own CDN — never an arbitrary URL from a payload.
+    if (!m.url || !/^https:\/\/([a-z0-9-]+\.)*(fbsbx\.com|whatsapp\.net|facebook\.com)\//i.test(m.url)) return { ok: false, reason: 'unavailable' };
+    const file = await fetch(m.url, { signal: AbortSignal.timeout(60_000), headers: { Authorization: `Bearer ${c.token}` } });
+    if (!file.ok) return { ok: false, reason: 'unavailable' };
+    const bytes = Buffer.from(await file.arrayBuffer());
+    if (bytes.length > ceiling) return { ok: false, reason: 'too_large', mime };
+    return { ok: true, bytes, mime };
+  },
+
   /** Photo, voice note, video or document by URL (our signed storage link). */
   media: (to: string, kind: 'image' | 'audio' | 'video' | 'document', url: string, caption?: string) => send(to, {
     type: kind,

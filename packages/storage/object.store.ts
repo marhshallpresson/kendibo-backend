@@ -21,6 +21,8 @@ export const folderForKind = (kind: MediaKind): MediaFolder =>
 
 export interface PresignedUpload { assetId: string; uploadUrl: string; maxBytes: number; }
 const MAX_BYTES = 25 * 1024 * 1024;
+// Job evidence videos from WhatsApp may be up to 50 MB (callers set their own per-type limits).
+const HARD_MAX_BYTES = 50 * 1024 * 1024;
 const DRIVER = process.env.STORAGE_DRIVER ?? 'local';
 const BUCKET = process.env.STORAGE_BUCKET ?? 'kendibo-media';
 const SIGN_SECRET = process.env.MEDIA_SIGN_SECRET ?? 'dev-media-secret';
@@ -64,7 +66,7 @@ export const objectStore = {
     return { assetId, uploadUrl: `store://${folder}/quarantine/${assetId}`, maxBytes: MAX_BYTES };
   },
   async putQuarantine(folder: MediaFolder, assetId: string, bytes: Buffer, mime = 'image/jpeg'): Promise<void> {
-    if (bytes.length > MAX_BYTES) throw new Error('FILE_TOO_LARGE');
+    if (bytes.length > HARD_MAX_BYTES) throw new Error('FILE_TOO_LARGE');
     if (DRIVER === 's3') paused();
     if (DRIVER === 'ftp') { await ftpStore.putQuarantine(folder, assetId, bytes, mime); return; }
     writeFileSync(join(localDir(folder, 'quarantine'), storageKey(assetId, mime)), bytes);

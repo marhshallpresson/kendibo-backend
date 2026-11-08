@@ -9,7 +9,8 @@ import { emit } from '../../packages/observability/emit.js';
 
 export interface MediaAsset { id: string; sha256: string; status: 'quarantined' | 'clean' | 'rejected'; url?: string; folder?: string; mime?: string }
 
-const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'application/pdf', 'audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/aac', 'audio/amr'];
+const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'video/mp4', 'video/quicktime', 'application/pdf', 'audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/aac', 'audio/amr'];
+const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
 
 /**
  * Magic-byte sniff — a client-declared MIME is untrusted. Returns true when
@@ -25,6 +26,13 @@ function magicBytesMatch(bytes: Buffer, mime: string): boolean {
     case 'video/mp4':
       // ISO BMFF: bytes 4..7 == 'ftyp'
       return bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70;
+    case 'image/heic': {
+      // ISO BMFF 'ftyp' box with a HEIF brand.
+      const brand = bytes.toString('ascii', 8, 12);
+      return bytes.toString('ascii', 4, 8) === 'ftyp' && ['heic', 'heix', 'hevc', 'heim', 'heis', 'mif1', 'msf1'].includes(brand);
+    }
+    case 'video/quicktime':
+      return ['ftyp', 'moov', 'mdat', 'wide', 'free', 'skip'].includes(bytes.toString('ascii', 4, 8));
     case 'image/webp':
       return bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP';
     case 'audio/ogg':
@@ -53,11 +61,11 @@ export const mediaService = {
     return { uploadUrl: `${up.uploadUrl}${up.uploadUrl.includes('?') ? '&' : '?'}kind=${kind}`, assetId: id, folder };
   },
   /** Validate + promote. Magic-byte + size checks; EXIF stripped client-side. */
-  async ingest(assetId: string, bytes: Buffer, mime: string): Promise<MediaAsset> {
+  async ingest(assetId: string, bytes: Buffer, mime: string, opts: { maxBytes?: number } = {}): Promise<MediaAsset> {
     const cur = await q<Record<string, unknown>>(`SELECT * FROM media.asset WHERE id=$1`, [assetId]);
     if (!cur[0]) throw new Error('NOT_FOUND');
     const folder = (String(cur[0].folder ?? 'photos')) as MediaFolder;
-    if (bytes.length > 25 * 1024 * 1024) {
+    if (bytes.length > (opts.maxBytes ?? DEFAULT_MAX_BYTES)) {
       await q(`UPDATE media.asset SET status='rejected' WHERE id=$1`, [assetId]);
       return { id: assetId, sha256: '', status: 'rejected', folder };
     }

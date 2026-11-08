@@ -50,6 +50,8 @@ export function storageKey(assetId: string, mime: string): string {
     mime === 'image/png' ? '.png'
     : mime === 'video/mp4' ? '.mp4'
     : mime === 'application/pdf' ? '.pdf'
+    : mime === 'video/quicktime' ? '.mov'
+    : mime === 'image/heic' ? '.heic'
     : '.jpg';
   return assetId.endsWith(ext) ? assetId : `${assetId}${ext}`;
 }
