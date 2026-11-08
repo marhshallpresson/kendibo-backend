@@ -9,6 +9,7 @@ import { postCollection, postSettlement, trialBalance, openPeriod, currentPeriod
 import { transition, type JobStatus } from '../../../modules/job-engine/job.machine.js';
 import { whyNot, checkStartCode, ensureStartCode, afterTransition, confirmCompletion, startCompletionSweeper } from '../../../modules/job-engine/job-guard.js';
 import { checkInDistance, selfieRequired, selfiePassed, recordCheckinSelfie, ratingsFor, rateParty, startReminderSweeper } from '../../../modules/job-engine/journey.js';
+import { startBackupSweeper } from '../../../modules/backup/db-backup.js';
 import { offeringService, earningsFor } from '../../../modules/vendors/offering.service.js';
 import { observability } from '../../../packages/observability/watchup.adapter.js';
 import { identityService } from '../../../modules/identity/identity.service.js';
@@ -153,7 +154,19 @@ void app.addHook('preSerialization', async (_req, _reply, payload) => ser(payloa
 const payments = new PaymentService((globalThis as Record<string, unknown>).__PSP__ as never);
 void app.register(watchupTracing);
 process.on('unhandledRejection', (err) => observability.captureException(err, { source: 'unhandledRejection' }));
-process.on('SIGTERM', () => void (watchupClient as unknown as { shutdown?: () => Promise<void> }).shutdown?.());
+// Graceful stop for restarts and deploys: finish in-flight requests, flush
+// error reporting, then exit. A hung close never keeps the old process (and its
+// port) alive: a 10s timer forces the exit.
+let stopping = false;
+const shutdown = (signal: string) => {
+  if (stopping) return;
+  stopping = true;
+  app.log.info(`${signal} received: shutting down`);
+  setTimeout(() => process.exit(0), 10_000).unref();
+  void Promise.allSettled([app.close(), (watchupClient as unknown as { shutdown?: () => Promise<void> }).shutdown?.()]).then(() => process.exit(0));
+};
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 void openPeriod(currentPeriod());
 // Local DB (pg-mem) when no DATABASE_URL — same SQL, same constraints as Pxxl Postgres.
 if (!process.env.DATABASE_URL) {
@@ -3215,7 +3228,7 @@ app.get('/v1/media/:id/file', async (req, reply) => {
 const port = Number(process.env.PORT ?? 3000);
 // ---------- vendor platform: storefronts, trade rules, credentials, WhatsApp ----------
 registerVendorRoutes(app, { authed: authed as never, fail: fail as never, providerActor });
-if (process.env.NODE_ENV !== 'test') { startCompletionSweeper(); startReminderSweeper(); }
+if (process.env.NODE_ENV !== 'test') { startCompletionSweeper(); startReminderSweeper(); startBackupSweeper(); }
 registerAdminOpsRoutes(app, { authed: authed as never, fail: fail as never });
 configureWhatsappBot({ createCheckout: (input) => payments.createCheckout(input) });
 
