@@ -55,6 +55,10 @@ import { configureWhatsappBot } from '../../../modules/whatsapp/whatsapp.bot.js'
 import { registerVendorRoutes, VENDOR_ROUTE_POLICY } from './vendor.routes.js';
 import { registerAdminOpsRoutes, ADMIN_OPS_POLICY } from './admin-ops.routes.js';
 import { registerEvidenceRoutes } from './evidence.routes.js';
+import { registerEmailRoutes, EMAIL_ROUTE_POLICY } from './email.routes.js';
+import { installAdminAlerts } from '../../../modules/notifications/admin-alerts.service.js';
+import { startLifecycleSweeper } from '../../../modules/notifications/lifecycle.service.js';
+import { emit } from '../../../packages/observability/emit.js';
 import { storefrontService } from '../../../modules/storefront/storefront.service.js';
 import { surfaceFor } from '../../../packages/shared/clients.js';
 void surfaceFor;
@@ -283,7 +287,7 @@ const ROUTE_POLICY: Record<string, RoutePolicy> = {
 };
 // Vendor platform routes (storefronts, trade rules, WhatsApp) declare their own
 // public/permission entries next to the handlers; merged into the same gate.
-Object.assign(ROUTE_POLICY, VENDOR_ROUTE_POLICY, ADMIN_OPS_POLICY);
+Object.assign(ROUTE_POLICY, VENDOR_ROUTE_POLICY, ADMIN_OPS_POLICY, EMAIL_ROUTE_POLICY);
 
 app.addHook('onRequest', async (req, reply) => {
   const url = req.routeOptions.url;
@@ -1232,7 +1236,9 @@ app.post('/v1/provider/kyc', async (req, reply) => {
     if (location) { sets.push(`lat=$${vals.length + 1}`, `lng=$${vals.length + 2}`); vals.push(location.lat, location.lng); }
     if (radiusKm) { sets.push(`service_radius_km=$${vals.length + 1}`); vals.push(radiusKm); }
     if (sets.length > 0) await q(`UPDATE provider.provider SET ${sets.join(', ')} WHERE id=$${vals.length + 1}`, [...vals, me.id]);
+    if (bank) emit('provider.bank_added', { providerId: me.id });
   }
+  if (rcNumber || businessName) emit('provider.kyb_submitted', { providerId: me.id, hasRcNumber: Boolean(rcNumber) });
   for (const s of skills ?? []) { try { await providerService.addSkill(me.id, s); } catch { /* unknown skill tag */ } }
   if (documents?.length) {
     try { await kycService.attachDocuments(me.id, documents); }
@@ -3232,6 +3238,9 @@ registerVendorRoutes(app, { authed: authed as never, fail: fail as never, provid
 if (process.env.NODE_ENV !== 'test') { startCompletionSweeper(); startReminderSweeper(); startBackupSweeper(); }
 registerAdminOpsRoutes(app, { authed: authed as never, fail: fail as never });
 registerEvidenceRoutes(app, { fail: fail as never, bookingParty: bookingParty as never, adminActor: adminActor as never });
+registerEmailRoutes(app, { authed: authed as never, fail: fail as never });
+installAdminAlerts();
+if (process.env.NODE_ENV !== 'test') startLifecycleSweeper();
 configureWhatsappBot({ createCheckout: (input) => payments.createCheckout(input) });
 
 if (process.env.VITEST !== 'true' && process.env.NODE_ENV !== 'test') {

@@ -142,6 +142,7 @@ export const providerService = {
       `INSERT INTO provider.provider (user_id, kyc_status, rating) VALUES ($1,'PENDING',5.0) RETURNING *`,
       [userId],
     );
+    emit('provider.onboarded', { providerId: String(rows[0].id), userId });
     return toProv(rows[0]);
   },
 

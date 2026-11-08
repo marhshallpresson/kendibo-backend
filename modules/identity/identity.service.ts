@@ -75,6 +75,7 @@ export const identityService = {
         `INSERT INTO identity.users (${col}, role, name) VALUES ($1,$2,$3) RETURNING *`, [norm.value, normalizedRole, name ?? null],
       );
       user = ins[0];
+      emit('identity.user_created', { userId: String(user.id), channel: channel === 'phone' ? 'phone_otp' : 'email_otp', role: normalizedRole });
       // Welcome in-app + email + push — best-effort, never blocks the login.
       void welcomeService.send({
         id: String(user.id),
@@ -320,6 +321,7 @@ export const identityService = {
         );
         rows = ins;
         isNew = true;
+        emit('identity.user_created', { userId: String((ins[0] as { id?: unknown }).id), channel: 'google', role: 'CUSTOMER' });
         // Welcome in-app + email + push — best-effort, never blocks the login.
         void welcomeService.send({
           id: String((ins[0] as { id?: unknown }).id),
@@ -366,6 +368,7 @@ export const identityService = {
           `INSERT INTO identity.users (email, name, facebook_sub, profile_image) VALUES ($1,$2,$3,$4) RETURNING *`, [p.email, name, p.id, p.picture],
         );
         isNew = true;
+        emit('identity.user_created', { userId: String((rows[0] as { id?: unknown }).id), channel: 'facebook', role: 'CUSTOMER' });
         void welcomeService.send({ id: String((rows[0] as { id?: unknown }).id), name, email: p.email, phone: null }).catch(() => {});
       }
     }
