@@ -42,16 +42,33 @@ npm run build >/dev/null
 [ -f dist/apps/api/src/main.js ] || { echo "Build failed; $PREV keeps running." >&2; exit 1; }
 node scripts/migrate.js | grep -E "OK|FAILED|tables present"
 
-restart() {
-  # Stop the process running from this app; the panel worker starts it again on `current`.
-  for pid in $(pgrep -u "$(id -u)" -f "node" || true); do
+app_pids() {
+  # Node renames its process ("MainThread"), so match the command line, then the folder.
+  for pid in $(pgrep -u "$(id -u)" -f "dist/apps/api/src/main.js" || true); do
+    [ "$pid" = "$$" ] && continue
     cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
-    case "$cwd" in "$ROOT"/*) kill "$pid" 2>/dev/null || true ;; esac
+    case "$cwd" in "$ROOT"/*) echo "$pid" ;; esac
   done
 }
+restart() {
+  # Stop the running process; the panel worker starts it again on `current`.
+  OLD="$(app_pids)"
+  [ -n "$OLD" ] && kill $OLD 2>/dev/null || true
+  for i in $(seq 1 15); do
+    alive=""; for p in $OLD; do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+    [ -z "$alive" ] && return 0
+    sleep 1
+  done
+  echo "Old process did not stop in 15s; forcing it." >&2
+  kill -9 $alive 2>/dev/null || true
+}
 healthy() {
-  for i in $(seq 1 30); do
-    curl -fsS -m 5 http://127.0.0.1:4030/health/ready >/dev/null 2>&1 && return 0
+  # Healthy = the process serving is the new release AND it answers /health/ready.
+  want="$(readlink -f "$ROOT/current")"
+  for i in $(seq 1 45); do
+    for p in $(app_pids); do
+      if [ "$(readlink -f "/proc/$p/cwd")" = "$want" ] && curl -fsS -m 5 http://127.0.0.1:4030/health/ready >/dev/null 2>&1; then return 0; fi
+    done
     sleep 2
   done
   return 1
