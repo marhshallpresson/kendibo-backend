@@ -226,6 +226,7 @@ async function adminActor(req: { headers: Record<string, string | undefined> }):
 type RoutePolicy = 'public' | Permission;
 const ROUTE_POLICY: Record<string, RoutePolicy> = {
   'GET /': 'public',
+  'GET /favicon.ico': 'public',
   'GET /health/live': 'public',
   'GET /health/ready': 'public',
   'POST /v1/auth/otp/request': 'public',
@@ -332,6 +333,7 @@ app.get('/', async () => ({
   ok: true, service: 'kendibo-api', version: '0.1.0',
   docs: 'GET /health/live, /health/ready, /health/dependencies, /v1/mobile/config',
 }));
+app.get('/favicon.ico', async (_req, reply) => reply.code(204).send());
 app.get('/health/live', async () => ({ ok: true }));
 // Readiness actually asks the database (it used to report "postgres" whenever
 // DATABASE_URL was set, even while every query was failing). 503 lets the

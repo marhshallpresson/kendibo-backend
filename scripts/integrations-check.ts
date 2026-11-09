@@ -106,12 +106,14 @@ async function main() {
 
   await check('WhatsApp Cloud API (Meta)', ['WHATSAPP_ACCESS_TOKEN', 'WHATSAPP_PHONE_NUMBER_ID'], async () => {
     const v = env('WHATSAPP_GRAPH_VERSION') || 'v26.0';
-    const j = await json(await fetch(`https://graph.facebook.com/${v}/${env('WHATSAPP_PHONE_NUMBER_ID')}?fields=display_phone_number,verified_name,quality_rating`, {
+    const j = await json(await fetch(`https://graph.facebook.com/${v}/${env('WHATSAPP_PHONE_NUMBER_ID')}?fields=display_phone_number,verified_name,quality_rating,name_status,health_status`, {
       headers: { Authorization: `Bearer ${env('WHATSAPP_ACCESS_TOKEN')}` }, signal: timeout(),
     }), 'phone number');
     const dbg = await json(await fetch(`https://graph.facebook.com/${v}/debug_token?input_token=${encodeURIComponent(env('WHATSAPP_ACCESS_TOKEN'))}&access_token=${encodeURIComponent(env('WHATSAPP_ACCESS_TOKEN'))}`, { signal: timeout() }), 'token check');
     const exp = Number((dbg.data as { expires_at?: number } | undefined)?.expires_at ?? 0);
-    return `${String(j.verified_name ?? '?')} ${String(j.display_phone_number ?? '')}, quality ${String(j.quality_rating ?? '?')}`
+    const hs = (j.health_status as { can_send_message?: string } | undefined)?.can_send_message;
+    const ns = j.name_status ? `, name ${String(j.name_status)}${j.name_status !== 'APPROVED' ? ' (Meta 131037 blocks outbound until display name is APPROVED)' : ''}` : '';
+    return `${String(j.verified_name ?? '?')} ${String(j.display_phone_number ?? '')}, quality ${String(j.quality_rating ?? '?')}${ns}${hs ? `, send ${hs}` : ''}`
       + `; token ${exp === 0 ? 'never expires' : `EXPIRES ${new Date(exp * 1000).toISOString()} (use a permanent System User token)`}`
       + `${env('WHATSAPP_APP_SECRET') ? '' : '; WHATSAPP_APP_SECRET is not set (webhooks are refused in production)'}`
       + `${/^v2[0-1]\./.test(v) ? `; ${v} is retiring, set WHATSAPP_GRAPH_VERSION=v26.0` : ''}`;

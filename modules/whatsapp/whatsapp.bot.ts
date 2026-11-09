@@ -274,6 +274,26 @@ export async function enqueueInbound(m: InboundMessage, profileName?: string): P
   });
 }
 
+async function handleInboundFailure(m: InboundMessage, e: unknown, reason: string): Promise<void> {
+  const sendMatch = /^WHATSAPP_SEND_(\d{3})(?:_META_(\d{1,8}))?$/.exec(reason);
+  if (!sendMatch) {
+    await wa.text(m.from, 'Something went wrong on our side. Please try again in a moment, or type "agent" to reach a person.');
+    return;
+  }
+  const status = Number(sendMatch[1]);
+  const metaCode = sendMatch[2] ? Number(sendMatch[2]) : undefined;
+  const summary = typeof (e as { summary?: unknown })?.summary === 'string' ? (e as { summary: string }).summary.trim() : '';
+  if (summary) {
+    await q(`INSERT INTO messaging.whatsapp_turn (wa_id, role, content) VALUES ($1,'assistant',$2)`, [m.from, `[undelivered:${reason}] ${summary}`.slice(0, 2000)]).catch(() => undefined);
+  }
+  const smsBody = (summary || 'We received your WhatsApp message. Please continue in the Kendibo app while our WhatsApp line completes verification.').replace(/\s+/g, ' ').trim().slice(0, 480);
+  await import('../notifications/channels.js')
+    .then(({ sms }) => sms.send(`+${m.from.replace(/\D/g, '')}`, smsBody, { type: 'transactional' }))
+    .catch(() => undefined);
+  if (metaCode === 131037) emit('whatsapp.send_blocked', { reason, metaCode });
+  if (status === 429 || status >= 500) throw e;
+}
+
 async function processAndMark(m: InboundMessage, profileName?: string) {
   await q(`UPDATE messaging.whatsapp_inbound SET started_at=now(), attempts=attempts+1 WHERE message_id=$1`, [m.id]).catch(() => undefined);
   try {
@@ -285,7 +305,7 @@ async function processAndMark(m: InboundMessage, profileName?: string) {
     console.error('[whatsapp] inbound processing failed', { reason });
     // If even the fallback cannot be delivered, leave the message unprocessed
     // for the bounded recovery sweep instead of silently discarding it.
-    await wa.text(m.from, 'Something went wrong on our side. Please try again in a moment, or type "agent" to reach a person.');
+    await handleInboundFailure(m, e, reason);
   }
   // Processed (or answered with an apology): the sweeper only retries turns a crash cut short.
   await q(`UPDATE messaging.whatsapp_inbound SET processed_at=now() WHERE message_id=$1`, [m.id]).catch(() => undefined);
@@ -737,7 +757,7 @@ export async function continueAfterVerification(waId: string, status: string): P
       const d = await currentDraft(waId);
       if (d) {
         const s = await loadSession(waId);
-        await sendStep(waId, d, s.data, "You're verified.");
+        await sendStep(waId, d, s.data, "You're verified.").catch(() => notifyCustomer(waId, "You're verified."));
       } else {
         await notifyCustomer(waId, "You're verified. Thanks! Reply MENU when you're ready to book.");
       }
@@ -755,7 +775,7 @@ export async function continueAfterLocation(waId: string): Promise<void> {
     const s = await loadSession(waId);
     const d = await currentDraft(waId);
     if (!d) return;
-    await sendStep(waId, d, s.data, `Location saved${d.address_text ? `: ${d.address_text}` : ''}.`);
+    await sendStep(waId, d, s.data, `Location saved${d.address_text ? `: ${d.address_text}` : ''}.`).catch(() => notifyCustomer(waId, `Location saved${d.address_text ? `: ${d.address_text}` : ''}.`));
   });
 }
 

@@ -53,7 +53,25 @@ export async function signRefresh(userId: string, deviceId: string): Promise<{ t
   await q(`INSERT INTO identity.refresh_token (id, user_id, device_id, token_hash) VALUES ($1,$2,$3,$4)`, [id, userId, deviceId, hash]);
   return { token, id };
 }
+const inflightRotations = new Map<string, Promise<{ access: string; refresh: string } | null>>();
+const recentRotations = new Map<string, { userId: string; result: { access: string; refresh: string }; expiresAt: number }>();
+const CONCURRENT_REFRESH_GRACE_MS = 2000;
+
 export async function rotateRefresh(token: string): Promise<{ access: string; refresh: string } | null> {
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const cached = recentRotations.get(tokenHash);
+  if (cached) {
+    if (cached.expiresAt > Date.now()) return cached.result;
+    recentRotations.delete(tokenHash);
+  }
+  const inflight = inflightRotations.get(tokenHash);
+  if (inflight) return inflight;
+  const run = rotateRefreshOnce(token, tokenHash).finally(() => inflightRotations.delete(tokenHash));
+  inflightRotations.set(tokenHash, run);
+  return run;
+}
+
+async function rotateRefreshOnce(token: string, tokenHash: string): Promise<{ access: string; refresh: string } | null> {
   try {
     const p = jwt.verify(token, REFRESH_SECRET, { algorithms: ['HS256'] }) as { sub: string; deviceId: string; jti: string };
     const rows = await q<{ revoked: boolean }>(`SELECT revoked FROM identity.refresh_token WHERE id=$1`, [p.jti]);
@@ -75,10 +93,13 @@ export async function rotateRefresh(token: string): Promise<{ access: string; re
     const role = String(roleRows[0].role ?? 'CUSTOMER').toUpperCase();
     const access = signAccess(p.sub, isAdminRole(role) ? [...rolePerms(role)] : ['booking:create', 'booking:view:self', 'booking:cancel']);
     const next = await signRefresh(p.sub, p.deviceId);
-    return { access, refresh: next.token };
+    const result = { access, refresh: next.token };
+    recentRotations.set(tokenHash, { userId: p.sub, result, expiresAt: Date.now() + CONCURRENT_REFRESH_GRACE_MS });
+    return result;
   } catch { return null; }
 }
 export async function revokeAll(userId: string) {
+  for (const [k, v] of recentRotations) if (v.userId === userId) recentRotations.delete(k);
   await q(`DELETE FROM identity.refresh_token WHERE user_id=$1`, [userId]);
 }
 export function verifyAccess(token: string): { sub: string; permissions: string[] } | null {

@@ -71,7 +71,7 @@ export async function sendBusinessInitiated(opts: {
 }): Promise<'whatsapp' | 'template' | 'sms' | 'skipped'> {
   const isJobOffer = opts.template?.key === 'job_offer';
   if (isJobOffer && !(await hasJobOfferConsent(opts.waId))) return 'skipped';
-  if (await inServiceWindow(opts.waId)) { await opts.whatsapp(); return 'whatsapp'; }
+  if (await inServiceWindow(opts.waId)) { try { await opts.whatsapp(); return 'whatsapp'; } catch { /* fall through to template/SMS so the message is not lost */ } }
   const t = opts.template ? await approvedTemplate(opts.template.key, isJobOffer) : null;
   if (t && opts.template) {
     try {

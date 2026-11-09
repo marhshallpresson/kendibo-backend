@@ -80,7 +80,7 @@ async function send(to: string, payload: Record<string, unknown>, record = true)
     const data = await res.json().catch(() => null) as { error?: { code?: unknown } } | null;
     const code = data?.error?.code;
     const suffix = typeof code === 'number' && Number.isSafeInteger(code) && code >= 0 && code < 100_000_000 ? `_META_${code}` : '';
-    throw new Error(`WHATSAPP_SEND_${res.status}${suffix}`);
+    throw Object.assign(new Error(`WHATSAPP_SEND_${res.status}${suffix}`), { status: res.status, metaCode: suffix ? Number(code) : undefined, summary: summarise(payload) });
   }
   if (record) await sentHook?.(to, summarise(payload));
 }
