@@ -159,6 +159,33 @@ export const templates = {
     };
   },
 
+  /** WhatsApp RECOVER: the code that moves a new number onto this account. */
+  recoveryCode(input: { name?: string; code: string; last4: string }, opts: { recipientEmail?: string; appUrl?: string } = {}): MailPiece {
+    const content = `
+      <p style="${styles.p}">Hi ${escapeHtml(firstNameOf(input.name))},</p>
+      <p style="${styles.p}">Someone asked to move your Kendibo account to the WhatsApp number ending ${escapeHtml(input.last4)}. If that's you, reply in WhatsApp with this code:</p>
+      <p style="font-size: 32px; font-weight: 900; letter-spacing: 6px; text-align: center; margin: 8px 0 24px 0; color: #111111;">${escapeHtml(input.code)}</p>
+      <p style="${styles.p}">It works for 10 minutes. Never share it with anyone, including Kendibo staff. If this wasn't you, ignore this email and nothing changes.</p>
+    `;
+    return {
+      html: renderLayout(content, 'Your Kendibo account recovery code', opts),
+      text: `Hi ${firstNameOf(input.name)},\nYour Kendibo recovery code is ${input.code}. It works for 10 minutes.\nIf you did not ask to move your account to the number ending ${input.last4}, ignore this email.`,
+    };
+  },
+
+  /** WhatsApp RECOVER finished: tell the old address the account moved. */
+  accountMoved(input: { name?: string; last4: string }, opts: { recipientEmail?: string; appUrl?: string } = {}): MailPiece {
+    const content = `
+      <p style="${styles.p}">Hi ${escapeHtml(firstNameOf(input.name))},</p>
+      <p style="${styles.p}">Your Kendibo account is now on the WhatsApp number ending ${escapeHtml(input.last4)}.</p>
+      <p style="${styles.p}">If this wasn't you, reply to this email or contact Kendibo support right away and we'll lock the account.</p>
+    `;
+    return {
+      html: renderLayout(content, 'Your Kendibo account moved to a new number', opts),
+      text: `Hi ${firstNameOf(input.name)},\nYour Kendibo account is now on the WhatsApp number ending ${input.last4}.\nIf this wasn't you, reply to this email or contact Kendibo support right away.`,
+    };
+  },
+
   bookingConfirmed(input: { name?: string; service: string; when: string; where: string; ref: string }, opts: { recipientEmail?: string; appUrl?: string } = {}): MailPiece {
     const row = (k: string, v: string) => `<p style="${styles.p}"><strong>${escapeHtml(k)}:</strong> ${escapeHtml(v)}</p>`;
     const content = `
