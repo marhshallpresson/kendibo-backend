@@ -197,7 +197,7 @@ export const identityService = {
       identityVerification: await safe(`SELECT status, tier, created_at, updated_at FROM kyc.customer WHERE user_id=$1`),
       notificationPreferences: await safe(`SELECT * FROM notification.user_preference WHERE user_id=$1`),
       supportTickets: await safe(`SELECT * FROM support.ticket WHERE customer_id=$1 ORDER BY created_at DESC`),
-      devices: await safe(`SELECT platform, model, os, app_version, created_at FROM identity.device WHERE user_id=$1`),
+      devices: await safe(`SELECT platform, channel, created_at FROM identity.device WHERE user_id=$1`),
     };
   },
   /**

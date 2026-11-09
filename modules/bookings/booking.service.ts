@@ -93,7 +93,7 @@ export const bookingService = {
   async listForProvider(providerId: string) {
     const rows = await q<Record<string, unknown>>(
       `SELECT b.* FROM booking.booking b
-       JOIN dispatch.assignment a ON a.job_id = b.id
+       JOIN dispatch.assignment a ON a.job_id = b.id::text
        WHERE a.provider_id=$1 AND a.status='accepted'
        ORDER BY b.created_at DESC LIMIT 50`,
       [providerId],

@@ -41,14 +41,14 @@ const TRANSITIONS: Record<JobStatus, JobStatus[]> = {
 
 export interface JobEvent {
   jobId: string; from: JobStatus; to: JobStatus; at: string; actor: string;
-  reason?: string; lat?: number; lng?: number; flags?: ExceptionFlag[];
+  reason?: string; lat?: number; lng?: number; flags?: ExceptionFlag[]; clientEventId?: string;
 }
 
 async function record(e: JobEvent): Promise<JobEvent> {
   try {
     await q(
-      `INSERT INTO booking.job_event (job_id, from_status, to_status, actor) VALUES ($1,$2,$3,$4)`,
-      [e.jobId, e.from, e.to, e.actor],
+      `INSERT INTO booking.job_event (job_id, from_status, to_status, actor, reason, client_event_id, lat, lng) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [e.jobId, e.from, e.to, e.actor, e.reason ?? null, e.clientEventId ?? null, e.lat ?? null, e.lng ?? null],
     );
     await q(`INSERT INTO outbox_event (topic, payload) VALUES ('job.transition',$1)`, [JSON.stringify(e)]);
   } catch { /* tables absent in minimal boots — event still returned */ }

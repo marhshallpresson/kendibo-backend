@@ -112,6 +112,8 @@ export function localDb(): IMemoryDb {
   run('041_media_evidence.sql');
   run('042_email_alerts_lifecycle.sql');
   run('044_kyc_verification_check.sql');
+  run('045_job_event_reason_client_id.sql');
+  run('046_kyc_reviewed_by_text.sql');
   console.log('[localdb] pg-mem ready (001-019, 021-032)');
   return mem;
 }
