@@ -159,6 +159,7 @@ void app.addHook('preSerialization', async (_req, _reply, payload) => ser(payloa
 const payments = new PaymentService((globalThis as Record<string, unknown>).__PSP__ as never);
 void app.register(watchupTracing);
 process.on('unhandledRejection', (err) => observability.captureException(err, { source: 'unhandledRejection' }));
+process.on('uncaughtException', (err) => observability.captureException(err, { source: 'uncaughtException' }));
 // Graceful stop for restarts and deploys: finish in-flight requests, flush
 // error reporting, then exit. A hung close never keeps the old process (and its
 // port) alive: a 10s timer forces the exit.
@@ -3157,7 +3158,7 @@ app.get('/v1/mobile/config', async () => ({
     cities: await cityService.list(),
     // Active map provider + fallbacks so the web/native layers render the
     // right tiles (admin-switchable without redeploy; no secrets exposed).
-    maps: (async () => { const c = await getMapsConfig(); return { provider: c.provider, fallbacks: c.fallbacks }; })(),
+    maps: await (async () => { const c = await getMapsConfig(); return { provider: c.provider, fallbacks: c.fallbacks, googleMapsKey: process.env.GOOGLE_MAPS_BROWSER_KEY || process.env.GOOGLE_MAPS_API_KEY || undefined }; })(),
     surfaces: ['user_app', 'provider_b2b_app', 'admin_console'],
   },
 }));

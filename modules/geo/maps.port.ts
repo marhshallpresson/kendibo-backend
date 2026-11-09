@@ -1,22 +1,14 @@
-// MapsPort — geocode/reverse abstraction with runtime provider switching.
+// MapsPort — geocode/reverse abstraction with Google Maps primary provider.
 //
 // The active provider and its ordered fallbacks live in configuration.platform_setting
 // (keys `maps.provider` / `maps.fallbacks`), editable by admins via
-// PUT /v1/admin/maps/config — no redeploy needed to swap Mapbox ⇄ Google ⇄ OSM.
-// Every adapter declares availability (needs an API key?); resolution walks the
-// chain and skips unavailable adapters, always ending on OSM/Nominatim which
-// needs no key. The dev stub is only reachable when NODE_ENV !== 'production'
-// and no real adapter is configured (audit: stub must never answer in prod).
+// PUT /v1/admin/maps/config — no redeploy needed to swap Google ⇄ Mapbox ⇄ OSM.
 import { q } from '../../packages/database/db';
 
 export interface MapsPort {
   geocode(query: string, city?: string): Promise<{ lat: number; lng: number; formatted: string } | null>;
-  reverse(lat: number, lng: number): Promise<{ area: string; city: string } | null>;
+  reverse(lat: number, lng: number): Promise<{ area: string; city: string; formatted?: string } | null>;
 }
-
-const CITY_CENTERS: Record<string, { lat: number; lng: number }> = {
-  uyo: { lat: 4.99, lng: 7.93 }, abuja: { lat: 9.06, lng: 7.49 }, lagos: { lat: 6.52, lng: 3.37 },
-};
 
 /** Per-attempt network budget — geocoding must never hold a booking request. */
 const ATTEMPT_TIMEOUT_MS = 4000;
@@ -30,29 +22,23 @@ function fetchJson(url: string, headers?: Record<string, string>): Promise<unkno
 
 /** Dev-only deterministic adapter. Never constructed in production. */
 export class StubMapsAdapter implements MapsPort {
-  async geocode(query: string, city = 'abuja') {
-    const c = CITY_CENTERS[city.toLowerCase()] ?? CITY_CENTERS.abuja;
+  async geocode(query: string, city = 'uyo') {
     if (!query.trim()) return null;
-    let h = 0; for (const ch of query) h = (h * 31 + ch.charCodeAt(0)) % 1000;
-    return { lat: c.lat + (h % 100) / 10000, lng: c.lng + (h % 77) / 10000, formatted: `${query}, ${city}` };
+    return { lat: 5.0399, lng: 7.9228, formatted: `${query}, ${city}` };
   }
-  async reverse(lat: number, lng: number) {
-    let best = 'abuja', bd = Infinity;
-    for (const [k, c] of Object.entries(CITY_CENTERS)) {
-      const d = Math.hypot(lat - c.lat, lng - c.lng);
-      if (d < bd) { bd = d; best = k; }
-    }
-    return { area: 'Central', city: best };
+  async reverse(_lat: number, _lng: number) {
+    return { area: 'Ikpa Road', city: 'Uyo', formatted: 'Ikpa Road, Uyo' };
   }
 }
 
 export class MapboxAdapter implements MapsPort {
   available() { return Boolean(process.env.MAPBOX_ACCESS_TOKEN); }
-  async geocode(query: string, city = 'abuja') {
+  async geocode(query: string, city = 'uyo') {
     if (!query.trim()) return null;
     const token = process.env.MAPBOX_ACCESS_TOKEN;
+    const q = city && !query.toLowerCase().includes(city.toLowerCase()) ? `${query}, ${city}, Nigeria` : `${query}, Nigeria`;
     const data = await fetchJson(
-      `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query + ', ' + city)}.json?access_token=${token}`,
+      `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(q)}.json?country=ng&access_token=${token}`,
     ) as { features?: Array<{ center: [number, number]; place_name: string }> };
     if (!data.features?.length) return null;
     const [lng, lat] = data.features[0].center;
@@ -62,49 +48,77 @@ export class MapboxAdapter implements MapsPort {
     const token = process.env.MAPBOX_ACCESS_TOKEN;
     const data = await fetchJson(
       `https://api.mapbox.com/geocoding/v5/mapbox.places/${lng},${lat}.json?access_token=${token}`,
-    ) as { features?: Array<{ place_type: string[]; text: string }> };
+    ) as { features?: Array<{ place_type: string[]; text: string; place_name?: string }> };
     if (!data.features?.length) return null;
-    let city = 'uyo', area = 'Central';
+    let city = '';
+    let area = '';
     for (const f of data.features) {
-      if (f.place_type.includes('place')) city = f.text;
-      if (f.place_type.includes('neighborhood') || f.place_type.includes('locality')) area = f.text;
+      if (!city && (f.place_type.includes('place') || f.place_type.includes('district') || f.place_type.includes('region'))) {
+        city = f.text;
+      }
+      if (!area && (f.place_type.includes('address') || f.place_type.includes('poi') || f.place_type.includes('neighborhood') || f.place_type.includes('locality'))) {
+        area = f.text;
+      }
     }
-    return { area, city };
+    const formatted = data.features[0]?.place_name;
+    if (!area && formatted) area = formatted.split(',')[0]?.trim() || '';
+    if (!area && !city) return null;
+    return { area: area || city, city: city || area, formatted };
   }
 }
 
 /** Google Geocoding REST API. Scales globally; billing-enabled key required. */
 export class GoogleMapsAdapter implements MapsPort {
-  available() { return Boolean(process.env.GOOGLE_MAPS_API_KEY); }
+  private key() {
+    return process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_MAPS_BROWSER_KEY || '';
+  }
+  available() { return Boolean(this.key()); }
   async geocode(query: string, city = 'uyo') {
     if (!query.trim()) return null;
-    const key = process.env.GOOGLE_MAPS_API_KEY;
+    const key = this.key();
+    const q = city && !query.toLowerCase().includes(city.toLowerCase()) ? `${query}, ${city}, Nigeria` : `${query}, Nigeria`;
     const data = await fetchJson(
-      `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(query + ', ' + city)}&key=${key}`,
+      `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(q)}&region=ng&key=${key}`,
     ) as { status: string; results?: Array<{ geometry: { location: { lat: number; lng: number } }; formatted_address: string }> };
     if (data.status !== 'OK' || !data.results?.length) return null;
     const r = data.results[0];
     return { lat: r.geometry.location.lat, lng: r.geometry.location.lng, formatted: r.formatted_address };
   }
   async reverse(lat: number, lng: number) {
-    const key = process.env.GOOGLE_MAPS_API_KEY;
+    const key = this.key();
     const data = await fetchJson(
       `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&key=${key}`,
     ) as { status: string; results?: Array<{ address_components: Array<{ long_name: string; types: string[] }>; formatted_address: string }> };
     if (data.status !== 'OK' || !data.results?.length) return null;
-    let city = 'uyo', area = 'Central';
-    for (const comp of data.results[0].address_components) {
-      if (comp.types.includes('locality')) city = comp.long_name;
-      if (comp.types.includes('neighborhood') || comp.types.includes('sublocality')) area = comp.long_name;
+    const primary = data.results[0];
+    let streetNumber = '';
+    let route = '';
+    let neighborhood = '';
+    let city = '';
+    let state = '';
+    for (const comp of primary.address_components) {
+      if (comp.types.includes('street_number')) streetNumber = comp.long_name;
+      if (comp.types.includes('route')) route = comp.long_name;
+      if (!neighborhood && (comp.types.includes('neighborhood') || comp.types.includes('sublocality') || comp.types.includes('sublocality_level_1') || comp.types.includes('premise'))) {
+        neighborhood = comp.long_name;
+      }
+      if (!city && (comp.types.includes('locality') || comp.types.includes('administrative_area_level_2'))) {
+        city = comp.long_name;
+      }
+      if (!state && comp.types.includes('administrative_area_level_1')) {
+        state = comp.long_name;
+      }
     }
-    return { area, city };
+    const street = [streetNumber, route].filter(Boolean).join(' ').trim();
+    const area = [street, neighborhood].filter(Boolean).join(', ') || primary.formatted_address.split(',')[0]?.trim() || city || state;
+    const resolvedCity = city || state || '';
+    return { area, city: resolvedCity, formatted: primary.formatted_address };
   }
 }
 
 /**
- * OSM Nominatim. No API key → always available, so it terminates every
- * fallback chain. Usage policy requires a User-Agent and ~1 req/s; client
- * screens debounce geocode input, and the 4s timeout bounds worst case.
+ * High-detail zoom=18 reverse/forward geocoder fallback when Google REST
+ * Geocoding API is still propagating activation.
  */
 export class OsmAdapter implements MapsPort {
   available() { return true; }
@@ -113,8 +127,9 @@ export class OsmAdapter implements MapsPort {
   }
   async geocode(query: string, city = 'uyo') {
     if (!query.trim()) return null;
+    const q = city && !query.toLowerCase().includes(city.toLowerCase()) ? `${query}, ${city}, Nigeria` : `${query}, Nigeria`;
     const data = await fetchJson(
-      `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(query + ', ' + city)}`,
+      `https://nominatim.openstreetmap.org/search?format=jsonv2&countrycodes=ng&limit=1&q=${encodeURIComponent(q)}`,
       this.headers(),
     ) as Array<{ lat: string; lon: string; display_name: string }>;
     if (!data.length) return null;
@@ -122,13 +137,19 @@ export class OsmAdapter implements MapsPort {
   }
   async reverse(lat: number, lng: number) {
     const data = await fetchJson(
-      `https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=14&lat=${lat}&lon=${lng}`,
+      `https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&addressdetails=1&lat=${lat}&lon=${lng}`,
       this.headers(),
-    ) as { address?: Record<string, string> } | null;
+    ) as { display_name?: string; address?: Record<string, string> } | null;
     const a = data?.address ?? {};
+    const street = [a.house_number, a.road || a.pedestrian || a.residential].filter(Boolean).join(' ').trim();
+    const locality = a.neighbourhood || a.suburb || a.quarter || a.village || '';
+    const area = [street, locality].filter(Boolean).join(', ') || a.town || a.city || a.state || '';
+    const city = a.city || a.town || a.county || a.state || '';
+    if (!area && !city) return null;
     return {
-      area: a.neighbourhood || a.suburb || a.town || a.city || a.state || 'Central',
-      city: (a.city || a.town || a.state || 'uyo').toLowerCase(),
+      area: area || city,
+      city: city || area,
+      formatted: data?.display_name,
     };
   }
 }
@@ -151,9 +172,7 @@ interface MapsConfig {
   availability: Record<string, boolean>;
 }
 
-// Google is primary and Mapbox the fallback (OSM always ends the chain); an
-// unavailable provider (no key) is skipped. MAPS_PROVIDER / the admin setting
-// can still reorder it.
+// Google is primary.
 const DEFAULT_PROVIDER: MapsProviderName = process.env.MAPS_PROVIDER === 'mapbox' ? 'mapbox' : 'google';
 
 let cachedConfig: { at: number; config: MapsConfig } | null = null;
@@ -162,7 +181,7 @@ const CONFIG_TTL_MS = 30_000;
 function availability(): Record<string, boolean> {
   return {
     mapbox: Boolean(process.env.MAPBOX_ACCESS_TOKEN),
-    google: Boolean(process.env.GOOGLE_MAPS_API_KEY),
+    google: Boolean(process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_MAPS_BROWSER_KEY),
     osm: true,
   };
 }
@@ -170,7 +189,7 @@ function availability(): Record<string, boolean> {
 async function loadConfig(): Promise<MapsConfig> {
   if (cachedConfig && Date.now() - cachedConfig.at < CONFIG_TTL_MS) return cachedConfig.config;
   let provider = DEFAULT_PROVIDER;
-  let fallbacks: MapsProviderName[] = DEFAULT_PROVIDER === 'google' ? ['mapbox', 'osm'] : ['google', 'osm'];
+  let fallbacks: MapsProviderName[] = DEFAULT_PROVIDER === 'google' ? ['osm', 'mapbox'] : ['google', 'osm'];
   try {
     const rows = await q<{ key: string; value: unknown }>(
       'SELECT key, value FROM configuration.platform_setting WHERE key IN ($1, $2)',

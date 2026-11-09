@@ -296,8 +296,10 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
     const nonce = newNonce();
     const t = String((req.query as { t?: string }).t ?? '');
     if (!verifyLink(t, 'loc')) return expired(reply, nonce);
-    const [lat, lng] = String(process.env.WHATSAPP_MAP_DEFAULT_CENTER || '5.0377,7.9128').split(',').map(Number); // Uyo
-    const key = process.env.GOOGLE_MAPS_BROWSER_KEY || '';
+    const { geoService } = await import('../../../modules/geo/geo.service.js');
+    const cov = await geoService.coverage().catch(() => []);
+    const [lat, lng] = process.env.WHATSAPP_MAP_DEFAULT_CENTER ? String(process.env.WHATSAPP_MAP_DEFAULT_CENTER).split(',').map(Number) : [cov[0]?.lat ?? 0, cov[0]?.lng ?? 0];
+    const key = process.env.GOOGLE_MAPS_BROWSER_KEY || process.env.GOOGLE_MAPS_API_KEY || '';
     return html(reply, nonce, !!key, renderLocationPage({ token: t, nonce, mapsKey: key || undefined, centre: { lat, lng }, waNumber: waNumber() }));
   });
 
