@@ -165,7 +165,11 @@ export const identityService = {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(patch.dob)) throw new Error('BAD_DOB');
       sets.push(`dob=$${vals.length + 1}`); vals.push(patch.dob);
     }
-    if (patch.avatarUrl !== undefined) { sets.push(`profile_image=$${vals.length + 1}`); vals.push(String(patch.avatarUrl).slice(0, 500) || null); }
+    // Only real web addresses: a browser-local blob:/file:/data:/content: link
+    // only works on the device (and tab) that made it, and breaks everywhere else.
+    if (patch.avatarUrl !== undefined && !/^(blob|file|data|content):/i.test(String(patch.avatarUrl).trim())) {
+      sets.push(`profile_image=$${vals.length + 1}`); vals.push(String(patch.avatarUrl).slice(0, 500) || null);
+    }
     if (sets.length > 0) {
       await q(`UPDATE identity.users SET ${sets.join(', ')}, updated_at=now() WHERE id=$${vals.length + 1}`, [...vals, userId]);
     }
