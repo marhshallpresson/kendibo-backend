@@ -124,6 +124,9 @@ export async function settleJob(bookingId: string): Promise<'settled' | 'unpaid'
       await notifyCustomer(String(p[0].phone).replace(/\D/g, ''), `The customer confirmed the job. ${n(split.providerKobo)} has been added to your Kendibo earnings (${n(split.collectedKobo)} minus Kendibo's ${split.commissionBps / 100}% commission and VAT on it).`);
     } catch { /* best effort */ }
   }
+  // Final invoice to the customer (idempotent: one per booking).
+  const { onSettled } = await import('../invoices/invoice.service.js');
+  await onSettled(bookingId);
   return 'settled';
 }
 

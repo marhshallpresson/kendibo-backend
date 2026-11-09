@@ -29,7 +29,12 @@ async function parties(bookingId: string): Promise<{ customer: string | null; pr
   return { customer: c[0]?.phone ?? null, provider: p[0]?.phone ?? null };
 }
 
-const whenText = (iso: string) => new Date(iso).toLocaleString('en-NG', { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', timeZone: 'Africa/Lagos' });
+/** "Tue 12 Nov, 8am–12pm" (Lagos), using the booking's time window when it has one. */
+async function whenFor(bookingId: string, iso: string): Promise<string> {
+  const { bookingFacts, formatWhen } = await import('../invoices/when.js');
+  const f = await bookingFacts(bookingId).catch(() => null);
+  return f?.when ?? formatWhen(iso);
+}
 
 // ── Reminders ───────────────────────────────────────────────────────────────
 export async function reminderSweep(now = Date.now()): Promise<{ day: number; hour: number }> {
@@ -44,8 +49,9 @@ export async function reminderSweep(now = Date.now()): Promise<{ day: number; ho
     const claimed = await q(`UPDATE booking.booking SET reminder_24h_at=now() WHERE id=$1 AND reminder_24h_at IS NULL RETURNING id`, [b.id]);
     if (!claimed[0]) continue;
     const p = await parties(String(b.id));
-    const when = whenText(String(b.scheduled_at));
-    await send(p.customer, `Reminder: your Kendibo job is booked for ${when}. Reply AGENT if you need to change anything.`);
+    const when = await whenFor(String(b.id), String(b.scheduled_at));
+    const { dayBeforeSummary } = await import('./schedule-updates.js');
+    await send(p.customer, (await dayBeforeSummary(String(b.id)).catch(() => null)) ?? `Reminder: your Kendibo job is booked for ${when}. Reply AGENT if you need to change anything.`);
     await send(p.provider, `Reminder: you have a Kendibo job on ${when}. Open the app for the address and details.`);
   }
   const hour = await q<{ id: string; scheduled_at: string }>(
@@ -56,8 +62,9 @@ export async function reminderSweep(now = Date.now()): Promise<{ day: number; ho
     const claimed = await q(`UPDATE booking.booking SET reminder_1h_at=now(), reminder_24h_at=COALESCE(reminder_24h_at, now()) WHERE id=$1 AND reminder_1h_at IS NULL RETURNING id`, [b.id]);
     if (!claimed[0]) continue;
     const p = await parties(String(b.id));
-    await send(p.customer, 'Your Kendibo pro is due within the hour. You will get your start code when they set off.');
-    await send(p.provider, 'Your Kendibo job starts within the hour. Tap "On my way" in the app when you leave.');
+    const when = await whenFor(String(b.id), String(b.scheduled_at));
+    await send(p.customer, `Your Kendibo pro is due soon (${when}). You will get your start code when they set off.`);
+    await send(p.provider, `Your Kendibo job starts soon (${when}). Tap "On my way" in the app when you leave.`);
   }
   if (day.length || hour.length) emit('job.reminders_sent', { day: day.length, hour: hour.length });
   return { day: day.length, hour: hour.length };
@@ -66,7 +73,10 @@ export async function reminderSweep(now = Date.now()): Promise<{ day: number; ho
 let reminderTimer: NodeJS.Timeout | null = null;
 export function startReminderSweeper(everyMs = 5 * 60_000) {
   if (reminderTimer) return;
-  reminderTimer = setInterval(() => { void reminderSweep().catch((e) => observability.captureException(e)); }, everyMs);
+  reminderTimer = setInterval(() => {
+    void reminderSweep().catch((e) => observability.captureException(e));
+    void import('./schedule-updates.js').then((m) => m.providerEveningSweep()).catch((e) => observability.captureException(e));
+  }, everyMs);
   reminderTimer.unref?.();
 }
 
