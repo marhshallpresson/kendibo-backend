@@ -1,8 +1,9 @@
 // PaymentPort — every PSP behind this interface. No business module imports an SDK.
-// Single PSP: BachsAdapter (Flutterwave removed Oct 2026). Paystack is NOT supported.
+// PSPs: BachsAdapter (live today) and PagaAdapter (sandbox, test accounts only until
+// Paga live approval). Flutterwave removed Oct 2026. Paystack is NOT supported.
 import type { Kobo } from './money.js';
 
-export type PSP = 'bachs';
+export type PSP = 'bachs' | 'paga';
 
 export interface CreateCheckoutInput {
   bookingId: string;
@@ -18,9 +19,11 @@ export interface CreateCheckoutInput {
 export interface CheckoutSession {
   psp: PSP;
   checkoutId: string;
-  checkoutUrl: string | null; // Bachs hosted checkout URL
+  checkoutUrl: string | null; // hosted checkout (Bachs) or our pay page (Paga bank transfer)
   reference: string;
   status: 'open' | 'pending';
+  /** PSP payment instructions to keep with the payment row (e.g. Paga account number). */
+  details?: Record<string, unknown>;
 }
 
 export interface VerifiedPayment {

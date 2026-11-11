@@ -4,7 +4,7 @@
 // bound to one WhatsApp user + one job draft + one purpose, with an expiry.
 import crypto from 'node:crypto';
 
-export type LinkPurpose = 'loc' | 'vendors' | 'pay' | 'verify' | 'email' | 'invoice';
+export type LinkPurpose = 'loc' | 'vendors' | 'pay' | 'verify' | 'email' | 'invoice' | 'paga';
 export interface LinkClaims { w: string; d: string; p: LinkPurpose; exp: number }
 
 const secret = () => process.env.WHATSAPP_LINK_SECRET || process.env.JWT_ACCESS_SECRET || 'dev-wa-links-INSECURE';

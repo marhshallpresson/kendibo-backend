@@ -272,6 +272,9 @@ const ROUTE_POLICY: Record<string, RoutePolicy> = {
   'GET /v1/banks': 'public',
   'GET /v1/media/:id/file': 'public', // HMAC-signed URL checked in the handler
   'POST /webhooks/payments/bachs': 'public', // PSP signature checked in the handler
+  'POST /webhooks/payments/paga': 'public', // Paga body hash checked in the handler
+  'POST /webhooks/paga/transfer': 'public', // x-paga-hash checked in the handler
+  'GET /w/paga/pay': 'public', // signed link (purpose 'paga'); shows pay instructions only
   'GET /w/payment-return': 'public', // shows status only; reference is unguessable
   'GET /w/delete-account': 'public', // Google Play account-deletion instructions
   'POST /webhooks/sling': 'public', // Sling signature checked in the handler
@@ -981,7 +984,7 @@ app.get('/w/payment-return', async (req, reply) => {
     .header('Referrer-Policy', 'no-referrer').type('text/html; charset=utf-8').send(page);
 });
 
-for (const psp of ['bachs'] as const) {
+for (const psp of ['bachs', 'paga'] as const) {
   app.post(`/webhooks/payments/${psp}`, { config: { rawBody: true } }, async (req, reply) => {
     try {
       const raw = Buffer.from((req as unknown as { rawBody?: string }).rawBody || JSON.stringify(req.body ?? {}));
@@ -1001,6 +1004,60 @@ for (const psp of ['bachs'] as const) {
     }
   });
 }
+
+// Paga bank-transfer pay page (signed link from the checkout): account number,
+// exact amount, expiry and live status. Pending payments are re-checked with Paga.
+app.get('/w/paga/pay', async (req, reply) => {
+  const { verifyLink } = await import('../../../modules/whatsapp/links.js');
+  const { pageCsp } = await import('../../../modules/whatsapp/web-pages.js');
+  const { renderPagaPayPage } = await import('../../../modules/payments/paga/pay-page.js');
+  const claims = verifyLink(String((req.query as { t?: string }).t ?? ''), 'paga');
+  if (!claims) return reply.code(403).type('text/plain; charset=utf-8').send('This payment link is not valid or has expired. Ask for a new one in WhatsApp or the app.');
+  const reference = claims.d;
+  const rows = await q<{ status: string; amount_kobo: string; psp_details: unknown; psp: string }>(
+    `SELECT status, amount_kobo, psp_details, psp FROM payment.payment WHERE reference=$1`, [reference],
+  ).catch(() => []);
+  const row = rows[0];
+  if (!row || row.psp !== 'paga') return reply.code(404).type('text/plain; charset=utf-8').send('Payment not found.');
+  let status = row.status;
+  if (status === 'pending') status = (await syncPendingPayment(reference)) ?? status;
+  const d = (typeof row.psp_details === 'string' ? JSON.parse(row.psp_details) : row.psp_details ?? {}) as Record<string, string | null>;
+  const nonce = crypto.randomBytes(16).toString('base64');
+  const expired = status === 'pending' && d.expiresAt ? Date.parse(`${String(d.expiresAt).replace(/Z?$/, 'Z')}`) < Date.now() : false;
+  const page = renderPagaPayPage({
+    status: expired ? 'expired' : status === 'successful' ? 'successful' : status === 'failed' ? 'failed' : 'pending',
+    accountNumber: d.accountNumber ?? null, bankName: d.bankName ?? null,
+    amountKobo: BigInt(String(d.amountToPayKobo ?? row.amount_kobo)), expiresAt: d.expiresAt ?? null,
+    reference, sandbox: process.env.PAGA_ENV !== 'live', nonce,
+  });
+  return reply.header('Content-Security-Policy', pageCsp(nonce, false)).header('Cache-Control', 'no-store')
+    .header('Referrer-Policy', 'no-referrer').type('text/html; charset=utf-8').send(page);
+});
+
+// Paga Business API money-transfer status (vendor payouts). Hash in x-paga-hash;
+// Paga retries until it gets 200 {"status":"SUCCESS"}. Recorded once per reference+outcome.
+app.post('/webhooks/paga/transfer', { config: { rawBody: true } }, async (req, reply) => {
+  const { PagaAdapter } = await import('../../../modules/payments/paga.adapter.js');
+  const raw = Buffer.from((req as unknown as { rawBody?: string }).rawBody || JSON.stringify(req.body ?? {}));
+  if (!new PagaAdapter().verifyTransferNotification(raw, req.headers as Record<string, string>)) {
+    return fail(reply, 'BAD_SIGNATURE', 'Invalid Paga notification hash', 401);
+  }
+  const e = JSON.parse(raw.toString('utf-8')) as { referenceNumber?: string; responseCode?: number; transactionId?: string; message?: string };
+  const reference = String(e.referenceNumber ?? '');
+  const outcome = Number(e.responseCode) === 0 ? 'paid' : Number(e.responseCode) === 3 ? 'processing' : 'failed';
+  try {
+    await q(`INSERT INTO payment.webhook_event (psp, event_id, raw) VALUES ('paga', $1, $2)`, [`paga-transfer:${reference}:${outcome}`, raw.toString('utf-8')]);
+  } catch { return { status: 'SUCCESS' }; } // already recorded
+  if (reference) {
+    await q(
+      `UPDATE payment.payout SET status=$2, psp_reference=COALESCE($3, psp_reference), paid_at=CASE WHEN $2='paid' THEN now() ELSE paid_at END
+        WHERE id::text=$1 AND status NOT IN ('paid','failed')`, // payouts send their row id as Paga's referenceNumber
+      [reference, outcome, e.transactionId ?? null],
+    ).catch((err) => observability.captureException(err));
+  }
+  return { status: 'SUCCESS' };
+});
+
 app.post('/v1/refunds', async (req, reply) => {
   const { bookingId, amountKobo, reason } = z.object({ bookingId: z.string(), amountKobo: z.string().regex(/^\d+$/), reason: z.string().max(1000) }).parse(req.body);
   // Customers may only REQUEST a refund on their own booking; money moves via

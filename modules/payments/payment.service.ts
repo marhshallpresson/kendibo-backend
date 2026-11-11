@@ -1,16 +1,30 @@
-// PaymentService — Bachs.io is the single PSP (Flutterwave removed Oct 2026).
+// PaymentService — Bachs.io is the live PSP; Paga runs in sandbox for test accounts.
 // Rules: server owns money; webhook != truth until verified; every mutation idempotent.
-// With one PSP there is no failover, so transient Bachs failures (timeouts,
-// 429/5xx) get one quick retry with the SAME idempotency key — safe, because
-// Bachs dedupes on it — before the caller sees PSP_UNAVAILABLE.
+// Transient PSP failures (timeouts, 429/5xx) get one quick retry with the SAME
+// reference/idempotency key — safe, because the PSP dedupes on it — before the
+// caller sees PSP_UNAVAILABLE.
+//
+// Routing (PAGA_MODE):
+//   off (default)   every payment uses Bachs.
+//   test-accounts   Paga sandbox only when the customer AND the assigned pro (if any)
+//                   are flagged identity.users.is_test. Real customers never touch
+//                   sandbox money; test accounts never touch live rails.
 import type { PaymentPort, PSP, CreateCheckoutInput, CheckoutSession, VerifiedPayment } from './payment.port.js';
 import { BachsAdapter } from './bachs.adapter.js';
+import { PagaAdapter } from './paga.adapter.js';
+import { PagaClient, pagaConfigured } from './paga/client.js';
 import { q } from '../../packages/database/db.js';
 
 const transient = (e: unknown) => {
   const m = String((e as Error)?.message ?? '');
-  return /BACHS_(429|5\d\d)|timeout|aborted|ECONNRESET|ETIMEDOUT|fetch failed/i.test(m);
+  return /BACHS_(429|5\d\d)|PAGA_HTTP_5\d\d|timeout|aborted|ECONNRESET|ETIMEDOUT|fetch failed/i.test(m);
 };
+
+/** Signed page where a Paga bank-transfer payer sees the account number and amount. */
+async function pagaPayPage(reference: string): Promise<string> {
+  const { signLink, webBase } = await import('../whatsapp/links.js');
+  return `${webBase()}/w/paga/pay?t=${encodeURIComponent(signLink({ w: 'paga', d: reference, p: 'paga' }, 24 * 3600))}`;
+}
 async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
   try { return await fn(); }
   catch (e) {
@@ -22,19 +36,44 @@ async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
 
 export class PaymentService {
   private adapters: Record<PSP, PaymentPort>;
+  /** A test passed its own Paga adapter, so Paga counts as configured. */
+  private readonly pagaInjected: boolean;
 
   /** Pass a fake adapter in tests to avoid PSP network calls. */
   constructor(adapters?: Partial<Record<PSP, PaymentPort>>) {
-    this.adapters = { bachs: adapters?.bachs ?? new BachsAdapter() };
+    this.pagaInjected = Boolean(adapters?.paga);
+    this.adapters = {
+      bachs: adapters?.bachs ?? new BachsAdapter(),
+      paga: adapters?.paga ?? new PagaAdapter(new PagaClient(), () => ''),
+    };
   }
 
-  private async recordIntent(psp: PSP, checkoutId: string, checkoutUrl: string | null, input: CreateCheckoutInput): Promise<boolean> {
+  /** Which PSP a new payment goes to (see PAGA_MODE above). */
+  async pspFor(input: CreateCheckoutInput): Promise<PSP> {
+    if (process.env.PAGA_MODE !== 'test-accounts') return 'bachs';
+    if (!this.pagaInjected && !pagaConfigured()) return 'bachs';
+    if (input.bookingId === 'wallet_topup') return 'bachs';
+    const customer = await q<{ is_test: boolean }>(
+      `SELECT u.is_test FROM booking.booking b JOIN identity.users u ON u.id = b.user_id WHERE b.id = $1`, [input.bookingId],
+    ).catch(() => []);
+    if (!customer[0]?.is_test) return 'bachs';
+    const pros = await q<{ is_test: boolean }>(
+      `SELECT u.is_test FROM dispatch.assignment a
+         JOIN provider.provider p ON p.id = a.provider_id
+         JOIN identity.users u ON u.id = p.user_id
+        WHERE a.job_id = $1 AND a.status = 'accepted'`, [input.bookingId],
+    ).catch(() => []);
+    return pros.every((p) => p.is_test) ? 'paga' : 'bachs';
+  }
+
+
+  private async recordIntent(psp: PSP, checkoutId: string, checkoutUrl: string | null, input: CreateCheckoutInput, details?: Record<string, unknown>): Promise<boolean> {
     const bookingId = input.bookingId === 'wallet_topup' ? '00000000-0000-0000-0000-000000000000' : input.bookingId;
     try {
       await q(
-        `INSERT INTO payment.payment (booking_id, psp, reference, charge_id, amount_kobo, status, checkout_url)
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6)`,
-        [bookingId, psp, input.reference, checkoutId, Number(input.amountKobo), checkoutUrl],
+        `INSERT INTO payment.payment (booking_id, psp, reference, charge_id, amount_kobo, status, checkout_url, psp_details)
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7::jsonb)`,
+        [bookingId, psp, input.reference, checkoutId, Number(input.amountKobo), checkoutUrl, JSON.stringify(details ?? {})],
       );
       return true;
     } catch (error) {
@@ -47,7 +86,8 @@ export class PaymentService {
     }
   }
 
-  async createCheckout(input: CreateCheckoutInput, preferred: PSP = 'bachs'): Promise<CheckoutSession> {
+  async createCheckout(input: CreateCheckoutInput, preferredPsp?: PSP): Promise<CheckoutSession> {
+    const preferred: PSP = preferredPsp ?? (await this.pspFor(input));
     // Check postgres for idempotency
     const existing = await q<{ psp: PSP; charge_id: string; booking_id: string; amount_kobo: string; status: string; checkout_url: string | null }>(
       `SELECT psp, charge_id, booking_id, amount_kobo, status, checkout_url FROM payment.payment WHERE reference=$1 LIMIT 1`,
@@ -64,8 +104,10 @@ export class PaymentService {
     }
 
     const s = await withRetry(() => this.adapters[preferred].createCheckout(input));
+    // Paga bank transfers have no hosted page: the customer gets our signed pay page.
+    if (s.psp === 'paga' && !s.checkoutUrl) s.checkoutUrl = await pagaPayPage(input.reference);
     if (!s.checkoutId || !s.checkoutUrl) throw new Error('CHECKOUT_UNAVAILABLE');
-    return await this.recordIntent(s.psp, s.checkoutId, s.checkoutUrl, input) ? s : this.createCheckout(input, preferred);
+    return await this.recordIntent(s.psp, s.checkoutId, s.checkoutUrl, input, s.details) ? s : this.createCheckout(input, preferred);
   }
 
   /** Server-side verify of a charge (webhook is never trusted alone). */
@@ -81,8 +123,8 @@ export class PaymentService {
     );
     const row = rows[0];
     if (!row?.charge_id) throw new Error('CHARGE_NOT_SETTLED');
-    if (row.psp !== 'bachs') throw new Error('REFUND_RETIRED_PSP'); // pre-Oct-2026 Flutterwave charges: refund in its dashboard
-    return this.adapters.bachs.refund({
+    if (row.psp !== 'bachs' && row.psp !== 'paga') throw new Error('REFUND_RETIRED_PSP'); // pre-Oct-2026 Flutterwave charges: refund in its dashboard
+    return this.adapters[row.psp].refund({
       chargeId: row.charge_id, reference: `rf_${reference}`,
       ...(amountKobo !== undefined ? { amountKobo } : {}),
       reason, idempotencyKey: `rf_${reference}`,
@@ -111,7 +153,8 @@ export class PaymentService {
     if (!adapter.verifyWebhookSignature(rawBody, headers)) return { ok: false };
 
     const event = JSON.parse(raw) as any;
-    const eventId = event.id ?? event.event_id ?? `${psp}:${Date.now()}`;
+    // Paga retries reuse notificationId; Bachs sends id/event_id.
+    const eventId = event.id ?? event.event_id ?? (event.notificationId ? `paga:${event.notificationId}` : `${psp}:${Date.now()}`);
     
     // Dedupe on the raw event BEFORE any PSP verify call — replays short-circuit here.
     try {
@@ -122,7 +165,7 @@ export class PaymentService {
     }
     
     const reference =
-      event.data?.tx_ref ?? event.data?.reference ?? event.data?.checkout_id ?? event.txRef;
+      event.data?.tx_ref ?? event.data?.reference ?? event.data?.checkout_id ?? event.txRef ?? event.externalReferenceNumber;
     const chargeId = event.data?.charge_id ?? event.data?.payment_id ?? event.data?.id;
 
     let verified: VerifiedPayment;
@@ -169,8 +212,8 @@ export class PaymentService {
     );
     const local = rows[0];
     if (!local) return { status: 'not_found', transitioned: false };
-    if (local.status !== 'pending' || local.psp !== 'bachs') return { status: local.status, transitioned: false };
-    const adapter = this.adapters.bachs;
+    if (local.status !== 'pending' || (local.psp !== 'bachs' && local.psp !== 'paga')) return { status: local.status, transitioned: false };
+    const adapter = this.adapters[local.psp];
     let verified: VerifiedPayment;
     try {
       verified = await adapter.verifyByReference(reference);
