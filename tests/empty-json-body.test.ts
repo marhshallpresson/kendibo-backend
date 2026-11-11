@@ -65,7 +65,8 @@ describe('body-less JSON POSTs', () => {
   });
 
   it('still rejects malformed JSON', async () => {
-    const res = await app.inject({ method: 'POST', url: '/v1/provider/onboarding', headers: { 'content-type': 'application/json' }, payload: '{bad' });
+    const uid = String((await q<{ id: string }>(`INSERT INTO identity.users (email, name) VALUES ($1,'Bad Body') RETURNING id`, [`p-${randomUUID()}@kendibo.local`]))[0].id);
+    const res = await app.inject({ method: 'POST', url: '/v1/provider/onboarding', headers: { authorization: `Bearer ${signAccess(uid, [])}`, 'content-type': 'application/json' }, payload: '{bad' });
     assert.equal(res.statusCode, 400);
   });
 });
