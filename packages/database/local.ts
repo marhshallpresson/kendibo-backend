@@ -116,6 +116,7 @@ export function localDb(): IMemoryDb {
   run('046_kyc_reviewed_by_text.sql');
   run('049_provider_onboarding_progress.sql');
   run('043_invoices_schedule_updates.sql');
+  run('040_whatsapp_sessions_recovery.sql');
   console.log('[localdb] pg-mem ready (001-019, 021-032)');
   return mem;
 }

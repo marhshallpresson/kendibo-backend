@@ -25,7 +25,11 @@ import { observability } from '../../packages/observability/watchup.adapter.js';
 import { wa, onMessageSent } from './whatsapp.client.js';
 import { understand, logTurn, type Understanding } from './nlu/index.js';
 import { currentDraft, openDraft, patchDraft, addPhotoToDraft, saveDraftLocation, cancelDraft, submitDraft, type Draft } from './draft.js';
-import { nextStep, sendStep, handleFlowTap, patchFromUnderstanding, acknowledge, tradeName, type Asked, type Step } from './flow.js';
+import { nextStep, sendStep, handleFlowTap, patchFromUnderstanding, acknowledge, tradeName, trades, type Asked, type Step } from './flow.js';
+import { parseCommand, menuText, BUILTIN, ONBOARDING_TIP, type Command } from './commands.js';
+import { activeRequestFor, openSessions, switchSession, sessionPrefix, describeSession } from './sessions.js';
+import { RECOVER_TRIGGER, startRecovery, continueRecovery } from './recover.js';
+import { replyWithInvoice } from './invoice-hook.js';
 import { FACTS, priceLines } from './facts.js';
 import { OPT_IN, OPT_OUT, llmAllowed, sendBusinessInitiated, notifyCustomer, setJobOfferConsent } from './policy.js';
 import { activeRelay, closeRelay, relayText, relayMedia } from './relay.js';
@@ -136,12 +140,12 @@ async function sendWelcome(to: string, name?: string) {
 }
 const sendMenu = (to: string, body = 'What would you like to do?') => wa.buttons(to, body, MENU_BUTTONS);
 
-async function handOff(s: Session, userId: string, to: string, summary: string) {
+async function handOff(s: Session, userId: string, to: string, summary: string, reply = 'Okay. Someone from the Kendibo team will reply in this chat (8am–8pm daily). Type "bot" to go back to the assistant.') {
   const { supportService } = await import('../warranties/warranty.service.js');
   const t = await supportService.open(userId, `whatsapp: ${summary.slice(0, 200)}`);
   s.state = 'HUMAN';
   emit('whatsapp.handoff', { ticketId: (t as { id?: string }).id ?? null });
-  await wa.text(to, 'Okay. Someone from the Kendibo team will reply in this chat (8am–8pm daily). Type "bot" to go back to the assistant.');
+  await wa.text(to, reply);
 }
 
 async function sendStatus(to: string, userId: string, draft: Draft | null) {
@@ -326,9 +330,12 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
   const firstContact = !(await q(`SELECT 1 FROM messaging.whatsapp_turn WHERE wa_id=$1 LIMIT 1`, [to]).catch(() => []))[0];
   await q(`INSERT INTO messaging.whatsapp_turn (wa_id, role, content) VALUES ($1,'user',$2)`, [to, (text || `(${m.type})`).slice(0, 2000)]).catch(() => undefined);
 
+  // "/stop" is the same as STOP; "/" or "menu" shows every command.
+  const cmd: Command | null = id ? null : parseCommand(text);
+
   // Marketing opt-out (Meta policy, NDPA 2023): STOP turns promotions off on
   // every channel; START turns them back on. Booking updates still go out.
-  if (!id && OPT_OUT.test(lower)) {
+  if (!id && (OPT_OUT.test(lower) || cmd?.cmd === 'stop')) {
     await setJobOfferConsent(to, false);
     const { notificationService } = await import('../notifications/notification.service.js');
     await notificationService.updateUserPreferences(user.id, { promo: false });
@@ -352,6 +359,23 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
     `SELECT COUNT(*) AS n FROM messaging.whatsapp_inbound WHERE wa_id=$1 AND received_at > $2`, [to, new Date(Date.now() - 3600_000).toISOString()],
   ).catch(() => [{ n: '0' }]);
   if (Number(recent[0]?.n ?? 0) > 40) return;
+
+  // RECOVER (lost or changed number): before the consent gate, because the old
+  // account already agreed and a brand-new number shouldn't onboard first.
+  if (!id && RECOVER_TRIGGER.test(lower)) {
+    await startRecovery(to, s.data);
+    await saveSession(s);
+    return;
+  }
+  if (!id && s.data.recover) {
+    const out = await continueRecovery(to, user.id, s.data, text);
+    if (out.kind !== 'not_mine') {
+      if (out.kind === 'moved') { s.userId = out.userId; s.data = { lang: s.data.lang }; s.state = 'BOT'; }
+      if (out.kind === 'support') s.state = 'HUMAN';
+      await saveSession(s);
+      return;
+    }
+  }
 
   // Onboarding: a short notice and one tap to agree before the first booking
   // (NDPA 2023 notice + consent). Whatever they asked first is kept and
@@ -379,6 +403,7 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
   if (s.data.onboard) {
     const done = await handleOnboarding(to, s, user.id, text, id, profileName);
     if (!done) { await saveSession(s); return; }
+    await wa.text(to, ONBOARDING_TIP);
     const pending = s.data.pendingText ?? '';
     delete s.data.pendingText;
     await saveSession(s);
@@ -387,6 +412,10 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
     return;
   }
 
+  // Commands work at any point ("/" lists them; PAY, VERIFY, DONE, PROBLEM,
+  // AGENT and STOP are the same commands without the slash).
+  if (cmd && (await runCommand(cmd, to, s, user.id))) return;
+  // Handlers below run only when the command router above did not handle the message.
   // Shortcuts that work at any point: resend the pay button, or the ID check.
   if (!id && /^(pay|pay now|payment|make payment)[.!]*$/.test(lower)) { await sendPayButton(to, user.id); return; }
   // Completion: DONE confirms the job the pro marked finished; PROBLEM freezes it
@@ -483,6 +512,12 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
         delete s.data.cancelDraftId;
         if (draft) await sendStep(to, draft, s.data, 'Your request is still in progress.');
         else await sendMenu(to);
+      } else if (id.startsWith('sess:cancel:')) {
+        const { requestService } = await import('../requests/request.service.js');
+        const ok = await requestService.cancel(id.slice('sess:cancel:'.length), user.id).then(() => true, () => false);
+        await sendMenu(to, ok ? 'Cancelled. Nothing more will be sent to vendors for that request.' : "That request can't be cancelled here any more. Type AGENT and we'll help.");
+      } else if (id === 'sess:keep') {
+        await sendMenu(to, 'Okay, your request stays as it is.');
       } else if (id === 'flow:confirm' && !draft) {
         await sendMenu(to, 'That request has already been sent. Want to do something else?');
       } else if (id.startsWith('flow:') || id.startsWith('cat:')) {
@@ -752,17 +787,18 @@ export async function confirmPendingEmail(waId: string, userId: string): Promise
 }
 
 /** PAY: the latest booking still waiting for payment gets a fresh pay button. */
-async function sendPayButton(to: string, userId: string): Promise<void> {
+async function sendPayButton(to: string, userId: string, bookingId?: string, prefix = ''): Promise<void> {
+  // With session mode, the active session's booking is paid; otherwise the latest one waiting.
   const b = await q<{ id: string; price_kobo: string | null }>(
     `SELECT b.id, b.price_kobo FROM booking.booking b
-      WHERE b.user_id=$1 AND upper(b.status) IN ('REQUESTED','PAYMENT_PENDING')
+      WHERE b.user_id=$1 AND upper(b.status) IN ('REQUESTED','PAYMENT_PENDING')${bookingId ? ' AND b.id=$2' : ''}
         AND NOT EXISTS (SELECT 1 FROM payment.payment p WHERE p.booking_id=b.id AND p.status='successful')
-      ORDER BY b.created_at DESC LIMIT 1`, [userId],
+      ORDER BY b.created_at DESC LIMIT 1`, bookingId ? [userId, bookingId] : [userId],
   ).catch(() => []);
-  if (!b[0]) { await sendMenu(to, "You don't have anything to pay right now. When a pro accepts a job, the pay button comes here."); return; }
+  if (!b[0]) { await sendMenu(to, `${prefix}You don't have anything to pay right now. When a pro accepts a job, the pay button comes here.`); return; }
   const amount = String(b[0].price_kobo ?? '0').split('.')[0] || '0';
   const url = `${webBase()}/w/pay?t=${encodeURIComponent(payToken(to, String(b[0].id)))}`;
-  await wa.ctaUrl(to, Number(amount) > 0 ? `Pay ${naira(amount)} to confirm your booking. Kendibo holds it until the job is done.` : 'Confirm and pay for your booking.', 'Pay securely', url);
+  await wa.ctaUrl(to, `${prefix}${Number(amount) > 0 ? `Pay ${naira(amount)} to confirm your booking. Kendibo holds it until the job is done.` : 'Confirm and pay for your booking.'}`, 'Pay securely', url);
 }
 
 /** The ID-check page finished: tell the customer and pick their request back up. */
@@ -842,7 +878,10 @@ export async function notifyRequestAccepted(requestId: string, bookingId: string
   const vendor = await q<{ name: string | null }>(
     `SELECT p.business_name AS name FROM booking.request_offer o JOIN provider.provider p ON p.id=o.provider_id WHERE o.request_id=$1 AND o.status='accepted' LIMIT 1`, [requestId],
   );
-  const who = vendor[0]?.name ? String(vendor[0].name) : 'A verified vendor';
+  // Session mode: say which request this is when the customer has more than one open.
+  const tag = (await q<{ session_tag: string | null }>(`SELECT session_tag FROM booking.service_request WHERE id=$1`, [requestId]).catch(() => []))[0]?.session_tag;
+  const tagged = tag && (await openSessions(String(r.user_id)).catch(() => [])).length > 1 ? `[${tag}] ` : '';
+  const who = `${tagged}${vendor[0]?.name ? String(vendor[0].name) : 'A verified vendor'}`;
   if (!bookingId) {
     await notifyCustomer(to, `${who} accepted your job. They'll inspect first and send a quote here for you to approve. You only pay after you accept it.`);
     return;
@@ -870,4 +909,117 @@ export async function notifyRequestAccepted(requestId: string, bookingId: string
     template: { key: 'request_update', params: [`${line} ${checkoutUrl}`] },
     sms: `${line} ${checkoutUrl}`,
   });
+}
+
+/** Returns false when the text only looked like a command (e.g. a tag that isn't theirs). */
+async function runCommand(cmd: Command, to: string, s: Session, userId: string): Promise<boolean> {
+  const done = async () => { await saveSession(s); return true; };
+  const cats = await trades().catch(() => []);
+  const category = cats.find((c) => c.id === cmd.cmd);
+  if (!BUILTIN.has(cmd.cmd) && !category) {
+    await wa.text(to, `I don't know that one yet.\n\n${menuText(cats)}`);
+    return done();
+  }
+  if (cmd.cmd === 'menu') {
+    if (s.state === 'HUMAN') s.state = 'BOT';
+    await wa.text(to, menuText(cats));
+    return done();
+  }
+  if (category || cmd.cmd === 'book') {
+    // A new request: the open ones stay as they are; this one becomes active once it's sent.
+    const d = (await currentDraft(to)) ?? (await openDraft(to, userId));
+    if (category && d.category_id !== category.id) await patchDraft(d.id, { category_id: category.id });
+    await sendStep(to, category ? { ...d, category_id: category.id } : d, s.data, category ? `Okay, ${category.name}.` : undefined);
+    return done();
+  }
+  if (cmd.cmd === 'sessions') {
+    const open = await openSessions(userId);
+    const active = await activeRequestFor(userId);
+    await wa.text(to, open.length
+      ? `Your open requests:\n${open.map((x) => `${x.tag === active?.tag ? '▶ ' : '• '}${describeSession(x)}`).join('\n')}\n\nType /switch and a tag (like /switch ${open[0].tag}) to pick one.`
+      : "You don't have any open requests. Type /book to start one.");
+    return done();
+  }
+  if (cmd.cmd === 'switch') {
+    if (!cmd.arg) { await wa.text(to, 'Type /switch and the tag, like /switch AC-4821. Type /sessions to see your tags.'); return done(); }
+    const hit = await switchSession(userId, cmd.arg);
+    if (!hit) {
+      if (!cmd.slash) return false; // just text that looks like a tag: let the normal router read it
+      await wa.text(to, `I can't find an open request called ${cmd.arg.toUpperCase()}. Type /sessions to see yours.`);
+      return done();
+    }
+    await wa.text(to, `[${hit.tag}] Okay, we're now talking about this request: ${describeSession(hit)}.`);
+    return done();
+  }
+  if (cmd.cmd === 'status') {
+    const active = await activeRequestFor(userId);
+    if (!active) { await sendStatus(to, userId, await currentDraft(to)); return done(); }
+    await wa.text(to, `${await sessionPrefix(userId, active)}${describeSession(active)}`);
+    return done();
+  }
+  if (cmd.cmd === 'pay') {
+    const active = await activeRequestFor(userId);
+    await sendPayButton(to, userId, active?.bookingId ?? undefined, await sessionPrefix(userId, active));
+    return true;
+  }
+  if (cmd.cmd === 'invoice') {
+    const active = await activeRequestFor(userId);
+    await replyWithInvoice(to, userId, active, await sessionPrefix(userId, active));
+    return true;
+  }
+  if (cmd.cmd === 'reschedule') {
+    const active = await activeRequestFor(userId);
+    if (!active) { await sendMenu(to, "You don't have an open request to reschedule."); return true; }
+    const p = await sessionPrefix(userId, active);
+    await handOff(s, userId, to, `${active.tag}: customer wants to reschedule`, `${p}Okay. Someone from the Kendibo team will help you pick a new date and time in this chat (8am–8pm daily). Type "bot" to go back to the assistant.`);
+    return done();
+  }
+  if (cmd.cmd === 'cancel') {
+    const draft = await currentDraft(to);
+    if (draft) {
+      s.data.cancelDraftId = draft.id;
+      await wa.buttons(to, 'Would you like to cancel your request in progress?', [{ id: 'cancel:confirm', title: 'Yes, cancel' }, { id: 'cancel:keep', title: 'Keep request' }]);
+      return done();
+    }
+    const active = await activeRequestFor(userId);
+    const p = await sessionPrefix(userId, active);
+    if (active && ['SUBMITTED', 'MATCHING', 'OFFERED'].includes(active.status)) {
+      await wa.buttons(to, `${p}Cancel this request? ${describeSession(active)}`, [{ id: `sess:cancel:${active.id}`, title: 'Yes, cancel' }, { id: 'sess:keep', title: 'Keep it' }]);
+    } else if (active) {
+      await sendMenu(to, `${p}This one is already booked. Type AGENT and we'll cancel it for you.`);
+    } else {
+      await sendMenu(to, 'To cancel a booking that is already confirmed, open the Kendibo app and go to Bookings, or type "agent" and we\'ll do it for you.');
+    }
+    return done();
+  }
+  if (cmd.cmd === 'agent') {
+    if (s.state === 'HUMAN') return false; // already with a person: the message goes to the support inbox
+    await handOff(s, userId, to, 'asked for a person');
+    return done();
+  }
+  if (cmd.cmd === 'recover') { await startRecovery(to, s.data); return done(); }
+  if (cmd.cmd === 'stop') return false; // handled by the opt-out above
+  if (cmd.cmd === 'verify') {
+    await wa.ctaUrl(to, "Verify your ID on Kendibo's secure page. It takes about a minute. Never send your NIN or BVN in this chat.", 'Verify my ID', idCheckLink(to, userId));
+    return true;
+  }
+  // Completion: DONE confirms the job the pro marked finished; PROBLEM freezes it
+  // (no payout) and hands the chat to a person.
+  const { awaitingConfirmationFor, confirmCompletion } = await import('../job-engine/job-guard.js');
+  const bookingId = await awaitingConfirmationFor(userId);
+  if (cmd.cmd === 'done') {
+    if (!bookingId) { await sendMenu(to, "There's no finished job waiting for your confirmation right now."); return true; }
+    const out = await confirmCompletion(bookingId, 'customer');
+    await wa.text(to, out === 'confirmed'
+      ? 'Thanks for confirming! Your pro will be paid. Rate them in the app to help other customers.'
+      : out === 'disputed' ? 'This job has an open report. Our team will settle it with you here.' : 'That job is not ready to confirm yet.');
+    return true;
+  }
+  // problem
+  if (bookingId) {
+    const { flag } = await import('../job-engine/job.machine.js');
+    await flag(bookingId, 'DISPUTED', 'customer', 'reported on WhatsApp').catch(() => undefined);
+  }
+  await handOff(s, userId, to, `Customer reported a problem${bookingId ? ` with booking ${bookingId.slice(0, 8)}` : ''}. Payment is on hold.`);
+  return done();
 }

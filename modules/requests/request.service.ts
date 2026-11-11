@@ -10,6 +10,7 @@ import { bookingService } from '../bookings/booking.service.js';
 import { notificationService } from '../notifications/notification.service.js';
 import { deviceService } from '../devices/device.service.js';
 import { emit } from '../../packages/observability/emit.js';
+import { assignSessionTag } from '../whatsapp/sessions.js';
 
 export type RequestStatus = 'SUBMITTED' | 'MATCHING' | 'OFFERED' | 'ACCEPTED' | 'BOOKED' | 'CANCELLED' | 'EXPIRED';
 export interface ServiceRequest {
@@ -118,6 +119,9 @@ export const requestService = {
        input.idempotencyKey, input.preferredProviderId ?? null, input.source ?? 'app'],
     );
     const req = toReq(rows[0]);
+    // Session mode: a short tag (AC-4821) the customer can use to pick this request on WhatsApp.
+    await assignSessionTag(req.id, userId, input.categoryId ?? null)
+      .catch((e) => emit('request.session_tag_failed', { requestId: req.id, error: String((e as Error).message) }));
     await q(`INSERT INTO outbox_event (topic, payload) VALUES ('request.submitted',$1)`, [JSON.stringify({ requestId: req.id })]);
     // Photos/videos the customer sent before this request existed join it now.
     await import('../media/evidence.service.js').then((m) => m.attachPendingEvidence(userId, req.id)).catch(() => 0);
