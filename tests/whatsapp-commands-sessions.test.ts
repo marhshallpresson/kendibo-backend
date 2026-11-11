@@ -22,8 +22,14 @@ before(async () => {
   const original = email.send.bind(email);
   // Admin alerts (new sign-ups etc.) go to the team's addresses; these tests
   // only count mail sent to customers.
+  // The seeded addresses are filtered directly too: under a loaded full-suite run
+  // an alert sent in the background can resolve its lookup late (or fail it).
+  const ADMIN = new Set(['admin@kendibo.ng', 'alerts@kendibo.ng']);
   email.send = async (to: string, subject: string, html: string) => {
-    if ((await getAlertEmails()).map((e) => e.toLowerCase()).includes(String(to).toLowerCase())) return { id: 'stub_admin' };
+    const addr = String(to).toLowerCase();
+    if (ADMIN.has(addr)) return { id: 'stub_admin' };
+    const alertTo = await getAlertEmails().catch(() => [] as string[]);
+    if (alertTo.map((e) => e.toLowerCase()).includes(addr)) return { id: 'stub_admin' };
     mails.push({ to, subject, html }); return { id: `stub_${mails.length}` };
   };
   restoreMail = () => { email.send = original; };
