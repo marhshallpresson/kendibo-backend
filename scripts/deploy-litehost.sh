@@ -37,7 +37,15 @@ ln -sfn "$HOME/shared/$APP/.env" "$R/.env"
 . "$HOME/.nvm/nvm.sh" >/dev/null; nvm use 24 >/dev/null
 cd "$R"
 export UV_THREADPOOL_SIZE=2 NODE_OPTIONS=--max-old-space-size=2048
-npm ci --include=dev --no-audit --no-fund >/dev/null
+# The container caps threads. Same lockfile as the running release: reuse its
+# packages as hard links (instant, no extra disk). Otherwise install, running
+# package install scripts one at a time so they don't exhaust threads.
+if [ -n "$PREV" ] && [ -d "$PREV/node_modules" ] && cmp -s "$PREV/package-lock.json" package-lock.json; then
+  cp -al "$PREV/node_modules" node_modules
+  echo "Packages unchanged: reused from $(basename "$PREV")"
+else
+  npm_config_foreground_scripts=true npm ci --include=dev --no-audit --no-fund >/dev/null
+fi
 npm run build >/dev/null
 [ -f dist/apps/api/src/main.js ] || { echo "Build failed; $PREV keeps running." >&2; exit 1; }
 node scripts/migrate.js | grep -E "OK|FAILED|tables present"
