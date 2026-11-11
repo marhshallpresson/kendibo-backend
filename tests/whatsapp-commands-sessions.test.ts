@@ -18,8 +18,14 @@ before(async () => {
   ({ app } = await import('../apps/api/src/main.js'));
   delete process.env.DATABASE_URL;
   const { email } = await import('../modules/notifications/channels.js');
+  const { getAlertEmails } = await import('../modules/notifications/admin-alerts.service.js');
   const original = email.send.bind(email);
-  email.send = async (to: string, subject: string, html: string) => { mails.push({ to, subject, html }); return { id: `stub_${mails.length}` }; };
+  // Admin alerts (new sign-ups etc.) go to the team's addresses; these tests
+  // only count mail sent to customers.
+  email.send = async (to: string, subject: string, html: string) => {
+    if ((await getAlertEmails()).map((e) => e.toLowerCase()).includes(String(to).toLowerCase())) return { id: 'stub_admin' };
+    mails.push({ to, subject, html }); return { id: `stub_${mails.length}` };
+  };
   restoreMail = () => { email.send = original; };
 });
 after(async () => {
