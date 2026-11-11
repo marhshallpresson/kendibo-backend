@@ -60,6 +60,7 @@ import { registerOnboardingRoutes } from './onboarding.routes.js';
 import { installAdminAlerts } from '../../../modules/notifications/admin-alerts.service.js';
 import { startLifecycleSweeper } from '../../../modules/notifications/lifecycle.service.js';
 import { emit } from '../../../packages/observability/emit.js';
+import { registerInvoiceRoutes, INVOICE_ROUTE_POLICY } from './invoice.routes.js';
 import { storefrontService } from '../../../modules/storefront/storefront.service.js';
 import { surfaceFor } from '../../../packages/shared/clients.js';
 void surfaceFor;
@@ -937,19 +938,14 @@ async function settleSuccessfulPayment(reference: string, amountKobo: bigint): P
   }
   try { await postCollection(reference, amountKobo, currentPeriod()); } catch (e) { observability.captureException(e); }
   observability.track('booking.payment_succeeded', { psp: 'bachs', reference });
-  // Paid from a WhatsApp link: confirm in the chat.
-  if (reference.endsWith('_wa')) {
-    try {
-      const rows = await q<{ phone: string | null }>(
-        `SELECT u.phone FROM payment.payment p JOIN booking.booking b ON b.id = p.booking_id JOIN identity.users u ON u.id = b.user_id WHERE p.reference=$1`, [reference],
-      );
-      if (rows[0]?.phone) {
-        const { notifyCustomer } = await import('../../../modules/whatsapp/policy.js');
-        const naira = (Number(amountKobo) / 100).toLocaleString('en-NG');
-        await notifyCustomer(String(rows[0].phone).replace(/\D/g, ''), `Payment received: ₦${naira}. Kendibo holds it safely until the job is done.`);
-      }
-    } catch (e) { observability.captureException(e); }
-  }
+  // Receipt to the customer (WhatsApp link + verified email): paid, held until the job is done.
+  try {
+    const rows = await q<{ booking_id: string }>(`SELECT booking_id FROM payment.payment WHERE reference=$1`, [reference]);
+    if (rows[0]) {
+      const { onPaymentSucceeded } = await import('../../../modules/invoices/invoice.service.js');
+      await onPaymentSucceeded(String(rows[0].booking_id));
+    }
+  } catch (e) { observability.captureException(e); }
 }
 /** Ask Bachs about a still-pending payment (at most every 5s per reference) and settle it if it went through. */
 const lastReconcile = new Map<string, number>();
@@ -3255,6 +3251,7 @@ registerEmailRoutes(app, { authed: authed as never, fail: fail as never });
 registerOnboardingRoutes(app, { authed: authed as never, fail: fail as never });
 installAdminAlerts();
 if (process.env.NODE_ENV !== 'test') startLifecycleSweeper();
+Object.assign(ROUTE_POLICY, INVOICE_ROUTE_POLICY); registerInvoiceRoutes(app, { fail: fail as never, bookingParty: bookingParty as never, providerActor });
 configureWhatsappBot({ createCheckout: (input) => payments.createCheckout(input) });
 
 if (process.env.VITEST !== 'true' && process.env.NODE_ENV !== 'test') {

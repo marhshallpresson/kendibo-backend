@@ -416,6 +416,21 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
     await wa.ctaUrl(to, "Verify your ID on Kendibo's secure page. It takes about a minute. Never send your NIN or BVN in this chat.", 'Verify my ID', idCheckLink(to, user.id));
     return;
   }
+  // Receipts and invoices: resend the newest one (WhatsApp link + verified email).
+  if (!id && /^\/?(invoice|invoices|receipt|receipts|my receipt|my invoice)[.!]*$/.test(lower)) {
+    const { latestInvoiceFor, sendInvoice } = await import('../invoices/invoice.service.js');
+    const latest = await latestInvoiceFor(user.id);
+    if (!latest || !(await sendInvoice(latest.bookingId))) await sendMenu(to, "You don't have a receipt yet. You'll get one here as soon as you pay for a job.");
+    return;
+  }
+  // The pro asked for a new time: the customer accepts or keeps the old one.
+  const sched = /^sched:(accept|decline):([0-9a-f-]{36})$/i.exec(id);
+  if (sched) {
+    const { answerScheduleChange } = await import('../job-engine/schedule-updates.js');
+    const out = await answerScheduleChange(sched[2], user.id, sched[1].toLowerCase() === 'accept');
+    if (out === 'gone') await sendMenu(to, 'That time change was already answered or replaced.');
+    return;
+  }
 
   // Human hand-off: the team owns the chat while the customer keeps talking
   // (12h of quiet hands it back) or until they type "bot".

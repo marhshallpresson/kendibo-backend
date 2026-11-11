@@ -397,6 +397,10 @@ export const requestService = {
  *  link when the job has a fixed price). Never throws into the accept path. */
 async function notifyWhatsappCustomer(requestId: string, bookingId: string | null): Promise<void> {
   try {
+    if (bookingId) {
+      const { proAssignedUpdate } = await import('../job-engine/schedule-updates.js');
+      await proAssignedUpdate(bookingId).catch(() => null);
+    }
     const { notifyRequestAccepted } = await import('../whatsapp/whatsapp.bot.js');
     await notifyRequestAccepted(requestId, bookingId);
     // Open the masked client <-> vendor chat through Kendibo.

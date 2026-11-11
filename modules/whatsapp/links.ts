@@ -4,7 +4,7 @@
 // bound to one WhatsApp user + one job draft + one purpose, with an expiry.
 import crypto from 'node:crypto';
 
-export type LinkPurpose = 'loc' | 'vendors' | 'pay' | 'verify' | 'email';
+export type LinkPurpose = 'loc' | 'vendors' | 'pay' | 'verify' | 'email' | 'invoice';
 export interface LinkClaims { w: string; d: string; p: LinkPurpose; exp: number }
 
 const secret = () => process.env.WHATSAPP_LINK_SECRET || process.env.JWT_ACCESS_SECRET || 'dev-wa-links-INSECURE';
@@ -44,3 +44,5 @@ export const idCheckLink = (waId: string, userId: string) => `${webBase()}/w/ver
 export const termsLink = () => `${webBase()}/w/terms`;
 /** Email confirmation link (d = user id). The email is attached only once this is opened. */
 export const emailConfirmLink = (waId: string, userId: string) => `${webBase()}/w/confirm-email?t=${encodeURIComponent(signLink({ w: waId, d: userId, p: 'email' }, 24 * 3600))}`;
+/** Printable invoice / receipt page (w = customer user id, d = invoice id). Long-lived: people keep receipts. */
+export const invoiceLink = (userId: string, invoiceId: string) => `${webBase()}/w/invoice/${encodeURIComponent(signLink({ w: userId, d: invoiceId, p: 'invoice' }, 365 * 86_400))}`;
