@@ -56,6 +56,7 @@ import { registerVendorRoutes, VENDOR_ROUTE_POLICY } from './vendor.routes.js';
 import { registerAdminOpsRoutes, ADMIN_OPS_POLICY } from './admin-ops.routes.js';
 import { registerEvidenceRoutes } from './evidence.routes.js';
 import { registerEmailRoutes, EMAIL_ROUTE_POLICY } from './email.routes.js';
+import { registerOnboardingRoutes } from './onboarding.routes.js';
 import { installAdminAlerts } from '../../../modules/notifications/admin-alerts.service.js';
 import { startLifecycleSweeper } from '../../../modules/notifications/lifecycle.service.js';
 import { emit } from '../../../packages/observability/emit.js';
@@ -84,6 +85,15 @@ const app = Fastify({
   logger: { stream: logStream, serializers: { req: safeRequestLog } },
   genReqId: () => `req_${Date.now().toString(36)}${Math.floor(Math.random() * 1e6)}`,
   trustProxy: PROD, // Pxxl edge terminates TLS ahead of the container
+});
+// Clients (the app's fetch helper among them) send `Content-Type: application/json`
+// on body-less POSTs such as "start provider onboarding" and "log out everywhere".
+// Fastify rejects an empty JSON body with 400, which silently blocked onboarding;
+// treat a zero-length JSON request as having no body instead.
+app.addHook('onRequest', async (req) => {
+  if (req.headers['content-length'] === '0' && /application\/json/i.test(String(req.headers['content-type'] ?? ''))) {
+    delete req.headers['content-type'];
+  }
 });
 // Meta posts Facebook data-deletion / deauthorize callbacks as form bodies.
 app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string', bodyLimit: 16_384 }, (_req, body, done) => {
@@ -3242,6 +3252,7 @@ if (process.env.NODE_ENV !== 'test') { startCompletionSweeper(); startReminderSw
 registerAdminOpsRoutes(app, { authed: authed as never, fail: fail as never });
 registerEvidenceRoutes(app, { fail: fail as never, bookingParty: bookingParty as never, adminActor: adminActor as never });
 registerEmailRoutes(app, { authed: authed as never, fail: fail as never });
+registerOnboardingRoutes(app, { authed: authed as never, fail: fail as never });
 installAdminAlerts();
 if (process.env.NODE_ENV !== 'test') startLifecycleSweeper();
 configureWhatsappBot({ createCheckout: (input) => payments.createCheckout(input) });
