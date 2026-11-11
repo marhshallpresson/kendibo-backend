@@ -1,30 +1,32 @@
-// Migrate the LIVE database (Pxxl managed Postgres) through infra/postgres/*.sql
-// in order. Idempotent: every object uses IF NOT EXISTS / conditional ADD COLUMN.
-// Usage: npm run db:migrate  (requires DATABASE_URL)
+// Same tracked runner as scripts/migrate.js, run straight from source with tsx
+// (no build needed): npm run db:migrate -- [--dry-run] [--baseline=049]
+// Each file runs once per database; see packages/database/migrate.ts.
 import 'dotenv/config';
-import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { Pool } from 'pg';
-
-const DIR = join(process.cwd(), 'infra', 'postgres');
+import pg from 'pg';
+import { runMigrations } from '../packages/database/migrate.js';
 
 async function main(): Promise<void> {
-  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
-  const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-  const files = readdirSync(DIR).filter((f) => f.endsWith('.sql')).sort();
-  for (const f of files) {
-    const sql = readFileSync(join(DIR, f), 'utf-8');
-    try {
-      await pool.query(sql);
-      console.log(`[migrate] ${f} OK`);
-    } catch (err) {
-      console.log(`[migrate] ${f} FAILED: ${(err as Error).message.split('\n')[0]}`);
-      await pool.end();
-      process.exitCode = 1;
-      return;
-    }
+  const url = process.env.DATABASE_URL;
+  if (!url) throw new Error('DATABASE_URL is required');
+  const arg = (name: string) => process.argv.find((a) => a.startsWith(`--${name}=`))?.split('=')[1];
+  const local = /[?&]host=\//.test(url) || /@(localhost|127\.0\.0\.1)[:/]/.test(url) || process.env.DATABASE_SSL === 'false';
+  const client = new pg.Client({ connectionString: url, ssl: local ? false : { rejectUnauthorized: false } });
+  await client.connect();
+  try {
+    await client.query('SELECT pg_advisory_lock($1)', [74119510]);
+    const gis = (await client.query(`SELECT 1 FROM pg_available_extensions WHERE name='postgis'`)).rows;
+    const r = await runMigrations(client, {
+      dir: join(process.cwd(), 'infra', 'postgres'),
+      baselineThrough: arg('baseline') || process.env.MIGRATE_BASELINE_THROUGH || undefined,
+      dryRun: process.argv.includes('--dry-run'),
+      transform: (sql) => (gis.length ? sql : sql.replace(/^CREATE EXTENSION IF NOT EXISTS postgis;\s*$/gim, '')),
+      log: (line) => console.log(line),
+    });
+    console.log(`[migrate] OK (${r.applied.length} applied, ${r.baselined.length} baselined, ${r.alreadyApplied} already applied)`);
+  } finally {
+    await client.query('SELECT pg_advisory_unlock($1)', [74119510]).catch(() => undefined);
+    await client.end();
   }
-  await pool.end();
-  console.log('[migrate] done');
 }
-void main();
+main().catch((err) => { console.error('[migrate] FAILED:', (err as Error).message); process.exitCode = 1; });

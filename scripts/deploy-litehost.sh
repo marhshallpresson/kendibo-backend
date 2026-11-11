@@ -29,7 +29,7 @@ for i in 1 2 3 4 5; do
 done
 echo "Uploaded $APP $SHA ($SIZE bytes)"
 
-$SSH "$HOST" APP="$APP" SHA="$SHA" sh -s <<'REMOTE'
+$SSH "$HOST" APP="$APP" SHA="$SHA" BASELINE="${LITEHOST_MIGRATE_BASELINE:-}" sh -s <<'REMOTE'
 set -eu
 ROOT="$HOME/apps/$APP"; R="$ROOT/releases/$SHA"; PREV="$(readlink -f "$ROOT/current" 2>/dev/null || true)"
 rm -rf "$R"; mkdir -p "$R"; tar xzf "$HOME/backups/kendibo/$APP-$SHA.tgz" -C "$R"
@@ -48,7 +48,16 @@ else
 fi
 npm run build >/dev/null
 [ -f dist/apps/api/src/main.js ] || { echo "Build failed; $PREV keeps running." >&2; exit 1; }
-node scripts/migrate.js | grep -E "OK|FAILED|tables present"
+# Tracked migrations: only files not yet recorded for this database run. A
+# failure (or an untracked database) stops the deploy; the old release stays up.
+# One-time baseline for a database that predates tracking:
+#   LITEHOST_MIGRATE_BASELINE=049 sh scripts/deploy-litehost.sh
+if ! MIGRATE_BASELINE_THROUGH="$BASELINE" node scripts/migrate.js > .migrate.log 2>&1; then
+  grep -v "MODULE_TYPELESS\|Reparsing\|eliminate this\|trace-warnings" .migrate.log | tail -6 >&2
+  echo "Migration did not run cleanly; $PREV keeps running." >&2
+  exit 1
+fi
+grep -E "^\[migrate\] (applied|baselined|nothing|note|tables present|OK)" .migrate.log | tail -12
 
 app_pids() {
   # Node renames its process ("MainThread"), so match the command line, then the folder.
