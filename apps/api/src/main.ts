@@ -157,6 +157,9 @@ void app.register(cors, {
     return cb(null, false);
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+  // Browsers only let pages read these response headers when listed: the admin
+  // console shows the sign-in lockout countdown from Retry-After.
+  exposedHeaders: ['Retry-After'],
 });
 void app.register(multipart, {
   limits: { fileSize: 25 * 1024 * 1024, files: 1 },
