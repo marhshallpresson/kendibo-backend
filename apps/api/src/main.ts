@@ -59,6 +59,7 @@ import { registerEvidenceRoutes } from './evidence.routes.js';
 import { registerEmailRoutes, EMAIL_ROUTE_POLICY } from './email.routes.js';
 import { registerOnboardingRoutes } from './onboarding.routes.js';
 import { registerKycAdminRoutes } from './kyc-admin.routes.js';
+import { registerAdminConsoleRoutes, ADMIN_CONSOLE_POLICY, accountGate, refreshGate, adminLogin, sendLocked, clientIp, auditQuerySchema } from './admin-console.routes.js';
 import { installAdminAlerts } from '../../../modules/notifications/admin-alerts.service.js';
 import { startLifecycleSweeper } from '../../../modules/notifications/lifecycle.service.js';
 import { emit } from '../../../packages/observability/emit.js';
@@ -209,7 +210,7 @@ app.setErrorHandler((err, req, reply) => {
   if (status >= 500) req.log.error({ err }, 'request failed');
   return reply.code(status).send(err);
 });
-function authed(req: { headers: Record<string, string | undefined> }): { sub: string; permissions: string[] } | null {
+function authed(req: { headers: Record<string, string | undefined> }): { sub: string; permissions: string[]; sid?: string; iat?: number } | null {
   const h = req.headers.authorization;
   if (!h?.startsWith('Bearer ')) return null;
   return verifyAccess(h.slice(7));
@@ -306,7 +307,7 @@ const ROUTE_POLICY: Record<string, RoutePolicy> = {
 };
 // Vendor platform routes (storefronts, trade rules, WhatsApp) declare their own
 // public/permission entries next to the handlers; merged into the same gate.
-Object.assign(ROUTE_POLICY, VENDOR_ROUTE_POLICY, ADMIN_OPS_POLICY, EMAIL_ROUTE_POLICY);
+Object.assign(ROUTE_POLICY, VENDOR_ROUTE_POLICY, ADMIN_OPS_POLICY, EMAIL_ROUTE_POLICY, ADMIN_CONSOLE_POLICY);
 
 app.addHook('onRequest', async (req, reply) => {
   const url = req.routeOptions.url;
@@ -314,7 +315,14 @@ app.addHook('onRequest', async (req, reply) => {
   const method = req.method === 'HEAD' ? 'GET' : req.method;
   const policy = ROUTE_POLICY[`${method} ${url}`];
   if (policy === 'public') return;
-  if (policy || url.startsWith('/v1/admin/')) {
+  const claims = authed(req as never);
+  if (!claims) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  // Suspended accounts, revoked sessions, admin idle timeout and admin 2FA
+  // (admin-console.routes.ts) — one place for every authenticated route.
+  const adminRoute = Boolean(policy) || url.startsWith('/v1/admin/');
+  const blocked = await accountGate(claims, { url, adminRoute });
+  if (blocked) return fail(reply, blocked.code, blocked.message, blocked.status);
+  if (adminRoute) {
     const a = await adminActor(req as never);
     if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
     if ('denied' in a || (policy && !adminCan(a.role, policy))) return fail(reply, 'FORBIDDEN', 'Insufficient permissions', 403);
@@ -447,8 +455,28 @@ app.post('/v1/auth/otp/verify', { config: { rateLimit: { max: 10, timeWindow: '1
   if (!parsed.success) return fail(reply, 'BAD_REQUEST', 'Enter a valid verification code and identity.', 400);
   const { channel, identity, code, device, name, role } = parsed.data;
   const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip;
-  const s = await identityService.verifyOtp(channel, identity, code, { ...device, ip, name, role });
-  if (!s) return { error: { code: 'BAD_OTP', message: 'Invalid or expired code', retryable: false } };
+  const ua = req.headers['user-agent'] ? String(req.headers['user-agent']) : undefined;
+  // Admin seats: 5 failures / 15 min per account and per IP lock sign-in for 15 min.
+  const adminId = await adminLogin.target(channel, identity).catch(() => null);
+  const loginCtx = { ip: clientIp(req as never), ua: ua ?? null };
+  if (adminId) {
+    const retry = await adminLogin.retryAfter(adminId, loginCtx.ip);
+    if (retry > 0) { await adminLogin.locked(adminId, retry, loginCtx); return sendLocked(reply, fail as never, retry); }
+  }
+  let s;
+  try { s = await identityService.verifyOtp(channel, identity, code, { ...device, ip, ua, name, role }); }
+  catch (e) {
+    if ((e as Error).message === 'ACCOUNT_SUSPENDED') return fail(reply, 'ACCOUNT_SUSPENDED', 'This account is suspended. Contact Kendibo support.', 403);
+    throw e;
+  }
+  if (!s) {
+    if (adminId) {
+      const locked = await adminLogin.failed(adminId, channel === 'phone' ? 'sms_otp' : 'email_otp', loginCtx);
+      if (locked > 0) return sendLocked(reply, fail as never, locked);
+    }
+    return { error: { code: 'BAD_OTP', message: 'Invalid or expired code', retryable: false } };
+  }
+  if (adminId) await adminLogin.succeeded(adminId, s, channel === 'phone' ? 'sms_otp' : 'email_otp', loginCtx);
   observability.track('auth.verified', { channel });
   return { data: s };
 });
@@ -494,11 +522,18 @@ app.post('/v1/auth/google', async (req, reply) => {
   if (!idToken) return fail(reply, 'GOOGLE_REJECTED', 'Google sign-in failed. Try again.', 401);
   try {
     const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip;
-    const s = await identityService.googleVerify(idToken, { ...device, ip });
+    const ua = req.headers['user-agent'] ? String(req.headers['user-agent']) : undefined;
+    const s = await identityService.googleVerify(idToken, { ...device, ip, ua });
+    if ('user' in s && isAdminRole(s.user.role)) await adminLogin.succeeded(s.user.id, s, 'google', { ip: clientIp(req as never), ua: ua ?? null });
+    else if ('twoFactorRequired' in s) {
+      const ch = await q<{ user_id: string }>(`SELECT user_id FROM identity.admin_login_challenge WHERE id=$1`, [s.challengeId]);
+      if (ch[0]) await adminLogin.succeeded(String(ch[0].user_id), s, 'google', { ip: clientIp(req as never), ua: ua ?? null });
+    }
     observability.track('auth.google_verified', { isNew: s.isNew });
     return { data: s };
   } catch (e: unknown) {
     const code = String((e as Error).message);
+    if (code === 'ACCOUNT_SUSPENDED') return fail(reply, code, 'This account is suspended. Contact Kendibo support.', 403);
     if (['BAD_GOOGLE_TOKEN', 'BAD_GOOGLE_AUDIENCE', 'GOOGLE_TOKEN_EXPIRED', 'GOOGLE_UNVERIFIED'].includes(code)) {
       return fail(reply, 'GOOGLE_REJECTED', 'Google sign-in failed. Try again.', 401);
     }
@@ -522,6 +557,7 @@ app.post('/v1/auth/facebook', async (req, reply) => {
     return { data: s };
   } catch (e: unknown) {
     const code = String((e as Error).message);
+    if (code === 'ACCOUNT_SUSPENDED') return fail(reply, code, 'This account is suspended. Contact Kendibo support.', 403);
     if (code === 'FACEBOOK_NOT_CONFIGURED') return fail(reply, code, 'Facebook sign-in is not set up yet. Use your phone number instead.', 503);
     if (['BAD_FACEBOOK_TOKEN', 'BAD_FACEBOOK_APP', 'FACEBOOK_TOKEN_EXPIRED'].includes(code)) return fail(reply, 'FACEBOOK_REJECTED', 'Facebook sign-in failed. Try again.', 401);
     return fail(reply, 'FACEBOOK_FAILED', 'Facebook sign-in is unavailable right now. Try your phone number instead.', 502, true);
@@ -568,8 +604,10 @@ app.post('/v1/auth/role', async (req, reply) => {
   if (current !== target) await q(`UPDATE identity.users SET role=$2 WHERE id=$1`, [a.sub, target]);
   return { data: { role: target } };
 });
-app.post('/v1/auth/refresh', async (req) => {
+app.post('/v1/auth/refresh', async (req, reply) => {
   const { refresh } = z.object({ refresh: z.string() }).parse(req.body);
+  const blocked = await refreshGate(refresh);
+  if (blocked) return fail(reply, blocked.code, blocked.message, blocked.status);
   const r = await identityService.refresh(refresh);
   if (!r) return { error: { code: 'REFRESH_REJECTED', message: 'Reuse detected or expired', retryable: false } };
   return { data: r };
@@ -2281,13 +2319,7 @@ app.patch('/v1/me', async (req, reply) => {
 app.delete('/v1/me', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   // Customer bookings, plus jobs assigned to this user as a provider.
-  const open = await q(
-    `SELECT 1 FROM booking.booking b
-      WHERE (b.user_id=$1 OR b.id::text IN (SELECT da.job_id FROM dispatch.assignment da JOIN provider.provider p ON p.id=da.provider_id
-                                              WHERE p.user_id=$1 AND da.status='accepted'))
-        AND upper(b.status) NOT IN ('COMPLETED','CANCELLED','CANCELED','REFUNDED','CLOSED','DECLINED','EXPIRED') LIMIT 1`, [a.sub],
-  );
-  if (open[0]) return fail(reply, 'OPEN_BOOKINGS', 'Finish or cancel your open bookings before deleting your account.', 409);
+  if (await identityService.hasOpenBookings(a.sub)) return fail(reply, 'OPEN_BOOKINGS', 'Finish or cancel your open bookings before deleting your account.', 409);
   const balance = await walletService.getBalance(a.sub).catch(() => 0);
   if (balance > 0) return fail(reply, 'WALLET_NOT_EMPTY', 'Withdraw or use your wallet balance before deleting your account. Contact support if you need help.', 409);
   return { data: await identityService.eraseAccount(a.sub) };
@@ -3196,7 +3228,7 @@ app.get('/v1/admin/audit', async (req, reply) => {
   const a = await adminActor(req as never);
   if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   if ('denied' in a || !adminCan(a.role, 'audit:view')) return fail(reply, 'FORBIDDEN', 'Audit view access required', 403);
-  return { data: await auditService.list() };
+  return { data: await auditService.query(auditQuerySchema.parse(req.query ?? {})) };
 });
 app.post('/v1/admin/flags', async (req, reply) => {
   const a = await adminActor(req as never);
@@ -3311,6 +3343,7 @@ registerEvidenceRoutes(app, { fail: fail as never, bookingParty: bookingParty as
 registerEmailRoutes(app, { authed: authed as never, fail: fail as never });
 registerOnboardingRoutes(app, { authed: authed as never, fail: fail as never });
 registerKycAdminRoutes(app, { fail: fail as never, adminActor: adminActor as never });
+registerAdminConsoleRoutes(app, { fail: fail as never, adminActor: adminActor as never });
 installAdminAlerts();
 if (process.env.NODE_ENV !== 'test') startLifecycleSweeper();
 Object.assign(ROUTE_POLICY, INVOICE_ROUTE_POLICY); registerInvoiceRoutes(app, { fail: fail as never, bookingParty: bookingParty as never, providerActor });

@@ -43,8 +43,22 @@ export async function verifyOtp(channel: string, identity: string, code: string)
   return true;
 }
 
-export function signAccess(userId: string, permissions: string[]): string {
-  return jwt.sign({ sub: userId, permissions }, ACCESS_SECRET, { expiresIn: '15m' });
+/**
+ * sid = the refresh token's device id. It ties admin requests to a tracked
+ * session (identity.admin_session: idle timeout, 2FA) while access tokens stay
+ * stateless JWTs.
+ */
+export function signAccess(userId: string, permissions: string[], sid?: string): string {
+  // ts: issue time in ms, so a revocation can tell tokens apart within one second.
+  const ts = Date.now();
+  return jwt.sign(sid ? { sub: userId, permissions, sid, ts } : { sub: userId, permissions, ts }, ACCESS_SECRET, { expiresIn: '15m' });
+}
+/** Verified subject of a refresh token (no DB, no rotation) — for pre-rotation account checks. */
+export function refreshSubject(token: string): { sub: string; deviceId: string } | null {
+  try {
+    const p = jwt.verify(token, REFRESH_SECRET, { algorithms: ['HS256'] }) as { sub: string; deviceId: string };
+    return p?.sub ? { sub: String(p.sub), deviceId: String(p.deviceId ?? '') } : null;
+  } catch { return null; }
 }
 export async function signRefresh(userId: string, deviceId: string): Promise<{ token: string; id: string }> {
   const id = crypto.randomUUID();
@@ -88,10 +102,10 @@ async function rotateRefreshOnce(token: string, tokenHash: string): Promise<{ ac
     if (!flipped[0]) return null;
     // Re-derive grants from the DB role so a refresh keeps (or loses) admin
     // rights exactly as the role currently says — never an empty grant list.
-    const roleRows = await q<{ role: string }>(`SELECT role FROM identity.users WHERE id=$1`, [p.sub]);
-    if (!roleRows[0]) return null;
+    const roleRows = await q<{ role: string; status: string | null }>(`SELECT role, status FROM identity.users WHERE id=$1`, [p.sub]);
+    if (!roleRows[0] || String(roleRows[0].status ?? '') === 'suspended') return null;
     const role = String(roleRows[0].role ?? 'CUSTOMER').toUpperCase();
-    const access = signAccess(p.sub, isAdminRole(role) ? [...rolePerms(role)] : ['booking:create', 'booking:view:self', 'booking:cancel']);
+    const access = signAccess(p.sub, isAdminRole(role) ? [...rolePerms(role)] : ['booking:create', 'booking:view:self', 'booking:cancel'], p.deviceId);
     const next = await signRefresh(p.sub, p.deviceId);
     const result = { access, refresh: next.token };
     recentRotations.set(tokenHash, { userId: p.sub, result, expiresAt: Date.now() + CONCURRENT_REFRESH_GRACE_MS });
@@ -102,9 +116,10 @@ export async function revokeAll(userId: string) {
   for (const [k, v] of recentRotations) if (v.userId === userId) recentRotations.delete(k);
   await q(`DELETE FROM identity.refresh_token WHERE user_id=$1`, [userId]);
 }
-export function verifyAccess(token: string): { sub: string; permissions: string[] } | null {
+export type AccessClaims = { sub: string; permissions: string[]; sid?: string; iat?: number; ts?: number };
+export function verifyAccess(token: string): AccessClaims | null {
   // Same secret signAccess used (incl. the dev fallback) and HS256 only, so a
   // token can never pick its own algorithm.
-  try { return jwt.verify(token, ACCESS_SECRET, { algorithms: ['HS256'] }) as { sub: string; permissions: string[] }; }
+  try { return jwt.verify(token, ACCESS_SECRET, { algorithms: ['HS256'] }) as AccessClaims; }
   catch { return null; }
 }
