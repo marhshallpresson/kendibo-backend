@@ -117,6 +117,10 @@ describe('Paga customer account numbers (Subsidiary Accounts)', () => {
     assert.equal(create.body.firstName, 'ADA');
     assert.equal(create.body.lastName, 'CHIOMA OBI', 'legal name from KYC');
     assert.equal(create.body.autoSweep, undefined, 'ledger-backed: the money stays in the customer account');
+    assert.equal(create.body.fundingTransactionLimit, 500000, 'sandbox refuses creation without limits');
+    assert.equal(create.body.fundingDailyLimit, 2000000);
+    assert.equal(create.body.status, 'ACTIVE');
+    assert.match(create.body.phoneNumber, /^0\d{10}$/, 'local phone format');
     assert.equal(create.headers.hash, sha512(`${create.body.referenceNumber}${create.body.accountReference}${create.body.callbackUrl}${HK}`));
     assert.equal(create.body.callbackUrl, 'https://api.kendibo.ng/webhooks/paga/subsidiary');
     const again = await ensureVirtualAccount(u);

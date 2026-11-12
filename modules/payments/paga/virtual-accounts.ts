@@ -50,6 +50,8 @@ const newRef = (prefix: string) => `${prefix}${Date.now().toString(36)}${crypto.
 const stableRef = (prefix: string, seed: string) => `${prefix}${crypto.createHash('sha256').update(seed).digest('hex').slice(0, 26)}`;
 const maskAcct = (n?: string | null) => (n ? `${'*'.repeat(Math.max(0, String(n).length - 4))}${String(n).slice(-4)}` : null);
 const okCode = (c: unknown) => String(c) === '0';
+/** 2348012345678 / +234 801 234 5678 → 08012345678 (Paga's examples use the local form). */
+export const localPhone = (p: string) => { const d = String(p).replace(/\D/g, ''); return d.startsWith('234') && d.length === 13 ? `0${d.slice(3)}` : d; };
 
 // ---------- eligibility ----------
 
@@ -153,8 +155,12 @@ async function finishCreate(row: VaRow, profile: NonNullable<Eligibility['profil
     accountName: profile.accountName,
     firstName: profile.firstName,
     lastName: profile.lastName,
-    ...(profile.phone ? { phoneNumber: profile.phone } : {}),
+    ...(profile.phone ? { phoneNumber: localPhone(profile.phone) } : {}),
     ...(profile.email ? { email: profile.email } : {}),
+    // The sandbox refuses creation without both limits (code 109), although the docs mark them optional.
+    fundingTransactionLimit: Number(process.env.PAGA_VA_TXN_LIMIT_NAIRA || 500_000),
+    fundingDailyLimit: Number(process.env.PAGA_VA_DAILY_LIMIT_NAIRA || 2_000_000),
+    status: 'ACTIVE',
     callbackUrl: cb,
   };
   // Hash: referenceNumber + accountReference + iifiNumber + autoSweep.bankPublicId + autoSweep.destination + autoSweep.accountNumber + callbackUrl

@@ -68,7 +68,8 @@ async function main() {
     try {
       const r = await client.collectRest('POST', '/subsidiary-accounts', {
         referenceNumber: ref, accountReference, accountName: 'Kendibo Smoke Test', firstName: 'Smoke', lastName: 'Test',
-        email: 'smoke-test@kendibo.ng',
+        email: 'smoke-test@kendibo.ng', phoneNumber: '08012345678',
+        fundingTransactionLimit: 500000, fundingDailyLimit: 2000000, status: 'ACTIVE', // sandbox requires the limits
       }, [ref, accountReference, '', '', '', '', '']);
       out('  create', { statusCode: r?.statusCode, statusMessage: r?.statusMessage, accountNumber: r?.accountNumber, accountReference });
       const b = `kb${Date.now()}`;
