@@ -50,6 +50,7 @@ import { q } from '../../../packages/database/db.js';
 import { maps, getMapsConfig, setMapsConfig, MAPS_PROVIDER_NAMES, type MapsProviderName } from '../../../modules/geo/maps.port.js';
 import { requestService } from '../../../modules/requests/request.service.js';
 import { vendorEligibilityService } from '../../../modules/vendors/eligibility.service.js';
+import { categoriesForSkills, providerSkillCategories } from '../../../modules/vendors/skill-categories.js';
 import { vendorFinanceService } from '../../../modules/vendors/vendor-finance.service.js';
 import { configureWhatsappBot } from '../../../modules/whatsapp/whatsapp.bot.js';
 import { registerVendorRoutes, VENDOR_ROUTE_POLICY } from './vendor.routes.js';
@@ -260,6 +261,7 @@ const ROUTE_POLICY: Record<string, RoutePolicy> = {
   'GET /v1/geo/geocode': 'public',
   'GET /v1/geo/reverse-geocode': 'public',
   'GET /v1/categories': 'public',
+  'GET /v1/categories/grouped': 'public',
   'GET /v1/services': 'public',
   'GET /v1/services/:id': 'public',
   'GET /v1/services/:id/availability': 'public',
@@ -662,7 +664,12 @@ app.get('/v1/properties/:id/assets', async (req, reply) => {
 });
 
 // ---------- catalog / pricing ----------
-app.get('/v1/categories', async () => ({ data: await catalogService.categories() }));
+const categoryKind = (req: { query: unknown }) => {
+  const k = (req.query as { kind?: string } | undefined)?.kind;
+  return k === 'product' || k === 'service' ? k : undefined;
+};
+app.get('/v1/categories', async (req) => ({ data: await catalogService.categories({ kind: categoryKind(req) }) }));
+app.get('/v1/categories/grouped', async (req) => ({ data: await catalogService.grouped({ kind: categoryKind(req) }) }));
 app.get('/v1/services', async (req) => {
   const q = req.query as { category?: string; q?: string };
   if (q.q) return { data: await catalogService.search(q.q) };
@@ -1530,9 +1537,8 @@ app.post('/v1/provider/skills', async (req, reply) => {
   const out = await providerService.addSkill(me.id, skill);
   // Adding a service enrolls the vendor in its trade so the app can show
   // exactly what that trade still needs (licence, tier, …).
-  // A skill is a service id or a skill tag (catalog.service.requires_skill).
-  const cat = await q<{ category_id: string }>(`SELECT DISTINCT category_id FROM catalog.service WHERE id=$1 OR requires_skill=$1`, [skill]).catch(() => []);
-  if (cat[0]) await vendorEligibilityService.enroll(me.id, String(cat[0].category_id)).catch((e) => observability.captureException(e));
+  // A skill is a category id, a service id or a skill tag (catalog.service.requires_skill).
+  for (const c of await categoriesForSkills([skill])) await vendorEligibilityService.enroll(me.id, c).catch((e) => observability.captureException(e));
   return { data: out };
 });
 app.post('/v1/provider/online', async (req, reply) => {
@@ -2953,10 +2959,7 @@ app.post('/v1/admin/providers/:id/approve', async (req, reply) => {
   const level = await verificationService.set(id, 'verified');
   // Approval changes what the vendor may do: enroll the trades of their skills
   // and re-evaluate every enrollment against its category rules.
-  const cats = await q<{ category_id: string }>(
-    `SELECT DISTINCT s.category_id FROM provider.skill k JOIN catalog.service s ON s.id = COALESCE(k.skill_tag, k.service_id) OR s.requires_skill = COALESCE(k.skill_tag, k.service_id) WHERE k.provider_id=$1`, [id],
-  ).catch(() => []);
-  for (const c of cats) await vendorEligibilityService.enroll(id, String(c.category_id)).catch((e) => observability.captureException(e));
+  for (const c of await providerSkillCategories(id)) await vendorEligibilityService.enroll(id, c).catch((e) => observability.captureException(e));
   await vendorEligibilityService.refreshAll(id).catch((e) => observability.captureException(e));
   return { data: level };
 });

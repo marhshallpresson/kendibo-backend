@@ -11,7 +11,7 @@ describe('schema (PRD Appendix B, local pg-mem)', () => {
     const count = (t: string) => (db.public.query(`SELECT count(*) c FROM ${t}`) as unknown as { rows: { c: number }[] }).rows[0].c;
     assert.equal(count('geo.city'), 3);
     assert.equal(count('geo.zone'), 6);
-    assert.equal(count('catalog.category'), 8);
+    assert.ok(count('catalog.category') >= 66, 'full catalogue (58 landing categories + products) is seeded');
     assert.equal(count('catalog.service'), 5);
     assert.equal(count('ledger.account'), 12);
     assert.equal(count('configuration.flag'), 10);

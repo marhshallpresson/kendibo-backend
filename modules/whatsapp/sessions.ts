@@ -15,9 +15,18 @@ const BOOKING_CLOSED = ['COMPLETED', 'CANCELLED', 'REFUNDED', 'CLOSED'];
 /** A tag looks like AC-4821: 2 to 5 letters, a dash, 4 digits. */
 export const TAG_RE = /^([A-Za-z]{2,5})-(\d{4})$/;
 
+/**
+ * Tag letters for a category. The 8 original trades keep their familiar
+ * prefixes (AC, CLN, PLB, …); any other id is derived from its words:
+ * 'borehole' -> BOR, 'solar-inverter' -> SOI, 'water-tank-cleaning' -> WATC.
+ */
 export function tagPrefix(categoryId: string | null): string {
   if (!categoryId) return 'JOB';
-  return PREFIX[categoryId] ?? (categoryId.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 4) || 'JOB');
+  if (PREFIX[categoryId]) return PREFIX[categoryId];
+  const words = categoryId.toUpperCase().replace(/^PROD[-_]/, '').split(/[^A-Z]+/).filter(Boolean);
+  if (!words.length) return 'JOB';
+  const out = words.length === 1 ? words[0].slice(0, 3) : (words[0].slice(0, 2) + words.slice(1).map((w) => w[0]).join('')).slice(0, 5);
+  return out.length >= 2 ? out : 'JOB';
 }
 
 export interface OpenSession {
@@ -49,7 +58,7 @@ export async function setActiveTag(userId: string, tag: string): Promise<void> {
 /** Open requests (not cancelled, and not finished), newest first. */
 export async function openSessions(userId: string): Promise<OpenSession[]> {
   const rows = await q<Record<string, unknown>>(
-    `SELECT r.id, r.session_tag, r.title, r.status, r.category_id, c.name AS category_name, r.booking_id, b.status AS booking_status,
+    `SELECT r.id, r.session_tag, r.title, r.status, r.category_id, COALESCE(c.short_name, c.name) AS category_name, r.booking_id, b.status AS booking_status,
             r.scheduled_date, r.created_at, p.business_name AS pro
        FROM booking.service_request r
        LEFT JOIN catalog.category c ON c.id = r.category_id

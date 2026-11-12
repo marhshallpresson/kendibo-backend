@@ -136,7 +136,7 @@ async function runTool(name: string, input: Record<string, unknown>, ctx: Ctx): 
     case 'get_services': {
       const cat = typeof input.category_id === 'string' ? input.category_id : null;
       if (!cat) {
-        const rows = await q<{ id: string; name: string }>(`SELECT id, name FROM catalog.category WHERE active ORDER BY sort_order LIMIT 30`);
+        const rows = await q<{ id: string; name: string }>(`SELECT id, name FROM catalog.category WHERE active AND kind = 'service' ORDER BY sort_order LIMIT 100`);
         return JSON.stringify({ trades: rows.map((r) => ({ id: r.id, name: r.name })) });
       }
       const rows = await q<{ id: string; name: string; booking_type: string; base_price_kobo: string }>(
