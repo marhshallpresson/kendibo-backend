@@ -15,6 +15,8 @@ import { emit } from '../../packages/observability/emit.js';
 import { getSetting } from '../settings/settings.service.js';
 import { mediaService } from '../media/media.service.js';
 import { guardKycAdapter } from './kyc-cost.guard.js';
+import { isKycUnavailable, unavailableFromError, MANUAL_VERIFICATION, MANUAL_REVIEW_MESSAGE } from './kyc-availability.js';
+export { classifyKycResult, isKycUnavailable, MANUAL_VERIFICATION, MANUAL_REVIEW_MESSAGE } from './kyc-availability.js';
 
 export type KycStatus = 'PENDING' | 'UNDER_REVIEW' | 'VERIFIED' | 'REJECTED';
 export type KycSubject = 'provider' | 'user';
@@ -41,6 +43,8 @@ export interface KycCheckResult {
   companyName?: string;
   rcNumber?: string;
   raw?: Record<string, unknown>;
+  /** Provider-side outage (unconfigured, unfunded, quota, timeout, 5xx, thrown) — not a verdict. */
+  unavailable?: boolean;
 }
 
 export interface NameAlignmentInput {
@@ -266,7 +270,8 @@ class PremblyKycAdapter implements KycAdapter {
         return json;
       }
       if (json && (json.response_code || json.status === false || json.message || json.detail)) {
-        return json;
+        // Keep the HTTP status so interpret() can tell 402/429/5xx outages from verdicts.
+        return { ...json, __http_status: res.status };
       }
       lastStatus = res.status;
       if (res.status !== 404) break;
@@ -304,6 +309,10 @@ class PremblyKycAdapter implements KycAdapter {
     let reason = passed ? undefined : String(r.detail ?? r.message ?? `response_code=${code}`);
     if (code === '04' || /insufficient.*balance/i.test(reason ?? '')) {
       reason = 'PREMBLY_INSUFFICIENT_WALLET_BALANCE: Merchant Prembly wallet balance is depleted. Please top up your wallet at dashboard.prembly.com.';
+    }
+    const http = Number(r.__http_status ?? 0);
+    if (!passed && (http === 401 || http === 402 || http === 403 || http === 429 || http >= 500)) {
+      reason = `PREMBLY_HTTP_${http}: ${reason ?? ''}`.slice(0, 300);
     }
     return {
       passed,
@@ -692,7 +701,7 @@ async function recordCheck(
       tier,
       kind,
       res.provider,
-      res.passed ? 'passed' : 'failed',
+      res.passed ? 'passed' : res.unavailable ? 'unavailable' : 'failed',
       res.confidence ?? null,
       maskedInput ?? null,
       JSON.stringify({
@@ -740,8 +749,27 @@ export interface TierRunOutcome {
   faceVerified?: boolean;
   faceConfidence?: number;
   nameAlignment?: NameAlignmentResult;
-  checks: { tier: 1 | 2 | 3; kind: string; passed: boolean; reason?: string; confidence?: number }[];
+  checks: { tier: 1 | 2 | 3; kind: string; passed: boolean; reason?: string; confidence?: number; unavailable?: boolean }[];
+  /** First provider-side outage seen (unconfigured, unfunded, quota, timeout, thrown). */
+  unavailableReason?: string;
 }
+
+/** Masked inputs + document references kept with an application (never raw numbers). */
+export function maskedSubmission(input: TierRunInput) {
+  return {
+    nin: input.nin ? maskId(input.nin) : null,
+    bvn: input.bvn ? maskId(input.bvn) : null,
+    rcNumber: input.rcNumber ? normalizeCacNumber(input.rcNumber).formatted : null,
+    businessName: input.businessName ?? null,
+    selfieProvided: Boolean(input.selfieBase64) || (input.documents ?? []).some((d) => d.kind === 'selfie'),
+    documents: (input.documents ?? []).map((d) => ({ assetId: d.assetId, kind: d.kind })),
+  };
+}
+
+const parseJson = (v: unknown): unknown => {
+  if (typeof v !== 'string') return v ?? null;
+  try { return JSON.parse(v); } catch { return null; }
+};
 
 export const kycService = {
   verifyNameAlignment,
@@ -816,6 +844,22 @@ export const kycService = {
     // budget caps, cost ledger). An injected adapter (tests) is used as-is.
     const adapter = input.adapter ?? guardKycAdapter(selectKycAdapter(), subjectType, subjectId);
     const checks: TierRunOutcome['checks'] = [];
+    let unavailableReason: string | undefined;
+    // Every vendor call: a throw or a provider-side outage becomes an
+    // 'unavailable' result (saved for manual review), never a 500.
+    const safe = async (fn: () => Promise<KycCheckResult>): Promise<KycCheckResult> => {
+      let r: KycCheckResult;
+      try { r = await fn(); } catch (e) { r = unavailableFromError(e, adapter.name); }
+      if (!r.passed && isKycUnavailable(r)) r = { ...r, unavailable: true };
+      return r;
+    };
+    const note = (tier: 1 | 2 | 3, kind: string, r: KycCheckResult) => {
+      checks.push({
+        tier, kind, passed: r.passed, reason: r.reason, confidence: r.confidence,
+        ...(r.unavailable ? { unavailable: true } : {}),
+      });
+      if (r.unavailable && !unavailableReason) unavailableReason = r.reason || 'KYC_PROVIDER_UNAVAILABLE';
+    };
     let tierReached: 0 | 1 | 2 | 3 = 0;
     let ninMasked: string | undefined;
     let bvnMasked: string | undefined;
@@ -838,17 +882,19 @@ export const kycService = {
       const masked = maskId(input.nin);
       let r: KycCheckResult;
       if (selfieB64 && adapter.verifyNinWithFace) {
-        r = await adapter.verifyNinWithFace(input.nin.trim(), selfieB64);
+        const nin = input.nin.trim(); const selfie = selfieB64; const fn = adapter.verifyNinWithFace.bind(adapter);
+        r = await safe(() => fn(nin, selfie));
         await recordCheck(subjectType, subjectId, 1, 'nin_w_face', r, masked);
-        checks.push({ tier: 1, kind: 'nin_w_face', passed: r.passed, reason: r.reason, confidence: r.confidence });
+        note(1, 'nin_w_face', r);
         if (r.passed) {
           faceVerified = true;
           faceConfidence = r.confidence;
         }
       } else {
-        r = await adapter.verifyNin(input.nin.trim());
+        const nin = input.nin.trim();
+        r = await safe(() => adapter.verifyNin(nin));
         await recordCheck(subjectType, subjectId, 1, 'nin', r, masked);
-        checks.push({ tier: 1, kind: 'nin', passed: r.passed, reason: r.reason, confidence: r.confidence });
+        note(1, 'nin', r);
       }
       if (r.passed) {
         tier1Passed = true;
@@ -860,17 +906,19 @@ export const kycService = {
       const masked = maskId(input.bvn);
       let r: KycCheckResult;
       if (!faceVerified && selfieB64 && adapter.verifyBvnWithFace) {
-        r = await adapter.verifyBvnWithFace(input.bvn.trim(), selfieB64);
+        const bvn = input.bvn.trim(); const selfie = selfieB64; const fn = adapter.verifyBvnWithFace.bind(adapter);
+        r = await safe(() => fn(bvn, selfie));
         await recordCheck(subjectType, subjectId, 1, 'bvn_w_face', r, masked);
-        checks.push({ tier: 1, kind: 'bvn_w_face', passed: r.passed, reason: r.reason, confidence: r.confidence });
+        note(1, 'bvn_w_face', r);
         if (r.passed) {
           faceVerified = true;
           faceConfidence = r.confidence;
         }
       } else {
-        r = await adapter.verifyBvn(input.bvn.trim());
+        const bvn = input.bvn.trim();
+        r = await safe(() => adapter.verifyBvn(bvn));
         await recordCheck(subjectType, subjectId, 1, 'bvn', r, masked);
-        checks.push({ tier: 1, kind: 'bvn', passed: r.passed, reason: r.reason, confidence: r.confidence });
+        note(1, 'bvn', r);
       }
       if (r.passed) {
         tier1Passed = true;
@@ -880,7 +928,7 @@ export const kycService = {
       }
     }
     if (!tier1Passed) {
-      return { tierReached: 0, provider: adapter.name, ninMasked, bvnMasked, checks };
+      return { tierReached: 0, provider: adapter.name, ninMasked, bvnMasked, checks, unavailableReason };
     }
     tierReached = 1;
 
@@ -888,18 +936,20 @@ export const kycService = {
     let tier2Passed = false;
     if (idDoc && selfieB64) {
       const idB64 = await assetBase64(idDoc.assetId);
-      const r = await adapter.verifyDocAndFace(idB64 ?? '', selfieB64);
+      const selfie = selfieB64;
+      const r = await safe(() => adapter.verifyDocAndFace(idB64 ?? '', selfie));
       await recordCheck(subjectType, subjectId, 2, 'doc_face', r);
-      checks.push({ tier: 2, kind: 'doc_face', passed: r.passed, reason: r.reason, confidence: r.confidence });
+      note(2, 'doc_face', r);
       if (r.passed) {
         tier2Passed = true;
         faceVerified = true;
         faceConfidence = r.confidence ?? faceConfidence;
       }
     } else if (selfieB64 && adapter.verifyFaceLiveness) {
-      const r = await adapter.verifyFaceLiveness(selfieB64);
+      const selfie = selfieB64; const fn = adapter.verifyFaceLiveness.bind(adapter);
+      const r = await safe(() => fn(selfie));
       await recordCheck(subjectType, subjectId, 2, 'face_liveness', r);
-      checks.push({ tier: 2, kind: 'face_liveness', passed: r.passed, reason: r.reason, confidence: r.confidence });
+      note(2, 'face_liveness', r);
       if (r.passed) {
         tier2Passed = true;
         faceVerified = true;
@@ -916,9 +966,10 @@ export const kycService = {
     // ── Tier 3: Mandatory CAC Corporate Affairs Commission Verification ─────
     if (input.rcNumber) {
       const norm = normalizeCacNumber(input.rcNumber);
-      const r = await adapter.verifyCac(input.rcNumber.trim(), input.businessName);
+      const rc = input.rcNumber.trim();
+      const r = await safe(() => adapter.verifyCac(rc, input.businessName));
       await recordCheck(subjectType, subjectId, 3, 'cac', r, norm.formatted);
-      checks.push({ tier: 3, kind: 'cac', passed: r.passed, reason: r.reason });
+      note(3, 'cac', r);
       if (r.passed) {
         cacVerified = true;
         cacNumber = r.rcNumber ?? norm.formatted;
@@ -976,6 +1027,7 @@ export const kycService = {
       faceConfidence,
       nameAlignment,
       checks,
+      unavailableReason,
     };
   },
 
@@ -985,9 +1037,14 @@ export const kycService = {
     const aligned = outcome.nameAlignment ? outcome.nameAlignment.aligned : true;
     const autoVerify = outcome.tierReached >= minTier && aligned;
     const nextStatus: KycStatus = autoVerify ? 'VERIFIED' : 'UNDER_REVIEW';
-    const rejectionReason = !aligned && outcome.nameAlignment?.mismatchReason
+    // The identity provider could not answer: save for a human, not a rejection.
+    const manual = !autoVerify && Boolean(outcome.unavailableReason);
+    const rejectionReason = !manual && !aligned && outcome.nameAlignment?.mismatchReason
       ? outcome.nameAlignment.mismatchReason
       : null;
+    const prior = await q<{ kyc_pending_reason: string | null }>(
+      `SELECT kyc_pending_reason FROM provider.provider WHERE id = $1`, [providerId],
+    ).catch(() => []);
 
     await q(
       `UPDATE provider.provider
@@ -1008,6 +1065,7 @@ export const kycService = {
               kyc_reviewed_at = CASE WHEN $2 = 'VERIFIED' THEN now() ELSE kyc_reviewed_at END,
               kyc_reviewed_by = CASE WHEN $2 = 'VERIFIED' THEN 'auto:' || $4 ELSE kyc_reviewed_by END,
               kyc_rejection_reason = $15,
+              kyc_pending_reason = $16,
               status = CASE WHEN $2 = 'VERIFIED' THEN 'active' ELSE status END,
               verify_level = CASE WHEN $2 = 'VERIFIED' THEN 'verified' ELSE verify_level END
         WHERE id = $1`,
@@ -1027,6 +1085,7 @@ export const kycService = {
         aligned,
         outcome.nameAlignment?.score ?? 100,
         rejectionReason,
+        manual ? MANUAL_VERIFICATION : null,
       ],
     );
     emit(autoVerify ? 'kyc.auto_verified' : 'kyc.submitted', {
@@ -1035,7 +1094,14 @@ export const kycService = {
       provider: outcome.provider,
       cacVerified: outcome.cacVerified,
       nameAligned: aligned,
+      ...(manual ? { manualReview: true } : {}),
     });
+    if (manual && prior[0]?.kyc_pending_reason !== MANUAL_VERIFICATION) {
+      emit('kyc.manual_review_needed', {
+        subjectType: 'provider', subjectId: providerId, reason: outcome.unavailableReason,
+        applicationRef: new Date().toISOString(),
+      });
+    }
     return this.status(providerId);
   },
 
@@ -1051,15 +1117,22 @@ export const kycService = {
     const autoVerify = outcome.tierReached >= minCustomerTier && aligned;
     const nextStatus: KycStatus = autoVerify ? 'VERIFIED' : 'UNDER_REVIEW';
     const fastTrackMethod = outcome.faceVerified ? 'prembly_biometric_fast_track' : 'prembly_nin_bvn_instant';
+    // The identity provider could not answer: save for a human, not a rejection.
+    const manual = !autoVerify && Boolean(outcome.unavailableReason);
+    const pendingReason = manual ? MANUAL_VERIFICATION : null;
+    const submittedMasked = JSON.stringify(maskedSubmission(input));
+    const prior = await q<{ pending_reason: string | null }>(
+      `SELECT pending_reason FROM kyc.customer WHERE user_id = $1`, [userId],
+    ).catch(() => []);
 
     await q(
       `INSERT INTO kyc.customer
          (user_id, status, tier, provider, nin_masked, bvn_masked, verified_legal_name,
           face_verified, face_confidence, name_aligned, name_alignment_score, fast_track_method,
-          submitted_at, reviewed_at, reviewed_by)
+          submitted_at, reviewed_at, reviewed_by, pending_reason, submitted_masked)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(),
                CASE WHEN $2 = 'VERIFIED' THEN now() ELSE NULL END,
-               CASE WHEN $2 = 'VERIFIED' THEN 'auto:' || $4 ELSE NULL END)
+               CASE WHEN $2 = 'VERIFIED' THEN 'auto:' || $4 ELSE NULL END, $14, $15)
        ON CONFLICT (user_id) DO UPDATE
          SET status = $2,
              tier = GREATEST(kyc.customer.tier, $3),
@@ -1075,7 +1148,9 @@ export const kycService = {
              rejection_reason = $13,
              submitted_at = now(),
              reviewed_at = CASE WHEN $2 = 'VERIFIED' THEN now() ELSE kyc.customer.reviewed_at END,
-             reviewed_by = CASE WHEN $2 = 'VERIFIED' THEN 'auto:' || $4 ELSE kyc.customer.reviewed_by END`,
+             reviewed_by = CASE WHEN $2 = 'VERIFIED' THEN 'auto:' || $4 ELSE kyc.customer.reviewed_by END,
+             pending_reason = $14,
+             submitted_masked = $15`,
       [
         userId,
         nextStatus,
@@ -1089,7 +1164,9 @@ export const kycService = {
         aligned,
         outcome.nameAlignment?.score ?? 100,
         fastTrackMethod,
-        !aligned ? outcome.nameAlignment?.mismatchReason ?? null : null,
+        !aligned && !manual ? outcome.nameAlignment?.mismatchReason ?? null : null,
+        pendingReason,
+        submittedMasked,
       ],
     ).catch(async () => {
       // pg-mem fallback when ON CONFLICT DO UPDATE is unsupported
@@ -1098,14 +1175,16 @@ export const kycService = {
         await q(
           `INSERT INTO kyc.customer
              (user_id, status, tier, provider, nin_masked, bvn_masked, verified_legal_name,
-              face_verified, face_confidence, name_aligned, name_alignment_score, fast_track_method, submitted_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now())`,
+              face_verified, face_confidence, name_aligned, name_alignment_score, fast_track_method, submitted_at,
+              pending_reason, submitted_masked)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),$13,$14)`,
           [
             userId, nextStatus, outcome.tierReached, outcome.provider,
             outcome.ninMasked ?? null, outcome.bvnMasked ?? null,
             outcome.verifiedLegalName ?? submittedName ?? null,
             Boolean(outcome.faceVerified), outcome.faceConfidence ?? null,
             aligned, outcome.nameAlignment?.score ?? 100, fastTrackMethod,
+            pendingReason, submittedMasked,
           ],
         );
       } else {
@@ -1114,7 +1193,7 @@ export const kycService = {
               SET status=$2, tier=$3, provider=$4, nin_masked=COALESCE($5, nin_masked),
                   bvn_masked=COALESCE($6, bvn_masked), verified_legal_name=COALESCE($7, verified_legal_name),
                   face_verified=$8, face_confidence=$9, name_aligned=$10, name_alignment_score=$11,
-                  fast_track_method=$12, submitted_at=now()
+                  fast_track_method=$12, submitted_at=now(), pending_reason=$13, submitted_masked=$14
             WHERE user_id=$1`,
           [
             userId, nextStatus, outcome.tierReached, outcome.provider,
@@ -1122,6 +1201,7 @@ export const kycService = {
             outcome.verifiedLegalName ?? submittedName ?? null,
             Boolean(outcome.faceVerified), outcome.faceConfidence ?? null,
             aligned, outcome.nameAlignment?.score ?? 100, fastTrackMethod,
+            pendingReason, submittedMasked,
           ],
         );
       }
@@ -1131,7 +1211,14 @@ export const kycService = {
       tier: outcome.tierReached,
       provider: outcome.provider,
       faceVerified: outcome.faceVerified,
+      ...(manual ? { manualReview: true } : {}),
     });
+    if (manual && prior[0]?.pending_reason !== MANUAL_VERIFICATION) {
+      emit('kyc.manual_review_needed', {
+        subjectType: 'user', subjectId: userId, reason: outcome.unavailableReason,
+        applicationRef: new Date().toISOString(),
+      });
+    }
     return this.userStatus(userId);
   },
 
@@ -1139,7 +1226,7 @@ export const kycService = {
     const rows = await q<Record<string, unknown>>(
       `SELECT status, tier, provider, nin_masked, bvn_masked, verified_legal_name,
               face_verified, face_confidence, name_aligned, name_alignment_score,
-              fast_track_method, rejection_reason, submitted_at, reviewed_at
+              fast_track_method, rejection_reason, submitted_at, reviewed_at, pending_reason
          FROM kyc.customer WHERE user_id = $1`,
       [userId],
     );
@@ -1162,13 +1249,15 @@ export const kycService = {
       submittedAt: r?.submitted_at ? String(r.submitted_at) : null,
       reviewedAt: r?.reviewed_at ? String(r.reviewed_at) : null,
       documentCount: docs.length,
+      pendingReason: r?.pending_reason ? String(r.pending_reason) : null,
+      message: r?.pending_reason === MANUAL_VERIFICATION ? MANUAL_REVIEW_MESSAGE : null,
     };
   },
 
   async userApprove(userId: string, adminUserId: string): Promise<void> {
     await q(
       `UPDATE kyc.customer
-          SET status = 'VERIFIED', rejection_reason = NULL,
+          SET status = 'VERIFIED', rejection_reason = NULL, pending_reason = NULL,
               reviewed_at = now(), reviewed_by = $2
         WHERE user_id = $1`,
       [userId, adminUserId],
@@ -1179,7 +1268,7 @@ export const kycService = {
   async userReject(userId: string, reason: string, adminUserId: string): Promise<void> {
     await q(
       `UPDATE kyc.customer
-          SET status = 'REJECTED', rejection_reason = $2,
+          SET status = 'REJECTED', rejection_reason = $2, pending_reason = NULL,
               reviewed_at = now(), reviewed_by = $3
         WHERE user_id = $1`,
       [userId, reason, adminUserId],
@@ -1225,6 +1314,66 @@ export const kycService = {
     }));
   },
 
+  /**
+   * Applications waiting on manual verification because the identity provider
+   * was unavailable — oldest first. For the auto re-check job: retry these and
+   * clear pending_reason once a real verdict comes back.
+   */
+  async pendingManualReview(limit = 100) {
+    const n = Math.max(1, Math.min(500, Math.floor(Number(limit) || 100)));
+    const users = await q<Record<string, unknown>>(
+      `SELECT user_id, status, submitted_at, submitted_masked
+         FROM kyc.customer WHERE pending_reason = $1
+        ORDER BY submitted_at ASC NULLS LAST LIMIT ${n}`,
+      [MANUAL_VERIFICATION],
+    );
+    const providers = await q<Record<string, unknown>>(
+      `SELECT id, kyc_status, kyc_submitted_at
+         FROM provider.provider WHERE kyc_pending_reason = $1
+        ORDER BY kyc_submitted_at ASC NULLS LAST LIMIT ${n}`,
+      [MANUAL_VERIFICATION],
+    );
+    const rows = [
+      ...users.map((r) => ({
+        subjectType: 'user' as KycSubject, subjectId: String(r.user_id), status: String(r.status) as KycStatus,
+        pendingReason: MANUAL_VERIFICATION, submittedAt: r.submitted_at ? String(r.submitted_at) : null,
+        submittedMasked: parseJson(r.submitted_masked),
+      })),
+      ...providers.map((r) => ({
+        subjectType: 'provider' as KycSubject, subjectId: String(r.id), status: String(r.kyc_status) as KycStatus,
+        pendingReason: MANUAL_VERIFICATION, submittedAt: r.kyc_submitted_at ? String(r.kyc_submitted_at) : null,
+        submittedMasked: null as unknown,
+      })),
+    ];
+    rows.sort((a, b) => (a.submittedAt ? Date.parse(a.submittedAt) : 0) - (b.submittedAt ? Date.parse(b.submittedAt) : 0));
+    return rows.slice(0, n);
+  },
+
+  /** Admin queue: every UNDER_REVIEW customer and provider (optionally only one pending_reason). */
+  async reviewQueue(opts: { pendingReason?: string | null; limit?: number } = {}) {
+    const n = Math.max(1, Math.min(200, Math.floor(Number(opts.limit) || 100)));
+    const userWhere = opts.pendingReason ? `AND c.pending_reason = $2` : '';
+    const provWhere = opts.pendingReason ? `AND p.kyc_pending_reason = $2` : '';
+    const params = opts.pendingReason ? ['UNDER_REVIEW', opts.pendingReason] : ['UNDER_REVIEW'];
+    const users = await q<Record<string, unknown>>(
+      `SELECT c.user_id, c.status, c.tier, c.provider, c.nin_masked, c.bvn_masked, c.pending_reason,
+              c.submitted_masked, c.submitted_at, u.name, u.phone, u.email
+         FROM kyc.customer c JOIN identity.users u ON u.id = c.user_id
+        WHERE c.status = $1 ${userWhere}
+        ORDER BY c.submitted_at ASC NULLS LAST LIMIT ${n}`,
+      params,
+    );
+    const providers = await q<Record<string, unknown>>(
+      `SELECT p.id, p.user_id, p.kyc_status, p.kyc_tier, p.kyc_provider, p.nin_masked, p.bvn_masked,
+              p.cac_number, p.business_name, p.kyc_pending_reason, p.kyc_submitted_at, u.name, u.phone, u.email
+         FROM provider.provider p JOIN identity.users u ON u.id = p.user_id
+        WHERE p.kyc_status = $1 ${provWhere}
+        ORDER BY p.kyc_submitted_at ASC NULLS LAST LIMIT ${n}`,
+      params,
+    );
+    return { users, providers };
+  },
+
   /** Legacy untiered entry point — moves application into UNDER_REVIEW. */
   async submitApplication(providerId: string): Promise<{ providerId: string; status: KycStatus }> {
     await q(
@@ -1251,7 +1400,7 @@ export const kycService = {
               p.verified_legal_name, p.face_verified, p.face_confidence,
               p.name_aligned, p.name_alignment_score, p.account_name, p.bank_name,
               p.office_address, p.storefront_completed, p.onboarding_step,
-              p.kyc_rejection_reason, p.kyc_submitted_at, p.kyc_reviewed_at,
+              p.kyc_rejection_reason, p.kyc_submitted_at, p.kyc_reviewed_at, p.kyc_pending_reason,
               u.name AS user_name
          FROM provider.provider p
          LEFT JOIN identity.users u ON u.id = p.user_id
@@ -1285,6 +1434,8 @@ export const kycService = {
       submittedAt: r.kyc_submitted_at ? String(r.kyc_submitted_at) : null,
       reviewedAt: r.kyc_reviewed_at ? String(r.kyc_reviewed_at) : null,
       documentCount: docs.length,
+      pendingReason: r.kyc_pending_reason ? String(r.kyc_pending_reason) : null,
+      message: r.kyc_pending_reason === MANUAL_VERIFICATION ? MANUAL_REVIEW_MESSAGE : null,
     };
   },
 
@@ -1309,6 +1460,7 @@ export const kycService = {
       `UPDATE provider.provider
           SET kyc_status = 'VERIFIED',
               kyc_rejection_reason = NULL,
+              kyc_pending_reason = NULL,
               kyc_reviewed_at = now(),
               kyc_reviewed_by = $2
         WHERE id = $1`,
@@ -1322,6 +1474,7 @@ export const kycService = {
       `UPDATE provider.provider
           SET kyc_status = 'REJECTED',
               kyc_rejection_reason = $2,
+              kyc_pending_reason = NULL,
               kyc_reviewed_at = now(),
               kyc_reviewed_by = $3,
               status = 'onboarding',

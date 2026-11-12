@@ -18,6 +18,7 @@ import { q } from '../../packages/database/db.js';
 import { emit } from '../../packages/observability/emit.js';
 import { observability } from '../../packages/observability/watchup.adapter.js';
 import type { KycAdapter, KycCheckResult } from './kyc.service.js';
+import { isKycUnavailable, unavailableFromError } from './kyc-availability.js';
 
 type Kind = 'nin' | 'nin_face' | 'bvn' | 'bvn_face' | 'doc_face' | 'liveness' | 'cac' | 'bank';
 
@@ -47,7 +48,7 @@ async function readCache(kind: Kind, id: string): Promise<KycCheckResult | null>
 
 async function writeCache(kind: Kind, id: string, r: KycCheckResult) {
   // Cache passes long, definite "not found" briefly, and never transient errors.
-  const definiteFail = !r.passed && /NOT_FOUND|MISMATCH|INVALID/.test(String(r.reason ?? ''));
+  const definiteFail = !r.passed && !isKycUnavailable(r) && /NOT_FOUND|MISMATCH|INVALID/.test(String(r.reason ?? ''));
   if (!r.passed && !definiteFail) return;
   const days = r.passed ? num('KYC_CACHE_DAYS', 180) : 1;
   const hash = lookupHash(kind, id);
@@ -78,7 +79,8 @@ async function budgetBlock(kind: Kind): Promise<string | null> {
 async function attemptsToday(subjectType: string, subjectId: string, kind: Kind): Promise<number> {
   const since = new Date(Date.now() - 86_400_000).toISOString();
   const rows = await q<{ n: string }>(
-    `SELECT COUNT(*) AS n FROM kyc.verification_cost WHERE subject_type=$1 AND subject_id=$2 AND kind=$3 AND cached=FALSE AND created_at >= $4`,
+    // Provider-side outages ('unavailable:...') are not the applicant's attempts.
+    `SELECT COUNT(*) AS n FROM kyc.verification_cost WHERE subject_type=$1 AND subject_id=$2 AND kind=$3 AND cached=FALSE AND created_at >= $4 AND outcome NOT LIKE 'unavailable:%'`,
     [subjectType, subjectId, kind, since],
   ).catch(() => [{ n: '0' }]);
   return Number(rows[0]?.n ?? 0);
@@ -114,13 +116,18 @@ export function guardKycAdapter(inner: KycAdapter, subjectType: string, subjectI
       if (blocked) {
         emit('kyc.budget_blocked', { kind, reason: blocked });
         observability.captureMessage?.(`kyc.budget_blocked kind=${kind} reason=${blocked}`);
-        return { passed: false, provider: vendor, reason: blocked };
+        return { passed: false, provider: vendor, reason: blocked, unavailable: true };
       }
     }
-    const r = await call();
-    // Vendors bill for conclusive answers; a transport error is logged at 0.
-    const conclusive = r.passed || /NOT_FOUND|MISMATCH|INVALID|FACE/.test(String(r.reason ?? ''));
-    await logCost(vendor, kind, subjectType, subjectId, billable && conclusive ? unitCost(kind) : 0n, false, r.passed ? 'passed' : (r.reason ?? 'failed'));
+    let r: KycCheckResult;
+    try { r = await call(); } catch (e) { r = unavailableFromError(e, vendor); }
+    // Vendors bill for conclusive answers; a transport error or any provider-side
+    // outage is logged at 0 and does not count toward the daily attempt limit.
+    const unavailable = isKycUnavailable(r);
+    if (unavailable) r = { ...r, unavailable: true };
+    const conclusive = !unavailable && (r.passed || /NOT_FOUND|MISMATCH|INVALID|FACE/.test(String(r.reason ?? '')));
+    const outcome = r.passed ? 'passed' : unavailable ? `unavailable:${String(r.reason ?? 'unknown').slice(0, 120)}` : (r.reason ?? 'failed');
+    await logCost(vendor, kind, subjectType, subjectId, billable && conclusive ? unitCost(kind) : 0n, false, outcome);
     if (idForCache) await writeCache(kind, idForCache, r);
     return r;
   }

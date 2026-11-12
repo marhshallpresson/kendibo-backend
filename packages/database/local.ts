@@ -66,6 +66,17 @@ export function localDb(): IMemoryDb {
           .filter((l) => !/submission_document_kind_check/i.test(l))
           .join('\n');
       }
+      if (f === '046_kyc_reviewed_by_text.sql') {
+        // pg-mem can't parse ALTER COLUMN ... TYPE ... USING; the columns hold
+        // no rows yet at this point locally, so recreate them as TEXT. Real
+        // Postgres applies 046 untouched.
+        sql = [
+          'ALTER TABLE kyc.customer DROP COLUMN reviewed_by;',
+          'ALTER TABLE kyc.customer ADD COLUMN reviewed_by TEXT;',
+          'ALTER TABLE provider.provider DROP COLUMN kyc_reviewed_by;',
+          'ALTER TABLE provider.provider ADD COLUMN kyc_reviewed_by TEXT;',
+        ].join('\n');
+      }
       mem!.public.none(sql);
     } catch (e) {
       console.warn(`[localdb] ${f}: ${(e as Error).message.split('\n')[0]}`);
@@ -117,6 +128,7 @@ export function localDb(): IMemoryDb {
   run('049_provider_onboarding_progress.sql');
   run('050_paga_sandbox.sql');
   run('051_catalog_categories.sql');
+  run('053_kyc_manual_review.sql');
   run('043_invoices_schedule_updates.sql');
   run('040_whatsapp_sessions_recovery.sql');
   console.log('[localdb] pg-mem ready (001-019, 021-032)');

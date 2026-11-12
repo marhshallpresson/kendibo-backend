@@ -146,6 +146,38 @@ export async function alertUnservedRequest(requestId: string, reason: string) {
   });
 }
 
+/**
+ * The identity provider (Prembly) could not answer — unconfigured, unfunded,
+ * over quota or down — so an ID application was saved for a human to verify.
+ * One email per application: the dedupe key carries the application ref.
+ */
+export async function alertKycManualReview(p: Record<string, unknown>) {
+  const subjectType = String(p.subjectType ?? '') === 'provider' ? 'provider' : 'user';
+  const subjectId = String(p.subjectId ?? '');
+  if (!subjectId) return { sent: 0 };
+  let who: { name: string; phone: string };
+  if (subjectType === 'provider') {
+    const info = await providerInfo(subjectId);
+    who = { name: info.name, phone: info.phone };
+  } else {
+    const u = await userInfo(subjectId);
+    who = { name: u.name || 'Unnamed customer', phone: maskPhone(u.phone) };
+  }
+  const reason = String(p.reason ?? 'provider unavailable').slice(0, 200);
+  return sendAdminAlert({
+    kind: 'kyc.manual_review_needed',
+    dedupeKey: `kyc:${subjectType}:${subjectId}:manual_review:${String(p.applicationRef ?? 'once')}`,
+    title: `KYC needs manual verification: ${who.name}`,
+    lines: [
+      `${subjectType === 'provider' ? 'Provider/vendor' : 'Customer'}: ${who.name}`,
+      `Phone: ${who.phone}`,
+      `Why: the identity provider could not verify automatically (${reason})`,
+      'The application is saved as UNDER_REVIEW. Check the documents and approve or reject it.',
+    ],
+    link: admin('/kyc/queue'),
+  });
+}
+
 async function onEvent(event: string, p: Record<string, unknown>): Promise<unknown> {
   const pid = p.providerId ? String(p.providerId) : '';
   switch (event) {
@@ -164,7 +196,9 @@ async function onEvent(event: string, p: Record<string, unknown>): Promise<unkno
       });
     }
     case 'provider.onboarded': return providerStep(pid, 'onboarded', 'New provider/vendor profile started');
-    case 'kyc.submitted': return providerStep(pid, 'kyc_submitted', 'KYC submitted', [`Status: ${String(p.status ?? 'PENDING')}`], false);
+    // A manual-review submission gets its own alert (kyc.manual_review_needed) instead.
+    case 'kyc.submitted': return p.manualReview ? null : providerStep(pid, 'kyc_submitted', 'KYC submitted', [`Status: ${String(p.status ?? 'PENDING')}`], false);
+    case 'kyc.manual_review_needed': return alertKycManualReview(p);
     case 'kyc.approved': return providerStep(pid, 'kyc_passed', 'KYC passed');
     case 'kyc.rejected': return providerStep(pid, 'kyc_failed', 'KYC failed', [`Reason: ${String(p.reason ?? 'not given')}`], false);
     case 'provider.kyb_submitted': return providerStep(pid, 'kyb_submitted', 'Business KYB submitted', [`CAC/RC number given: ${p.hasRcNumber ? 'yes' : 'no'}`]);

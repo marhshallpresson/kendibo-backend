@@ -58,6 +58,7 @@ import { registerAdminOpsRoutes, ADMIN_OPS_POLICY } from './admin-ops.routes.js'
 import { registerEvidenceRoutes } from './evidence.routes.js';
 import { registerEmailRoutes, EMAIL_ROUTE_POLICY } from './email.routes.js';
 import { registerOnboardingRoutes } from './onboarding.routes.js';
+import { registerKycAdminRoutes } from './kyc-admin.routes.js';
 import { installAdminAlerts } from '../../../modules/notifications/admin-alerts.service.js';
 import { startLifecycleSweeper } from '../../../modules/notifications/lifecycle.service.js';
 import { emit } from '../../../packages/observability/emit.js';
@@ -3309,6 +3310,7 @@ registerAdminOpsRoutes(app, { authed: authed as never, fail: fail as never });
 registerEvidenceRoutes(app, { fail: fail as never, bookingParty: bookingParty as never, adminActor: adminActor as never });
 registerEmailRoutes(app, { authed: authed as never, fail: fail as never });
 registerOnboardingRoutes(app, { authed: authed as never, fail: fail as never });
+registerKycAdminRoutes(app, { fail: fail as never, adminActor: adminActor as never });
 installAdminAlerts();
 if (process.env.NODE_ENV !== 'test') startLifecycleSweeper();
 Object.assign(ROUTE_POLICY, INVOICE_ROUTE_POLICY); registerInvoiceRoutes(app, { fail: fail as never, bookingParty: bookingParty as never, providerActor });
