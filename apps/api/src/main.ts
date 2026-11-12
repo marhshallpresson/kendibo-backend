@@ -59,6 +59,9 @@ import { registerEvidenceRoutes } from './evidence.routes.js';
 import { registerEmailRoutes, EMAIL_ROUTE_POLICY } from './email.routes.js';
 import { registerOnboardingRoutes } from './onboarding.routes.js';
 import { registerKycAdminRoutes } from './kyc-admin.routes.js';
+import { registerVirtualAccountRoutes, VIRTUAL_ACCOUNT_ROUTE_POLICY } from './virtual-account.routes.js';
+import { installVirtualAccountHooks, chargeForWalletPayment, reverseWalletCharge, VaError } from '../../../modules/payments/paga/virtual-accounts.js';
+import { onEmit } from '../../../packages/observability/emit.js';
 import { installAdminAlerts } from '../../../modules/notifications/admin-alerts.service.js';
 import { startLifecycleSweeper } from '../../../modules/notifications/lifecycle.service.js';
 import { emit } from '../../../packages/observability/emit.js';
@@ -306,7 +309,7 @@ const ROUTE_POLICY: Record<string, RoutePolicy> = {
 };
 // Vendor platform routes (storefronts, trade rules, WhatsApp) declare their own
 // public/permission entries next to the handlers; merged into the same gate.
-Object.assign(ROUTE_POLICY, VENDOR_ROUTE_POLICY, ADMIN_OPS_POLICY, EMAIL_ROUTE_POLICY);
+Object.assign(ROUTE_POLICY, VENDOR_ROUTE_POLICY, ADMIN_OPS_POLICY, EMAIL_ROUTE_POLICY, VIRTUAL_ACCOUNT_ROUTE_POLICY);
 
 app.addHook('onRequest', async (req, reply) => {
   const url = req.routeOptions.url;
@@ -1151,7 +1154,24 @@ app.post('/v1/bookings/:id/pay-with-wallet', async (req, reply) => {
   try {
     const alreadyPaid = !!settled[0];
     if (!alreadyPaid) {
-      await walletService.debit(a.sub, amountKobo, ref, 'payment', bookingId);
+      // Money held in the customer's Paga sub-account (account number) moves to
+      // Kendibo first; the ledger debit follows. No account number: no-op.
+      const replay = (await q(`SELECT 1 FROM payment.wallet_txn WHERE ref=$1`, [ref]))[0];
+      if (!replay && (await walletService.getBalance(a.sub)) < amountKobo) throw new Error('INSUFFICIENT_FUNDS');
+      let vaCharge: Awaited<ReturnType<typeof chargeForWalletPayment>> = null;
+      if (!replay) {
+        try { vaCharge = await chargeForWalletPayment(a.sub, ref, amountKobo); }
+        catch (e) {
+          if (e instanceof VaError) return fail(reply, e.code, e.message, e.status, e.status >= 500);
+          throw e;
+        }
+      }
+      try {
+        await walletService.debit(a.sub, amountKobo, ref, 'payment', bookingId);
+      } catch (e) {
+        if (vaCharge) await reverseWalletCharge(vaCharge).catch((err) => observability.captureException(err));
+        throw e;
+      }
       // Book the job as paid before the intent row: a crash here leaves an
       // unpaid booking the user can retry (debit replays by ref), never a
       // charged-but-unpaid job.
@@ -3311,6 +3331,8 @@ registerEvidenceRoutes(app, { fail: fail as never, bookingParty: bookingParty as
 registerEmailRoutes(app, { authed: authed as never, fail: fail as never });
 registerOnboardingRoutes(app, { authed: authed as never, fail: fail as never });
 registerKycAdminRoutes(app, { fail: fail as never, adminActor: adminActor as never });
+registerVirtualAccountRoutes(app, { authed: authed as never, fail: fail as never });
+installVirtualAccountHooks(onEmit);
 installAdminAlerts();
 if (process.env.NODE_ENV !== 'test') startLifecycleSweeper();
 Object.assign(ROUTE_POLICY, INVOICE_ROUTE_POLICY); registerInvoiceRoutes(app, { fail: fail as never, bookingParty: bookingParty as never, providerActor });

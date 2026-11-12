@@ -76,13 +76,13 @@ export class PagaClient {
     if (!pagaConfigured(this.cfg)) throw new PagaError('NOT_CONFIGURED', 'Paga keys are not set (PAGA_PUBLIC_KEY, PAGA_SECRET_KEY, PAGA_HASH_KEY)');
   }
 
-  private async send(url: string, headers: Record<string, string>, body: unknown): Promise<any> {
+  private async send(url: string, headers: Record<string, string>, body: unknown, method: 'GET' | 'POST' | 'PUT' = 'POST'): Promise<any> {
     let res: Response;
     try {
       res = await this.doFetch(url, {
-        method: 'POST',
+        method,
         headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...headers },
-        body: JSON.stringify(body),
+        ...(method === 'GET' ? {} : { body: JSON.stringify(body) }),
         signal: AbortSignal.timeout(this.cfg.timeoutMs),
       });
     } catch (e) {
@@ -102,6 +102,13 @@ export class PagaClient {
     this.ensure();
     const auth = Buffer.from(`${this.cfg.publicKey}:${this.cfg.secretKey}`).toString('base64');
     return this.send(`${HOSTS[this.cfg.env].collect}${path}`, { Authorization: `Basic ${auth}`, hash: this.hash(hashValues) }, body);
+  }
+
+  /** Collect API with any verb (Subsidiary Accounts use GET/PUT and path ids). GET sends no body. */
+  async collectRest(method: 'GET' | 'POST' | 'PUT', pathWithQuery: string, body: Record<string, unknown> | undefined, hashValues: Array<string | number | null | undefined>): Promise<any> {
+    this.ensure();
+    const auth = Buffer.from(`${this.cfg.publicKey}:${this.cfg.secretKey}`).toString('base64');
+    return this.send(`${HOSTS[this.cfg.env].collect}${pathWithQuery}`, { Authorization: `Basic ${auth}`, hash: this.hash(hashValues) }, body ?? {}, method);
   }
 
   /** Business API: principal + credentials + hash headers. */
