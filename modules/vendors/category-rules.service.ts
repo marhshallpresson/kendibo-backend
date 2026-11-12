@@ -180,7 +180,7 @@ export const categoryRulesService = {
    * approve, merge or reject it afterwards. Duplicate open proposals from the
    * same vendor collapse.
    */
-  async propose(providerId: string, rawName: string, description = '', opts: { groupId?: string } = {}) {
+  async propose(providerId: string, rawName: string, description = '', opts: { groupId?: string; force?: boolean } = {}) {
     const name = rawName.trim().replace(/\s+/g, ' ').slice(0, 60);
     if (name.length < 2) throw new Error('NAME_REQUIRED');
     const open = await q<Record<string, unknown>>(
@@ -191,13 +191,17 @@ export const categoryRulesService = {
 
     const cats = (await q<Record<string, unknown>>(`SELECT id, name, short_name, group_id, keywords FROM catalog.category WHERE active`))
       .map((c) => ({ id: String(c.id), name: String(c.name), shortName: c.short_name ? String(c.short_name) : undefined, groupId: c.group_id ? String(c.group_id) : undefined, keywords: toKeywords(c.keywords) }));
-    const near = findNearDuplicate(name, cats);
+    // "Add anyway" (force) skips the similarity suggestions, but an exact same-name
+    // category is always returned instead of creating a duplicate.
+    const key = slugify(name);
+    const exact = cats.find((c) => c.id === key || slugify(c.name) === key || (c.shortName && slugify(c.shortName) === key));
+    const near = exact ?? (opts.force ? null : findNearDuplicate(name, cats));
     if (near) return { status: 'suggest' as const, rawName: name, suggestion: { id: near.id, name: near.name } };
     if (open.length >= 5) throw new Error('TOO_MANY_OPEN_PROPOSALS');
 
     const existing = cats.map((c) => ({ id: c.id, name: c.name }));
     const ai = await aiSuggestion(name, description, existing);
-    if (ai?.matchesExistingCategoryId) {
+    if (ai?.matchesExistingCategoryId && !opts.force) {
       const hit = cats.find((c) => c.id === ai.matchesExistingCategoryId);
       if (hit) return { status: 'suggest' as const, rawName: name, suggestion: { id: hit.id, name: hit.name } };
     }
