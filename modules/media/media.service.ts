@@ -53,10 +53,12 @@ function magicBytesMatch(bytes: Buffer, mime: string): boolean {
 }
 
 export const mediaService = {
-  async presign(kind: MediaKind): Promise<{ uploadUrl: string; assetId: string; folder: MediaFolder }> {
+  /** `ownerUserId` records the uploader (052) so their assets can be attached to their own listings. */
+  async presign(kind: MediaKind, ownerUserId?: string): Promise<{ uploadUrl: string; assetId: string; folder: MediaFolder }> {
     const id = newId('med');
     const folder = folderForKind(kind);
-    await q(`INSERT INTO media.asset (id, folder) VALUES ($1,$2)`, [id, folder]);
+    if (ownerUserId) await q(`INSERT INTO media.asset (id, folder, owner_user_id) VALUES ($1,$2,$3)`, [id, folder, ownerUserId]);
+    else await q(`INSERT INTO media.asset (id, folder) VALUES ($1,$2)`, [id, folder]);
     const up = await objectStore.presign(id, folder);
     return { uploadUrl: `${up.uploadUrl}${up.uploadUrl.includes('?') ? '&' : '?'}kind=${kind}`, assetId: id, folder };
   },

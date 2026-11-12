@@ -94,6 +94,28 @@ export async function currentInvoice(bookingId: string): Promise<Invoice | null>
   return (await invoiceFor(bookingId, 'final')) ?? (await invoiceFor(bookingId, 'receipt'));
 }
 
+/**
+ * The booking's main line. A product order, or any quantity above one (052),
+ * reads "3 × Lithium battery 200Ah @ ₦X = ₦Y"; the amount stays the booking price.
+ */
+async function mainLineLabel(bookingId: string, service: string, priceKobo: bigint): Promise<string> {
+  const r = await q<{ title: string | null; quantity: number | null; unit_price_kobo: string | null; offering_id: string | null }>(
+    `SELECT title, quantity, unit_price_kobo, offering_id FROM booking.service_request WHERE booking_id=$1 LIMIT 1`, [bookingId],
+  ).catch(() => []);
+  const req = r[0];
+  if (!req) return service;
+  const qty = Number(req.quantity ?? 1) || 1;
+  let isProduct = false;
+  if (req.offering_id) {
+    const o = await q<{ kind: string | null }>(`SELECT kind FROM provider.offering WHERE id=$1`, [String(req.offering_id)]).catch(() => []);
+    isProduct = o[0]?.kind === 'product';
+  }
+  if (qty <= 1 && !isProduct) return service;
+  const unit = req.unit_price_kobo != null ? big(req.unit_price_kobo) : priceKobo / BigInt(qty);
+  const name = req.title ? String(req.title) : service;
+  return `${qty} × ${name} @ ${naira(unit)} = ${naira(unit * BigInt(qty))}`;
+}
+
 /** Everything the documents show, read fresh from the booking. */
 async function gather(bookingId: string, kind: InvoiceKind): Promise<{ userId: string; data: InvoiceData } | null> {
   const f = await bookingFacts(bookingId);
@@ -107,7 +129,8 @@ async function gather(bookingId: string, kind: InvoiceKind): Promise<{ userId: s
   ).catch(() => []);
   const paid = pays.reduce((s, p) => s + big(p.amount_kobo), 0n);
   const service = f.service.charAt(0).toUpperCase() + f.service.slice(1);
-  const lines: InvoiceLine[] = [{ label: service, amountKobo: String(big(price[0]?.price_kobo)) }];
+  const priceKobo = big(price[0]?.price_kobo);
+  const lines: InvoiceLine[] = [{ label: await mainLineLabel(bookingId, service, priceKobo), amountKobo: String(priceKobo) }];
   for (const x of extras) lines.push({ label: `Extra: ${String(x.reason).slice(0, 120)}`, amountKobo: String(big(x.amount_kobo)) });
   const total = lines.reduce((s, l) => s + BigInt(l.amountKobo), 0n);
   const last = pays.at(-1);

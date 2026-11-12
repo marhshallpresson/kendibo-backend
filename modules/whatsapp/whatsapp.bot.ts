@@ -284,11 +284,11 @@ async function handleOfferTap(waId: string, offerId: string, accept: boolean) {
 }
 
 /** Job offer to a vendor: buttons inside the 24h window, else a template or SMS. */
-export async function notifyProviderOfOffer(providerPhone: string, offerId: string, summary: string) {
+export async function notifyProviderOfOffer(providerPhone: string, offerId: string, summary: string, lead = 'New job near you') {
   const waId = providerPhone.replace(/\D/g, '');
   await sendBusinessInitiated({
     waId,
-    whatsapp: () => wa.buttons(waId, `New job near you: ${summary}`, [
+    whatsapp: () => wa.buttons(waId, `${lead}: ${summary}`, [
       { id: `offer:${offerId}:accept`, title: 'Accept' },
       { id: `offer:${offerId}:decline`, title: 'Decline' },
     ]),
