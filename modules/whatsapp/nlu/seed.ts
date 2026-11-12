@@ -317,6 +317,15 @@ export const SEED: [string, Intent, Trade?][] = [
   ['are you recruiting technicians', 'vendor_join'],
   ['I be AC technician I need work', 'vendor_join'],
   ['how much do vendors earn', 'vendor_join'],
+  ['I dey sell inverter battery', 'vendor_join'],
+  ['how I fit register as vendor', 'vendor_join'],
+  ['I want to offer my services on Kendibo', 'vendor_join'],
+  ['I want to sell my products here', 'vendor_join'],
+  ['I sell solar panels can I list them', 'vendor_join'],
+  ['I wan become agent for una', 'vendor_join'],
+  ['how do I register as a provider', 'vendor_join'],
+  ['I be carpenter I wan dey get work from una', 'vendor_join'],
+  ['can I sell my products on Kendibo', 'vendor_join'],
 
   // ── greeting ────────────────────────────────────────────────────────
   ['hi', 'greeting'],

@@ -10,7 +10,7 @@ export const FACTS: Record<string, string> = {
   coverage: "We're live in Uyo first, then Lagos and Abuja. When you set your location, we tell you straight away if the address is covered.",
   pricing: 'Standard jobs (like cleaning by number of rooms) have fixed prices. Repairs are quoted by the vendor after they see the problem, often within a range shown upfront, with parts listed separately. A small call-out fee may apply, and it counts towards the job if you go ahead.',
   safety: 'Every vendor passes ID and selfie checks, and trades like electrical work need a licence on file. You see verified badges and real reviews before you choose, and you can report anything unsafe here.',
-  become_a_pro: 'Vendors join through the Kendibo app: sign up as a pro, verify your ID with a selfie, add your trade and payout account. Approved vendors get job offers here on WhatsApp and in the app, plus their own shareable storefront link.',
+  become_a_pro: 'Providers and vendors sign up on the Kendibo website (kendibo.ng, "Join as a provider"): add your trade or products, verify your ID, and add your payout account. Approved vendors get job offers here on WhatsApp and in the app, plus their own shareable storefront link.',
   about: 'Kendibo helps you request home-service professionals and follow your requests. You can also ask to speak to a person.',
 };
 

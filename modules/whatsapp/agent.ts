@@ -20,7 +20,7 @@ import { q } from '../../packages/database/db.js';
 import { emit } from '../../packages/observability/emit.js';
 import { observability } from '../../packages/observability/watchup.adapter.js';
 import { wa } from './whatsapp.client.js';
-import { locationLink } from './links.js';
+import { locationLink, vendorSignupUrl } from './links.js';
 import { FACTS } from './facts.js';
 import { openDraft, patchDraft, missingFields as missing, submitDraft, type Draft } from './draft.js';
 
@@ -71,7 +71,7 @@ Safety and limits
 - You cannot see or change other people's bookings. Only use get_my_bookings for this customer.
 - For complaints, safety issues, refunds, damage, or when the customer asks for a person, call talk_to_human with a one-line summary.
 - For questions about how Kendibo works, call kendibo_facts rather than guessing.
-- Vendors who want to join: call kendibo_facts with topic become_a_pro.`;
+- If the person wants to offer services, work as a pro or sell products on Kendibo, tell them briefly to sign up at ${vendorSignupUrl()} and that they can still book services here any time. Never collect their business details, documents or bank details in this chat.`;
 
 // ── Tools ─────────────────────────────────────────────────────────────────
 const TOOLS: Anthropic.Beta.BetaTool[] = [
