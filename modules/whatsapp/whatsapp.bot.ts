@@ -33,10 +33,17 @@ import { replyWithInvoice } from './invoice-hook.js';
 import { FACTS, priceLines } from './facts.js';
 import { OPT_IN, OPT_OUT, llmAllowed, sendBusinessInitiated, notifyCustomer, setJobOfferConsent } from './policy.js';
 import { activeRelay, closeRelay, relayText, relayMedia } from './relay.js';
-import { idCheckLink, termsLink, payToken, webBase, emailConfirmLink } from './links.js';
+import { idCheckLink, termsLink, payToken, webBase, emailConfirmLink, vendorSignupUrl } from './links.js';
 
 type State = 'BOT' | 'HUMAN';
-interface Session { waId: string; userId: string | null; state: State; data: Asked; updatedAt: number }
+// Session data = the booking flow's flags plus two of the router's own: when
+// the provider sign-up button was last sent, and whether a new user was asked
+// "book or offer services?". Both survive draft resets.
+type BotData = Asked & { vendorCtaAt?: number; roleAsked?: boolean };
+interface Session { waId: string; userId: string | null; state: State; data: BotData; updatedAt: number }
+const freshData = (d: BotData): BotData => ({
+  lang: d.lang, ...(d.vendorCtaAt ? { vendorCtaAt: d.vendorCtaAt } : {}), ...(d.roleAsked ? { roleAsked: true } : {}),
+});
 
 export interface InboundMessage {
   id: string; from: string; type: string;
@@ -92,7 +99,7 @@ function runSerially(key: string, fn: () => Promise<void>): Promise<void> {
 async function loadSession(waId: string): Promise<Session> {
   const r = (await q<Record<string, unknown>>(`SELECT * FROM messaging.whatsapp_session WHERE wa_id=$1`, [waId]))[0];
   if (!r) return { waId, userId: null, state: 'BOT', data: {}, updatedAt: 0 };
-  const data = (typeof r.data === 'string' ? JSON.parse(r.data) : (r.data ?? {})) as Asked;
+  const data = (typeof r.data === 'string' ? JSON.parse(r.data) : (r.data ?? {})) as BotData;
   return { waId, userId: r.user_id ? String(r.user_id) : null, state: String(r.state) === 'HUMAN' ? 'HUMAN' : 'BOT', data, updatedAt: new Date(String(r.updated_at)).getTime() };
 }
 async function saveSession(s: Session) {
@@ -164,6 +171,50 @@ async function sendStatus(to: string, userId: string, draft: Draft | null) {
   if (draft) await wa.buttons(to, `${body}\n\nYou also have a request in progress.`, [{ id: 'flow:resume', title: 'Continue it' }, { id: 'menu:help', title: 'Talk to a person' }]);
   else await wa.buttons(to, body, [{ id: 'menu:book', title: 'Book a service' }, { id: 'menu:help', title: 'Talk to a person' }]);
 }
+
+// ── Would-be providers and vendors → the sign-up page ─────────────────────────
+// Clear "I want to work / sell / register as a pro" wording, in English or
+// Pidgin. The intent model covers the rest (vendor_join).
+const JOIN_RE: RegExp[] = [
+  /\b(join|register|sign\s?up|enrol+|onboard|apply)\b[^.?!]{0,40}\bas\b[^.?!]{0,20}\b(vendor|provider|service provider|artisan|agent|pro|partner|seller|technician|plumber|electrician|cleaner|painter|mechanic|carpenter|tiler|welder|fumigator)s?\b/i,
+  /\bbecome\s+(a\s+|an\s+)?(kendibo\s+)?(vendor|provider|service provider|pro|partner|agent|seller|artisan)\b/i,
+  /\b(want to|wan|wanna|would like to)\s+be\s+(a\s+|an\s+)?(kendibo\s+)?(vendor|provider|service provider|pro|partner|agent|seller|artisan)\b/i,
+  /\bI\s+(dey|de)\s+sell\b/i,
+  /\b(want to|wan|wanna|would like to|fit)\s+(sell|offer my|offer our|list my|list our|partner with|join kendibo|join una|join you)\b/i,
+  /\boffer(ing)?\s+(my|our)\s+(services?|skills?|products?)\b/i,
+  /\b(sell|list)\s+(my|our)\s+(products?|goods|items?|business|services?)\b/i,
+  /\bwork\s+(with|for)\s+(you|una|kendibo)\b/i,
+  /\b(vendor|provider|artisan|seller|agent|pro)\s+(registration|sign\s?up|onboarding|application)\b/i,
+  /\bregister\s+(me|my\s+(business|company|shop))\b/i,
+];
+/** "Send the link again": asks for the sign-up button even inside the quiet window. */
+const JOIN_AGAIN_RE = /\b(send|resend|share|give|drop)\b[^.?!]{0,25}\b(link|again)\b|\b(join|sign\s?up|registration|register|provider|vendor)\s+link\b|\blink\s+again\b/i;
+const VENDOR_CTA_GAP_MS = 10 * 60_000;
+
+function wantsToJoin(text: string, u?: Understanding | null): boolean {
+  if (u && u.intent === 'vendor_join' && u.sure) return true;
+  return JOIN_RE.some((re) => re.test(text));
+}
+
+/**
+ * One short message with the "Join as a provider" button. At most once per
+ * 10 minutes per number unless they ask again (force); nothing else in the
+ * session (an open booking draft included) is touched.
+ */
+async function sendVendorCta(to: string, s: Session, draft: Draft | null, force = false): Promise<boolean> {
+  if (!force && s.data.vendorCtaAt && Date.now() - s.data.vendorCtaAt < VENDOR_CTA_GAP_MS) return false;
+  s.data.vendorCtaAt = Date.now();
+  emit('whatsapp.vendor_signup_link', {});
+  const tail = draft ? 'Your booking in progress is saved. Just reply here to carry on.' : 'You can still book services here any time.';
+  await wa.ctaUrl(to, `Great! To offer your services or sell on Kendibo, sign up on our website. It only takes a few minutes. ${tail}`, 'Join as a provider', vendorSignupUrl());
+  return true;
+}
+
+/** Asked once, right after a new user's onboarding. "Book a service" reuses the menu tap. */
+const askRole = (to: string) => wa.buttons(to, `Are you here to book a service, or to offer your services on Kendibo?\n\n${ONBOARDING_TIP}`, [
+  { id: 'menu:book', title: 'Book a service' },
+  { id: 'role:offer', title: 'Offer my services' },
+]);
 
 async function factAnswer(u: Understanding, text: string, draft: Draft | null): Promise<string> {
   switch (u.intent) {
@@ -370,7 +421,7 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
   if (!id && s.data.recover) {
     const out = await continueRecovery(to, user.id, s.data, text);
     if (out.kind !== 'not_mine') {
-      if (out.kind === 'moved') { s.userId = out.userId; s.data = { lang: s.data.lang }; s.state = 'BOT'; }
+      if (out.kind === 'moved') { s.userId = out.userId; s.data = freshData(s.data); s.state = 'BOT'; }
       if (out.kind === 'support') s.state = 'HUMAN';
       await saveSession(s);
       return;
@@ -401,11 +452,33 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
 
   // Onboarding steps after consent: name (one tap), then email (or skip).
   if (s.data.onboard) {
+    // A would-be provider mid-onboarding gets the sign-up button; the step they
+    // were on stays as it is (their reply is not taken as a name or email).
+    if (!id && text && wantsToJoin(text)) {
+      s.data.roleAsked = true;
+      await sendVendorCta(to, s, null, true);
+      await saveSession(s);
+      return;
+    }
     const done = await handleOnboarding(to, s, user.id, text, id, profileName);
     if (!done) { await saveSession(s); return; }
-    await wa.text(to, ONBOARDING_TIP);
     const pending = s.data.pendingText ?? '';
     delete s.data.pendingText;
+    // Ask once "book or offer services?", unless their first message already
+    // said which (a job → carry on as before; joining → the sign-up button).
+    if (!s.data.roleAsked) {
+      s.data.roleAsked = true;
+      const pu = pending ? await understand(pending) : null;
+      const joining = !!pending && wantsToJoin(pending, pu);
+      const unclear = !pu || (['greeting', 'thanks', 'affirm', 'deny', 'out_of_scope'].includes(pu.intent) && !pu.trade);
+      if (joining || unclear) {
+        await saveSession(s);
+        if (joining) return processInbound({ id: `${m.id}:pending`, from: to, type: 'text', text: { body: pending } }, profileName);
+        await askRole(to); // carries the "/" tip, so it is not sent twice
+        return;
+      }
+    }
+    await wa.text(to, ONBOARDING_TIP);
     await saveSession(s);
     if (pending) return processInbound({ id: `${m.id}:pending`, from: to, type: 'text', text: { body: pending } }, profileName);
     await sendWelcome(to, profileName);
@@ -475,7 +548,7 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
   await q(`UPDATE messaging.whatsapp_job_draft SET status='abandoned' WHERE wa_id=$1 AND status='collecting' AND updated_at < $2`,
     [to, new Date(Date.now() - DRAFT_STALE_MS).toISOString()]).catch(() => undefined);
   let draft = await currentDraft(to);
-  if (!draft) s.data = { lang: s.data.lang };
+  if (!draft) s.data = freshData(s.data);
 
   // ── Masked client ↔ vendor chat: words and uploads pass straight through ────
   const relay = id ? null : await activeRelay(to);
@@ -500,12 +573,14 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
         await sendStatus(to, user.id, draft);
       } else if (id === 'menu:help') {
         await handOff(s, user.id, to, 'asked for a person from the menu');
+      } else if (id === 'role:offer') {
+        await sendVendorCta(to, s, draft, true);
       } else if (id === 'flow:resume') {
         if (draft) await sendStep(to, draft, s.data); else await sendMenu(to);
       } else if (id === 'cancel:confirm') {
         if (draft && s.data.cancelDraftId === draft.id) {
           await cancelDraft(draft.id);
-          s.data = { lang: s.data.lang };
+          s.data = freshData(s.data);
           await sendMenu(to, 'Cancelled. Nothing was sent to vendors.');
         } else await sendMenu(to, 'That cancellation confirmation has expired.');
       } else if (id === 'cancel:keep') {
@@ -603,6 +678,13 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
   if (u.intent === 'human') {
     route = 'human';
     await handOff(s, user.id, to, text);
+  } else if (wantsToJoin(text, u) || (JOIN_AGAIN_RE.test(text) && Date.now() - (s.data.vendorCtaAt ?? 0) < VENDOR_CTA_GAP_MS)) {
+    // Would-be provider or vendor: the sign-up button (an open draft is kept).
+    route = 'vendor_join';
+    if (!(await sendVendorCta(to, s, draft, JOIN_AGAIN_RE.test(text)))) {
+      const again = 'Tap "Join as a provider" in my message above to sign up. Reply "send the link" if you need it again.';
+      if (draft) await sendStep(to, draft, s.data, `${again}\n\nBack to your request:`); else await wa.text(to, again);
+    }
   } else if (u.intent === 'out_of_scope' && u.sure) {
     // Meta's terms bar general-purpose AI assistants: decline, with no LLM call.
     route = 'refuse';
@@ -636,7 +718,7 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
     if (draft) await sendStep(to, draft, s.data, "You're welcome."); else await wa.text(to, 'You\'re welcome! Reply "menu" any time.');
   } else if (draft && step === 'confirm' && u.intent === 'affirm') {
     const out = await submitDraft(to, user.id, draft);
-    if (!out.needsVerification) s.data = { lang: s.data.lang };
+    if (!out.needsVerification) s.data = freshData(s.data);
   } else if (draft && (step === 'photo' || step === 'budget') && u.intent === 'deny' && !u.budgetKobo) {
     if (step === 'photo') s.data.photo = true; else s.data.budget = true;
     await sendStep(to, draft, s.data);

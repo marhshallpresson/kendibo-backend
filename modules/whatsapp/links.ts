@@ -40,6 +40,8 @@ export const payToken = (waId: string, bookingId: string) => signLink({ w: waId,
 export const vendorsLink = (waId: string, draftId: string) => `${webBase()}/w/vendors?t=${encodeURIComponent(signLink({ w: waId, d: draftId, p: 'vendors' }, 24 * 3600))}`;
 /** Secure ID-check page (d = user id). NIN is typed on Kendibo's page, never in the chat. */
 export const idCheckLink = (waId: string, userId: string) => `${webBase()}/w/verify?t=${encodeURIComponent(signLink({ w: waId, d: userId, p: 'verify' }, 24 * 3600))}`;
+/** Where would-be providers and vendors sign up (VENDOR_SIGNUP_URL). Read only here. */
+export const vendorSignupUrl = () => (process.env.VENDOR_SIGNUP_URL || '').trim() || 'https://kendibo.ng/#join-provider';
 /** Public terms & privacy summary the onboarding message links to. */
 export const termsLink = () => `${webBase()}/w/terms`;
 /** Email confirmation link (d = user id). The email is attached only once this is opened. */
