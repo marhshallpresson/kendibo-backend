@@ -514,12 +514,23 @@ export async function adminList(opts: { filter?: 'all' | 'funded' | 'never_funde
   const rows = await q<Record<string, unknown>>(
     `SELECT v.user_id, v.account_number, v.account_name, v.status, v.env, v.created_at,
             u.phone, u.email,
-            COALESCE((SELECT SUM(f.amount_kobo) FROM payment.va_funding f WHERE f.virtual_account_id = v.id AND f.status = 'credited'), 0) AS funded_kobo,
-            (SELECT COUNT(*) FROM payment.va_funding f WHERE f.virtual_account_id = v.id AND f.status = 'credited') AS funding_count,
-            (SELECT COUNT(*) FROM payment.va_funding f WHERE f.virtual_account_id = v.id AND f.status = 'unconfirmed') AS unconfirmed_count,
-            (SELECT MAX(f.paid_at) FROM payment.va_funding f WHERE f.virtual_account_id = v.id AND f.status = 'credited') AS last_funded_at,
-            COALESCE((SELECT SUM(c.amount_kobo) FROM payment.va_charge c WHERE c.virtual_account_id = v.id AND c.status = 'successful'), 0) AS spent_kobo
-       FROM payment.virtual_account v JOIN identity.users u ON u.id = v.user_id
+            COALESCE(f.funded_kobo, 0) AS funded_kobo, COALESCE(f.funding_count, 0) AS funding_count,
+            COALESCE(f.unconfirmed_count, 0) AS unconfirmed_count, f.last_funded_at,
+            COALESCE(c.spent_kobo, 0) AS spent_kobo
+       FROM payment.virtual_account v
+       JOIN identity.users u ON u.id = v.user_id
+       LEFT JOIN (
+         SELECT virtual_account_id,
+                SUM(CASE WHEN status = 'credited' THEN amount_kobo ELSE 0 END) AS funded_kobo,
+                SUM(CASE WHEN status = 'credited' THEN 1 ELSE 0 END) AS funding_count,
+                SUM(CASE WHEN status = 'unconfirmed' THEN 1 ELSE 0 END) AS unconfirmed_count,
+                MAX(CASE WHEN status = 'credited' THEN paid_at ELSE NULL END) AS last_funded_at
+           FROM payment.va_funding GROUP BY virtual_account_id
+       ) f ON f.virtual_account_id = v.id
+       LEFT JOIN (
+         SELECT virtual_account_id, SUM(amount_kobo) AS spent_kobo
+           FROM payment.va_charge WHERE status = 'successful' GROUP BY virtual_account_id
+       ) c ON c.virtual_account_id = v.id
       WHERE v.status IN ('active', 'retired', 'rotating')
       ORDER BY v.created_at DESC LIMIT $1`, [limit],
   );
