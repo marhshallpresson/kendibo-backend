@@ -172,6 +172,21 @@ async function onEvent(event: string, p: Record<string, unknown>): Promise<unkno
     case 'offering.created': return providerStep(pid, 'first_price', 'First price listed', [`Category: ${String(p.categoryId ?? '')}`]);
     case 'provider.availability': return p.online ? providerStep(pid, 'first_online', 'First time online') : null;
     case 'provider.verified': return providerStep(pid, 'approved', 'Provider approved', [`Level: ${String(p.level ?? '')}`]);
+    case 'category.provider_created': {
+      const prov = await providerInfo(pid);
+      return sendAdminAlert({
+        kind: 'category.provider_created',
+        dedupeKey: `category:${String(p.categoryId)}:provider_created`,
+        title: `New provider-made category: ${String(p.name ?? p.categoryId)}`,
+        lines: [
+          `Category: ${String(p.name ?? '')} (${String(p.categoryId)})`,
+          `Group: ${String(p.groupId ?? 'other')}`,
+          `Added by: ${prov.name} (${prov.phone})`,
+          'It is live now. Approve, merge it into an existing category, or reject it.',
+        ],
+        link: admin('/category-proposals'),
+      });
+    }
     case 'request.unserved': return alertUnservedRequest(String(p.requestId), String(p.reason ?? ''));
     case 'whatsapp.request_submitted':
       return Number(p.vendors ?? 0) === 0 ? alertUnservedRequest(String(p.requestId), 'NO_PROVIDER_IN_RANGE') : null;

@@ -123,8 +123,8 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
   });
   app.post('/v1/provider/categories/propose', async (req, reply) => {
     const me = await h.providerActor(req as never, reply); if (!me) return reply;
-    const { name, description } = z.object({ name: z.string().min(2).max(60), description: z.string().max(1000).optional() }).parse(req.body ?? {});
-    try { return { data: await categoryRulesService.propose(me.id, name, description ?? '') }; } catch (e) { return err(reply, e); }
+    const { name, description, groupId } = z.object({ name: z.string().min(2).max(60), description: z.string().max(1000).optional(), groupId: z.string().max(40).optional() }).parse(req.body ?? {});
+    try { return { data: await categoryRulesService.propose(me.id, name, description ?? '', { groupId }) }; } catch (e) { return err(reply, e); }
   });
   app.get('/v1/provider/categories/proposals', async (req, reply) => {
     const me = await h.providerActor(req as never, reply); if (!me) return reply;

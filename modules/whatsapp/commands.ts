@@ -30,13 +30,26 @@ export function parseCommand(text: string): Command | null {
 
 export const BUILTIN = new Set(['menu', 'book', 'sessions', 'switch', 'status', 'pay', 'invoice', 'reschedule', 'cancel', 'verify', 'recover', 'agent', 'stop', 'done', 'problem']);
 
-/** The command list. Categories come from the live catalog. */
-export function menuText(categories: { id: string; name: string }[]): string {
+/**
+ * The command list. Trades come from the live catalog, shown by group (there
+ * are too many to list one per line): each group with a few of its /<trade>
+ * shortcuts. Every active trade id works as a command.
+ */
+export function menuText(categories: { id: string; name: string; groupId?: string; groupName?: string }[]): string {
+  const groups: { name: string; ids: string[] }[] = [];
+  for (const c of categories) {
+    const key = c.groupName ?? 'Trades';
+    const g = groups.find((x) => x.name === key);
+    if (g) g.ids.push(c.id); else groups.push({ name: key, ids: [c.id] });
+  }
+  const trades = groups.length > 1 || categories.length > 10
+    ? groups.map((g) => `• ${g.name}: ${g.ids.slice(0, 3).map((id) => `/${id}`).join(' ')}${g.ids.length > 3 ? ` +${g.ids.length - 3} more` : ''}`)
+    : categories.map((c) => `/${c.id} – book ${c.name}`);
   return [
     "Here's everything you can type:",
     '',
-    '/book – start a new request',
-    ...categories.map((c) => `/${c.id} – book ${c.name}`),
+    '/book – start a new request (pick a group, then the trade)',
+    ...trades,
     '',
     '/sessions – see your open requests',
     '/switch AC-4821 – pick which request we\'re talking about',

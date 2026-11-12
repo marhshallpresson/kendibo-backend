@@ -78,7 +78,7 @@ async function labelFor(serviceId: unknown, categoryId: unknown, title: unknown)
     if (s[0]?.name) return String(s[0].name);
   }
   if (categoryId) {
-    const c = await q<{ name: string }>(`SELECT name FROM catalog.category WHERE id=$1`, [String(categoryId)]).catch(() => []);
+    const c = await q<{ name: string }>(`SELECT COALESCE(short_name, name) AS name FROM catalog.category WHERE id=$1`, [String(categoryId)]).catch(() => []);
     if (c[0]?.name) return String(c[0].name);
   }
   return String(title || 'your job').slice(0, 60);
