@@ -104,6 +104,16 @@ describe('provider-made categories', () => {
     assert.equal((await q(`SELECT id FROM catalog.category`)).length, before);
   });
 
+  it('"Add anyway" (force) skips similar-name suggestions but never duplicates an exact name', async () => {
+    const p = await provider('Lagos Smart Locks');
+    const forced = await app.inject({ method: 'POST', url: '/v1/provider/categories/propose', headers: bearer(p.token), payload: { name: 'CCTV installation', force: true } });
+    assert.equal(forced.statusCode, 200, forced.body);
+    assert.notEqual(forced.json().data.status, 'suggest', 'a similar name is created when the provider insists');
+    const exact = await app.inject({ method: 'POST', url: '/v1/provider/categories/propose', headers: bearer(p.token), payload: { name: 'cctv', force: true } });
+    assert.equal(exact.json().data.status, 'suggest');
+    assert.equal(exact.json().data.suggestion.id, 'cctv', 'an exact existing name is always reused');
+  });
+
   it('a new trade goes live at once, flagged new, proposer enrolled, ops alerted', async () => {
     const events: { event: string; props: Record<string, unknown> }[] = [];
     onEmit((event, props) => { if (event === 'category.provider_created') events.push({ event, props }); });

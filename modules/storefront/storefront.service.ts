@@ -156,6 +156,13 @@ export const storefrontService = {
         WHERE e.provider_id=$1 AND e.status='eligible' ORDER BY c.sort_order`, [providerId],
     ).catch(() => []);
     const name = p.businessName || p.displayName || 'Kendibo vendor';
+    // Home products the vendor sells (052), as their own list; customers see the price, not the split.
+    const { offeringService } = await import('../vendors/offering.service.js');
+    const products = (await offeringService.listForProvider(providerId, false, 'product').catch(() => []))
+      .map((o) => ({
+        id: o.id, categoryId: o.categoryId, name: o.name, description: o.description, priceKobo: o.priceKobo,
+        priceUnit: o.priceUnit, stockNote: o.stockNote, maxQuantity: o.maxQuantity, photoUrl: o.photoUrl,
+      }));
     return {
       id: p.id,
       slug: raw.slug ? String(raw.slug) : null,
@@ -184,6 +191,7 @@ export const storefrontService = {
       skills: p.skills ?? [],
       operatingHours: p.operatingHours ?? {},
       packages: Array.isArray(opHours.packages) ? opHours.packages : [],
+      products,
       socialLinks: (raw.social_links ?? {}) as Record<string, string>,
       gallery,
     };

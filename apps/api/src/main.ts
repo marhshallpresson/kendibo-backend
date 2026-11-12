@@ -2109,7 +2109,7 @@ app.post('/v1/media/presign', async (req, reply) => {
   // Session-scoped: presign mints an upload slot + storage URL. Was public.
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
   const { kind } = z.object({ kind: z.enum(['avatar', 'photo', 'video', 'doc']) }).parse(req.body);
-  return { data: await mediaService.presign(kind) };
+  return { data: await mediaService.presign(kind, a.sub) };
 });
 // Multipart direct upload (self-hosted path, ADR-001): auth -> validate ->
 // quarantine -> promote. Poor-network clients keep using presign + base64 ingest.
@@ -2120,7 +2120,7 @@ app.post('/v1/media/upload', async (req, reply) => {
     if (!file) return fail(reply, 'NO_FILE', 'Attach a single file field.');
     const kindRaw = (file.fields as Record<string, { value?: string } | undefined> | undefined)?.kind?.value ?? 'photo';
     const kind = kindRaw === 'avatar' || kindRaw === 'video' || kindRaw === 'doc' ? kindRaw : 'photo';
-    const { assetId } = await mediaService.presign(kind);
+    const { assetId } = await mediaService.presign(kind, a.sub);
     const bytes = await file.toBuffer();
     const done = await mediaService.ingest(assetId, bytes, file.mimetype);
     if (done.status !== 'clean') return fail(reply, 'FILE_REJECTED', 'File type or size not allowed.');
@@ -2797,16 +2797,25 @@ const offeringBody = z.object({
   categoryId: z.string().min(1).max(60), name: z.string().min(2).max(80), description: z.string().max(500).optional(),
   priceKobo: z.union([z.string().regex(/^\d+$/), z.number().int().positive()]), priceUnit: z.enum(['job', 'hour', 'visit', 'item']).optional(),
   durationMinutes: z.number().int().min(5).max(24 * 60).optional(),
+  // Product vendors (052): kind, stock note ("In stock", "2–3 days"), photo (own media asset), max order quantity.
+  kind: z.enum(['service', 'product']).optional(), stockNote: z.string().trim().max(60).nullable().optional(),
+  photoAssetId: z.string().min(1).max(64).nullable().optional(), maxQuantity: z.number().int().min(1).max(1000).optional(),
 });
+const offeringKindQuery = z.object({ kind: z.enum(['service', 'product']).optional() });
 const offeringError = (reply: FastifyReply, e: unknown) => {
   const m = (e as Error).message;
   if (m.startsWith('BELOW_MINIMUM')) return fail(reply, 'BELOW_MINIMUM', `The lowest price is ₦${(Number(m.split(':')[1]) / 100).toLocaleString('en-NG')}.`, 400);
+  if (m.startsWith('KIND_MISMATCH:')) return fail(reply, 'KIND_MISMATCH', m.slice('KIND_MISMATCH:'.length), 400);
+  if (m === 'BAD_CATEGORY') return fail(reply, 'BAD_CATEGORY', 'Choose one of Kendibo\'s trades.', 400);
+  if (m === 'BAD_MAX_QUANTITY') return fail(reply, 'BAD_MAX_QUANTITY', 'Max quantity must be between 1 and 1,000.', 400);
+  if (m === 'ASSET_NOT_FOUND') return fail(reply, 'ASSET_NOT_FOUND', 'Upload the product photo first (it must be your own image).', 400);
   if (m === 'NOT_FOUND') return fail(reply, 'NOT_FOUND', 'Price not found', 404);
   return fail(reply, 'OFFERING_ERROR', m, 400);
 };
 app.get('/v1/provider/offerings', async (req, reply) => {
   const me = await providerActor(req as never, reply); if (!me) return reply;
-  return { data: await offeringService.listForProvider(me.id, true) };
+  const { kind } = offeringKindQuery.parse(req.query ?? {});
+  return { data: await offeringService.listForProvider(me.id, true, kind) };
 });
 // "You receive ₦X after Kendibo's Y% commission" while the provider types a price.
 app.get('/v1/provider/offerings/preview', async (req, reply) => {
@@ -2831,7 +2840,8 @@ app.patch('/v1/provider/offerings/:id', async (req, reply) => {
 // A provider's prices, for signed-in customers (members-only marketplace).
 app.get('/v1/providers/:id/offerings', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
-  const rows = await offeringService.listForProvider((req.params as { id: string }).id);
+  const { kind } = offeringKindQuery.parse(req.query ?? {});
+  const rows = await offeringService.listForProvider((req.params as { id: string }).id, false, kind);
   return { data: rows.map(({ earnings: _e, ...o }) => o) }; // customers see the price, not the split
 });
 // Customer books a listed price with that provider.
@@ -2843,11 +2853,14 @@ app.post('/v1/offerings/:id/book', async (req, reply) => {
     lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180), addressText: z.string().max(200).optional(),
     notes: z.string().max(500).optional(), scheduledDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     timeWindow: z.string().max(20).optional(),
+    quantity: z.number().int().optional(), // products only (1..max_quantity); services ignore it
   }).parse(req.body);
   try { return { data: await offeringService.book(a.sub, (req.params as { id: string }).id, { ...b, idempotencyKey: idem }) }; }
   catch (e) {
     const m = (e as Error).message;
     if (m === 'OFFERING_GONE') return fail(reply, 'OFFERING_GONE', 'This price is no longer available.', 404);
+    if (m.startsWith('QUANTITY_RANGE:')) return fail(reply, 'QUANTITY_RANGE', `Choose a quantity from 1 to ${m.split(':')[1]}.`, 400);
+    if (m.startsWith('BELOW_ORDER_MINIMUM:')) return fail(reply, 'BELOW_ORDER_MINIMUM', `The smallest order is ₦${(Number(m.split(':')[1]) / 100).toLocaleString('en-NG')}.`, 400);
     if (m === 'PROVIDER_UNAVAILABLE') return fail(reply, 'PROVIDER_UNAVAILABLE', 'This pro cannot take new jobs right now. Try another pro.', 409);
     throw e;
   }
