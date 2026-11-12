@@ -1,5 +1,5 @@
 // Identity module — Postgres-backed users, device sessions, PIN, biometrics.
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { issueOtp, verifyOtp, signAccess, signRefresh, rotateRefresh, revokeAll } from '../../packages/auth/auth.js';
 import { welcomeService } from '../notifications/welcome.js';
 import { q } from '../../packages/database/db.js';
@@ -8,6 +8,13 @@ import { providerService } from '../providers/provider.service.js';
 import { isAdminRole, rolePerms } from '../authorization/rbac.js';
 import { sms, email } from '../notifications/channels.js';
 import { templates } from '../notifications/mail.templates.js';
+import { adminTwoFactor, adminLoginChallenge, adminSessions } from './admin-security.service.js';
+
+export type LoginDevice = { fp?: string; platform?: string; model?: string; os?: string; appVersion?: string; ip?: string; city?: string; ua?: string };
+/** Admin with 2FA on: the first factor passed, the session waits for POST /v1/admin/login/2fa. */
+export interface TwoFactorChallenge { twoFactorRequired: true; challengeId: string; isNew: boolean }
+const CUSTOMER_PERMS = ['booking:create', 'booking:view:self', 'booking:cancel'];
+const newDeviceId = () => `dev_${Date.now().toString(36)}${randomBytes(3).toString('hex')}`;
 
 export interface User {
   id: string; phone?: string; email?: string; hasPin: boolean; biometric: boolean;
@@ -59,7 +66,7 @@ export const identityService = {
     }
     return { devCode: r.devCode };
   },
-  async verifyOtp(channel: 'phone' | 'email', identity: string, code: string, device?: { fp?: string; platform?: string; model?: string; os?: string; appVersion?: string; ip?: string; city?: string; name?: string; role?: string }) {
+  async verifyOtp(channel: 'phone' | 'email', identity: string, code: string, device?: LoginDevice & { name?: string; role?: string }) {
     const norm = this.normalizeIdentity(identity);
     if (norm.channel !== channel) return null;
     if (!(await verifyOtp(channel, norm.value, code))) return null;
@@ -114,18 +121,53 @@ export const identityService = {
     if (String(user.role ?? '').toUpperCase() === 'PROVIDER') {
       await providerService.onboard(String(user.id));
     }
-    const deviceId = `dev_${Date.now().toString(36)}`;
-    // Permissions are derived from the role the DB actually holds, not a
-    // hardcoded customer pair — an admin seat would otherwise mint a token
-    // with no admin grants and every /v1/admin call would 403.
+    const challenge = await this.loginGate(user, device);
+    if (challenge) return { ...challenge, isNew };
+    return { ...(await this.issueSession(user, device)), isNew };
+  },
+  /**
+   * Runs before any session is issued (OTP, Google, Facebook): a suspended
+   * account is refused (ACCOUNT_SUSPENDED); an admin with 2FA on gets a
+   * challenge instead of tokens.
+   */
+  async loginGate(user: Record<string, unknown>, device?: LoginDevice): Promise<Omit<TwoFactorChallenge, 'isNew'> | null> {
+    if (String(user.status ?? '') === 'suspended') throw new Error('ACCOUNT_SUSPENDED');
     const role = String(user.role ?? 'CUSTOMER').toUpperCase();
-    const permissions = isAdminRole(role)
-      ? [...rolePerms(role)]
-      : ['booking:create', 'booking:view:self', 'booking:cancel'];
-    const access = signAccess(String(user.id), permissions);
-    const refresh = await signRefresh(String(user.id), deviceId);
-    await this.logDevice(String(user.id), device ?? {});
-    return { user: row(user), access, refresh: refresh.token, deviceId, isNew };
+    if (isAdminRole(role) && await adminTwoFactor.enabled(String(user.id))) {
+      const { ua, ip, ...rest } = device ?? {};
+      const challengeId = await adminLoginChallenge.create(String(user.id), rest, ip ?? null, ua ?? null);
+      return { twoFactorRequired: true, challengeId };
+    }
+    return null;
+  },
+  /**
+   * Access + refresh for a user. Permissions are derived from the role the DB
+   * actually holds, not a hardcoded customer pair — an admin seat would
+   * otherwise mint a token with no admin grants and every /v1/admin call would
+   * 403. Admin logins start a tracked session (idle timeout, 2FA marker).
+   */
+  async issueSession(user: Record<string, unknown>, device?: LoginDevice, opts: { permissions?: string[]; mfa?: boolean } = {}) {
+    const id = String(user.id);
+    const role = String(user.role ?? 'CUSTOMER').toUpperCase();
+    const permissions = opts.permissions ?? (isAdminRole(role) ? [...rolePerms(role)] : CUSTOMER_PERMS);
+    const deviceId = newDeviceId();
+    const access = signAccess(id, permissions, deviceId);
+    const refresh = await signRefresh(id, deviceId);
+    if (isAdminRole(role)) await adminSessions.start(id, deviceId, opts.mfa === true);
+    const { ua: _ua, ...d } = device ?? {};
+    void _ua;
+    await this.logDevice(id, d);
+    return { user: row(user), access, refresh: refresh.token, deviceId };
+  },
+  /** Open bookings as customer, or accepted jobs as provider — blocks account erasure. */
+  async hasOpenBookings(userId: string): Promise<boolean> {
+    const open = await q(
+      `SELECT 1 FROM booking.booking b
+        WHERE (b.user_id=$1 OR b.id::text IN (SELECT da.job_id FROM dispatch.assignment da JOIN provider.provider p ON p.id=da.provider_id
+                                                WHERE p.user_id=$1 AND da.status='accepted'))
+          AND upper(b.status) NOT IN ('COMPLETED','CANCELLED','CANCELED','REFUNDED','CLOSED','DECLINED','EXPIRED') LIMIT 1`, [userId],
+    );
+    return Boolean(open[0]);
   },
   refresh(token: string) { return rotateRefresh(token); },
   logoutAll(userId: string) { return revokeAll(userId); },
@@ -265,7 +307,7 @@ export const identityService = {
     } catch { /* alert is best effort */ }
   },
   /** Google SSO: verify ID token (or OAuth2 access token), match-or-create verified user, same session bundle. */
-  async googleVerify(idToken: string, device?: { fp?: string; platform?: string; model?: string; os?: string; appVersion?: string; ip?: string; city?: string }) {
+  async googleVerify(idToken: string, device?: LoginDevice) {
     // Fail fast on obvious junk without network (keeps tests hermetic, avoids
     // useless external round-trip on garbage that can never verify).
     const trimmedToken = (idToken ?? '').trim();
@@ -344,19 +386,12 @@ export const identityService = {
       );
       if (upd[0]) userRow = upd[0];
     }
-    const user = row(userRow);
-    const role = String(userRow.role ?? 'CUSTOMER').toUpperCase();
-    const permissions = isAdminRole(role)
-      ? [...rolePerms(role)]
-      : ['booking:create', 'booking:view:self', 'booking:cancel'];
-    const deviceId = `dev_${Date.now().toString(36)}`;
-    const access = signAccess(user.id, permissions);
-    const refresh = await signRefresh(user.id, deviceId);
-    await this.logDevice(user.id, device ?? {});
-    return { user, access, refresh: refresh.token, deviceId, isNew };
+    const challenge = await this.loginGate(userRow, device);
+    if (challenge) return { ...challenge, isNew };
+    return { ...(await this.issueSession(userRow, device)), isNew };
   },
   /** Facebook Login: verify the token with Meta (see facebook.ts), match-or-create, same session bundle. */
-  async facebookVerify(accessToken: string, device?: { fp?: string; platform?: string; model?: string; os?: string; appVersion?: string; ip?: string; city?: string }) {
+  async facebookVerify(accessToken: string, device?: LoginDevice) {
     const { verifyFacebookToken } = await import('./facebook.js');
     const p = await verifyFacebookToken(accessToken);
     let rows = await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE facebook_sub=$1`, [p.id]);
@@ -376,12 +411,9 @@ export const identityService = {
         void welcomeService.send({ id: String((rows[0] as { id?: unknown }).id), name, email: p.email, phone: null }).catch(() => {});
       }
     }
-    const user = row(rows[0]);
-    const deviceId = `dev_${Date.now().toString(36)}`;
-    const access = signAccess(user.id, ['booking:create', 'booking:view:self']);
-    const refresh = await signRefresh(user.id, deviceId);
-    await this.logDevice(user.id, device ?? {});
-    return { user, access, refresh: refresh.token, deviceId, isNew };
+    const challenge = await this.loginGate(rows[0], device);
+    if (challenge) return { ...challenge, isNew };
+    return { ...(await this.issueSession(rows[0], device, { permissions: ['booking:create', 'booking:view:self'] })), isNew };
   },
   /**
    * Meta Data Deletion Request / deauthorize: unlink the Facebook id and drop
