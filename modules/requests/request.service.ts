@@ -171,7 +171,9 @@ export const requestService = {
     // Came through a vendor's storefront link: that vendor gets first refusal,
     // but only if the category rules clear them — a link never bypasses vetting.
     const { vendorEligibilityService } = await import('../vendors/eligibility.service.js');
-    if (!(await vendorEligibilityService.allowed(r.preferredProviderId, r.categoryId))) return ranked;
+    const { tierService } = await import('../tiers/tier.service.js');
+    const amountKobo = await tierService.jobAmountKobo({ requestId: r.id }).catch(() => null);
+    if (!(await vendorEligibilityService.allowed(r.preferredProviderId, r.categoryId, { amountKobo }))) return ranked;
     const rest = ranked.candidates.filter((c) => c.providerId !== r.preferredProviderId);
     const own = ranked.candidates.find((c) => c.providerId === r.preferredProviderId) ?? { providerId: r.preferredProviderId, score: 100, distanceKm: 0 };
     return { ...ranked, candidates: [own, ...rest].slice(0, 10), note: `${ranked.note}+PREFERRED` };
@@ -179,8 +181,10 @@ export const requestService = {
 
   async rankCandidates(r: ServiceRequest): Promise<{ requestId: string; candidates: MatchCandidate[]; note: string }> {
     if (r.lat == null || r.lng == null) return { requestId: r.id, candidates: [], note: 'NO_LOCATION' };
+    const { tierService } = await import('../tiers/tier.service.js');
+    const amountKobo = await tierService.jobAmountKobo({ requestId: r.id }).catch(() => null);
     if (r.serviceId) {
-      const cands = await dispatchService.findCandidates({ serviceId: r.serviceId, lat: r.lat, lng: r.lng });
+      const cands = await dispatchService.findCandidates({ serviceId: r.serviceId, lat: r.lat, lng: r.lng, amountKobo });
       return { requestId: r.id, candidates: cands.slice(0, 10), note: 'SKILL_MATCHED' };
     }
     const { providerService } = await import('../providers/provider.service.js');
@@ -199,8 +203,12 @@ export const requestService = {
     const scored: MatchCandidate[] = [];
     for (const c of nearby) {
       if (scored.length >= 10) break;
-      if (await vendorEligibilityService.allowed(c.providerId, r.categoryId)) scored.push(c);
+      if (await vendorEligibilityService.allowed(c.providerId, r.categoryId, { amountKobo })) {
+        // Tier 2/3 and Kendibo Pro rank higher among the cleared vendors.
+        scored.push({ ...c, score: Math.round((c.score + (await tierService.rankBoost(c.providerId).catch(() => 0))) * 10) / 10 });
+      }
     }
+    scored.sort((a, b) => b.score - a.score);
     return { requestId: r.id, candidates: scored, note: r.categoryId ? 'CATEGORY_MATCHED' : 'PROXIMITY_MATCHED' };
   },
 

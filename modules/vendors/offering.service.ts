@@ -96,8 +96,13 @@ async function checkShape(s: { categoryId: string; kind: OfferingKind; priceUnit
 }
 
 /** What the provider takes home from a price, under the trade's commission. */
-export async function earningsFor(categoryId: string | null, priceKobo: bigint): Promise<Earnings> {
-  const bps = categoryId ? (await categoryRulesService.ruleFor(categoryId)).commissionBps : 1500;
+export async function earningsFor(categoryId: string | null, priceKobo: bigint, providerId?: string): Promise<Earnings> {
+  let bps = categoryId ? (await categoryRulesService.ruleFor(categoryId)).commissionBps : 1500;
+  // Kendibo Pro / Tier 3 pay a lower commission (same rule as settlement).
+  if (providerId) {
+    const { tierService } = await import('../tiers/tier.service.js');
+    bps = await tierService.commissionBpsFor(providerId, bps).catch(() => bps);
+  }
   const commission = (priceKobo * BigInt(bps)) / 10000n; // rounded down: the provider never loses a kobo
   const { vatOn, COMMISSION_VAT_BPS } = await import('./vendor-finance.service.js');
   const vat = vatOn(commission); // VAT on Kendibo's commission, from the provider's share
@@ -110,7 +115,18 @@ export const offeringService = {
       `SELECT * FROM provider.offering WHERE provider_id=$1 ${includeInactive ? '' : 'AND active'} ORDER BY created_at`, [providerId],
     );
     const picked = rows.map(toOffering).filter((o) => !kind || o.kind === kind);
-    return Promise.all(picked.map(async (o) => ({ ...(await withPhotoUrl(o)), earnings: await earningsFor(o.categoryId, BigInt(o.priceKobo)) })));
+    return Promise.all(picked.map(async (o) => ({ ...(await withPhotoUrl(o)), earnings: await earningsFor(o.categoryId, BigInt(o.priceKobo), providerId) })));
+  },
+
+  /** Product listings are capped by tier (enforced with vendor eligibility). */
+  async checkListingCap(providerId: string, ignoreId?: string) {
+    const { eligibilityEnforced } = await import('./eligibility.service.js');
+    if (!eligibilityEnforced()) return;
+    const { tierService } = await import('../tiers/tier.service.js');
+    const max = await tierService.maxListings(providerId);
+    if (max === null) return;
+    const rows = await q<{ id: string }>(`SELECT id FROM provider.offering WHERE provider_id=$1 AND active AND kind='product'`, [providerId]);
+    if (rows.filter((r) => String(r.id) !== ignoreId).length >= max) throw new Error(`LISTING_LIMIT:${max}`);
   },
 
   async create(providerId: string, input: OfferingInput) {
@@ -120,6 +136,7 @@ export const offeringService = {
     const photoAssetId = input.photoAssetId ?? null;
     await checkShape({ categoryId: input.categoryId, kind, priceUnit, priceKobo: input.priceKobo, maxQuantity });
     if (photoAssetId && !(await assetOwnedBy(photoAssetId, providerId))) throw new Error('ASSET_NOT_FOUND');
+    if (kind === 'product') await this.checkListingCap(providerId);
     const rows = await q<Record<string, unknown>>(
       `INSERT INTO provider.offering (provider_id, category_id, name, description, price_kobo, price_unit, duration_minutes, kind, stock_note, photo_asset_id, max_quantity)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
@@ -128,7 +145,7 @@ export const offeringService = {
     );
     emit('offering.created', { providerId, categoryId: input.categoryId, kind });
     const o = toOffering(rows[0]);
-    return { ...(await withPhotoUrl(o)), earnings: await earningsFor(o.categoryId, input.priceKobo) };
+    return { ...(await withPhotoUrl(o)), earnings: await earningsFor(o.categoryId, input.priceKobo, providerId) };
   },
 
   async update(providerId: string, id: string, patch: {
@@ -148,6 +165,8 @@ export const offeringService = {
       await checkShape({ categoryId: c.categoryId, kind, priceUnit, priceKobo, maxQuantity });
     }
     if (patch.photoAssetId && patch.photoAssetId !== c.photoAssetId && !(await assetOwnedBy(patch.photoAssetId, providerId))) throw new Error('ASSET_NOT_FOUND');
+    // Re-listing (or turning a service into a product) counts against the tier's listing cap.
+    if (kind === 'product' && (patch.active ?? c.active) && (!c.active || c.kind !== 'product')) await this.checkListingCap(providerId, id);
     const rows = await q<Record<string, unknown>>(
       `UPDATE provider.offering SET name=$3, description=$4, price_kobo=$5, price_unit=$6, duration_minutes=$7, active=$8,
               kind=$9, stock_note=$10, photo_asset_id=$11, max_quantity=$12, updated_at=now()
@@ -157,7 +176,7 @@ export const offeringService = {
        kind, patch.stockNote !== undefined ? (patch.stockNote?.slice(0, 60) ?? null) : c.stockNote, photoAssetId, maxQuantity],
     );
     const o = toOffering(rows[0]);
-    return { ...(await withPhotoUrl(o)), earnings: await earningsFor(o.categoryId, BigInt(o.priceKobo)) };
+    return { ...(await withPhotoUrl(o)), earnings: await earningsFor(o.categoryId, BigInt(o.priceKobo), providerId) };
   },
 
   async get(id: string): Promise<Offering | null> {
@@ -182,7 +201,8 @@ export const offeringService = {
     const totalKobo = unitKobo * BigInt(quantity);
     if (o.kind === 'product' && totalKobo < PRODUCT_MIN_ORDER_KOBO()) throw new Error(`BELOW_ORDER_MINIMUM:${PRODUCT_MIN_ORDER_KOBO()}`);
     const { vendorEligibilityService } = await import('./eligibility.service.js');
-    if (!(await vendorEligibilityService.allowed(o.providerId, o.categoryId))) throw new Error('PROVIDER_UNAVAILABLE');
+    // The order total must fit the vendor's per-job tier cap.
+    if (!(await vendorEligibilityService.allowed(o.providerId, o.categoryId, { amountKobo: totalKobo }))) throw new Error('PROVIDER_UNAVAILABLE');
     const prior = await q<{ id: string }>(`SELECT id FROM booking.service_request WHERE user_id=$1 AND idempotency_key=$2`, [userId, input.idempotencyKey]);
     if (prior[0]) return { requestId: String(prior[0].id) };
     const rows = await q<{ id: string }>(

@@ -28,7 +28,7 @@ export function parseCommand(text: string): Command | null {
   return null;
 }
 
-export const BUILTIN = new Set(['menu', 'book', 'sessions', 'switch', 'status', 'pay', 'invoice', 'reschedule', 'cancel', 'verify', 'recover', 'agent', 'stop', 'done', 'problem']);
+export const BUILTIN = new Set(['menu', 'book', 'sessions', 'switch', 'status', 'pay', 'invoice', 'reschedule', 'cancel', 'verify', 'recover', 'agent', 'stop', 'done', 'problem', 'tier']);
 
 /**
  * The command list. Trades come from the live catalog, shown by group (there

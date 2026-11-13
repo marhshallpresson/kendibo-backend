@@ -279,7 +279,8 @@ export const providerService = {
       `SELECT p.*, u.name AS user_name
          FROM provider.provider p
          LEFT JOIN identity.users u ON u.id = p.user_id
-        WHERE p.online=TRUE AND p.kyc_status='VERIFIED' AND p.status='active'`,
+        WHERE p.online=TRUE AND p.status='active'
+          AND (p.kyc_status='VERIFIED' OR (p.kyc_status='UNDER_REVIEW' AND p.kyc_pending_reason='manual_verification'))`,
     );
     return Promise.all(rows.map(toProv));
   },

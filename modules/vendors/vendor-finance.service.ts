@@ -20,7 +20,7 @@ export const vendorFinanceService = {
   /** Split what was actually collected for a booking: platform commission by
    *  the category's rule, remainder to the vendor. Rounds commission down so
    *  the vendor never loses a fractional kobo. */
-  async settlementSplit(bookingId: string): Promise<SettlementSplit> {
+  async settlementSplit(bookingId: string, providerId?: string): Promise<SettlementSplit> {
     const paid = await q<{ total: string }>(
       `SELECT COALESCE(SUM(amount_kobo),0) AS total FROM payment.payment WHERE booking_id=$1 AND status='successful'`, [bookingId],
     );
@@ -35,7 +35,12 @@ export const vendorFinanceService = {
       const fromReq = await q<{ category_id: string | null }>(`SELECT category_id FROM booking.service_request WHERE booking_id=$1 LIMIT 1`, [bookingId]).catch(() => []);
       categoryId = fromReq[0]?.category_id ? String(fromReq[0].category_id) : null;
     }
-    const bps = categoryId ? (await categoryRulesService.ruleFor(categoryId)).commissionBps : 1500;
+    let bps = categoryId ? (await categoryRulesService.ruleFor(categoryId)).commissionBps : 1500;
+    // Kendibo Pro subscribers and Tier 3 pay the lower commission (tier.config.ts).
+    if (providerId) {
+      const { tierService } = await import('../tiers/tier.service.js');
+      bps = await tierService.commissionBpsFor(providerId, bps).catch(() => bps);
+    }
     const commission = (collected * BigInt(bps)) / 10000n;
     const vat = vatOn(commission);
     return { bookingId, categoryId, collectedKobo: collected, commissionBps: bps, commissionKobo: commission, vatKobo: vat, providerKobo: collected - commission - vat };
@@ -43,7 +48,7 @@ export const vendorFinanceService = {
 
   /** Idempotent per (provider, job): a retried settlement never double-credits. */
   async creditEarning(providerId: string, bookingId: string): Promise<SettlementSplit> {
-    const split = await this.settlementSplit(bookingId);
+    const split = await this.settlementSplit(bookingId, providerId);
     if (split.providerKobo <= 0n) throw new Error('NOTHING_COLLECTED');
     const existing = await q(`SELECT 1 FROM provider.earning WHERE provider_id=$1 AND job_id=$2`, [providerId, bookingId]);
     if (!existing[0]) {
@@ -53,6 +58,9 @@ export const vendorFinanceService = {
         [providerId, bookingId, String(split.providerKobo), String(split.collectedKobo), String(split.commissionKobo), split.commissionBps, String(split.vatKobo)],
       );
       emit('vendor.earning_credited', { providerId, bookingId, providerKobo: String(split.providerKobo) });
+      // A completed job may earn back the tier upgrade fee (wallet credit).
+      const { tierService } = await import('../tiers/tier.service.js');
+      await tierService.checkRefunds(providerId).catch(() => undefined);
     }
     return split;
   },
@@ -88,10 +96,26 @@ export const vendorFinanceService = {
     const earnedK = big(earned[0]?.t);
     const paidK = big(paid[0]?.t);
     const feesK = big(fees[0]?.t);
-    const available = earnedK - paidK - feesK;
+    // Tier payout hold: earnings younger than the tier's hold (48h Tier 1, 24h
+    // Tier 2, same day Tier 3) are not yet withdrawable. Enforced with the
+    // vendor eligibility switch, like the other tier limits.
+    let holdHours = 0;
+    let heldK = 0n;
+    const { eligibilityEnforced } = await import('./eligibility.service.js');
+    if (eligibilityEnforced()) {
+      const { tierService } = await import('../tiers/tier.service.js');
+      holdHours = await tierService.payoutHoldHours(providerId).catch(() => 0);
+      if (holdHours > 0) {
+        const since = new Date(Date.now() - holdHours * 3600_000).toISOString();
+        const recent = await q<{ t: string }>(`SELECT COALESCE(SUM(amount_kobo + tip_kobo),0) AS t FROM provider.earning WHERE provider_id=$1 AND created_at > $2`, [providerId, since]);
+        heldK = big(recent[0]?.t);
+      }
+    }
+    const available = earnedK - paidK - feesK - heldK;
     return {
       earnedKobo: earnedK.toString(), paidOutKobo: paidK.toString(), outstandingFeesKobo: feesK.toString(),
       availableKobo: (available > 0n ? available : 0n).toString(),
+      onHoldKobo: heldK.toString(), payoutHoldHours: holdHours,
     };
   },
 

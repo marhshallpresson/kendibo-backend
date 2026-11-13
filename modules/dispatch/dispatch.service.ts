@@ -19,7 +19,7 @@ const OFFER_SLA_SECONDS = Number(process.env.DISPATCH_OFFER_SLA_SECONDS ?? 180);
 
 export const dispatchService = {
   weights: WEIGHTS,
-  async findCandidates(job: { serviceId: string; lat: number; lng: number; radiusKm?: number }): Promise<Candidate[]> {
+  async findCandidates(job: { serviceId: string; lat: number; lng: number; radiusKm?: number; amountKobo?: bigint | null }): Promise<Candidate[]> {
     const svc = await catalogService.get(job.serviceId);
     const catRow = await q<{ category_id: string }>(`SELECT category_id FROM catalog.service WHERE id=$1`, [job.serviceId]);
     const categoryId = catRow[0]?.category_id ? String(catRow[0].category_id) : null;
@@ -42,12 +42,16 @@ export const dispatchService = {
         if (prov[0]?.kyc_status !== 'VERIFIED') continue; // skilled work needs KYC
       }
       // Category rules (KYC tier, face match, licence, capacity) decide who may be offered the job.
-      if (!(await vendorEligibilityService.allowed(p.id, categoryId))) continue;
+      // ...and the tier: per-job cap (when the price is known) and open-job limit.
+      if (!(await vendorEligibilityService.allowed(p.id, categoryId, { amountKobo: job.amountKobo ?? null }))) continue;
       const qual = await q<Record<string, unknown>>(`SELECT * FROM provider.quality WHERE provider_id=$1`, [p.id]);
       const rating = Number(qual[0]?.rating ?? 4.5) || 4.5;
       const loadRows = await q<{ c: number }>(`SELECT count(*) c FROM dispatch.assignment WHERE provider_id=$1 AND status='accepted'`, [p.id]);
       const load = Number(loadRows[0]?.c ?? 0);
-      const score = 100 - WEIGHTS.distance * d * 4 + WEIGHTS.rating * rating * 10 - WEIGHTS.workload * load * 5 + Math.random() * WEIGHTS.fairness * 10;
+      // Tier 2/3 and an active Kendibo Pro subscription rank higher.
+      const { tierService } = await import('../tiers/tier.service.js');
+      const boost = await tierService.rankBoost(p.id).catch(() => 0);
+      const score = 100 - WEIGHTS.distance * d * 4 + WEIGHTS.rating * rating * 10 - WEIGHTS.workload * load * 5 + Math.random() * WEIGHTS.fairness * 10 + boost;
       out.push({ providerId: p.id, score: Math.round(score * 10) / 10, distanceKm: Math.round(d * 100) / 100 });
     }
     return out.sort((a, b) => b.score - a.score);
@@ -96,7 +100,8 @@ export const dispatchService = {
     const considered = await q<Record<string, unknown>>(`SELECT provider_id FROM dispatch.assignment WHERE job_id=$1`, [jobId]);
     const consideredSet = new Set(considered.map(r => String(r.provider_id)));
     
-    const candidates = await this.findCandidates({ serviceId, lat, lng });
+    const price = await q<{ price_kobo: string }>(`SELECT price_kobo FROM booking.booking WHERE id::text=$1`, [jobId]).catch(() => []);
+    const candidates = await this.findCandidates({ serviceId, lat, lng, amountKobo: price[0]?.price_kobo != null ? BigInt(String(price[0].price_kobo)) : null });
     const next = candidates.find(c => !consideredSet.has(c.providerId));
     if (next) {
       await this.assign(jobId, next.providerId);

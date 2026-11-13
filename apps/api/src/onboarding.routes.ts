@@ -2,10 +2,15 @@
 // GET  /v1/provider/onboarding/progress  -> where the pro is and what they entered
 // PUT  /v1/provider/onboarding/progress  -> save one step (creates the provider
 //                                           profile on the first save)
+// Documents and CAC are optional: finishing Tier 1 (contact, NIN — verified or
+// in manual review — selfie, a trade and a service area) is enough to start
+// low-risk work. `tier1` in the response says what is still missing; Tier 2/3
+// documents are collected later (GET /v1/provider/tier).
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { q } from '../../../packages/database/db.js';
 import { providerService } from '../../../modules/providers/provider.service.js';
+import { tierService } from '../../../modules/tiers/tier.service.js';
 
 interface Helpers {
   authed: (req: never) => { sub: string } | null;
@@ -65,9 +70,12 @@ async function progressFor(userId: string) {
   const p = r[0];
   if (!p) return { started: false, step: 'account' as Step, accountType: null, draft: {}, kycStatus: null, steps: ONBOARDING_STEPS, updatedAt: null };
   const draft = typeof p.onboarding_draft === 'string' ? JSON.parse(p.onboarding_draft) : (p.onboarding_draft ?? {});
+  const tier1 = await tierService.tier1Status(String(p.id)).catch(() => ({ done: false, missing: [] as string[], manualReview: false }));
   return {
     started: true,
     providerId: String(p.id),
+    /** Tier 1 complete = eligible for low-risk jobs (no documents/CAC needed). */
+    tier1,
     step: (p.onboarding_step as Step) ?? 'account',
     accountType: (p.account_type as string) ?? null,
     draft,
