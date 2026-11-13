@@ -8,7 +8,7 @@ import { PagaAdapter } from '../modules/payments/paga.adapter.js';
 
 const cfg = pagaConfig();
 const step = process.argv[2] ?? 'all';
-const out = (label: string, v: unknown) => console.log(`${label.padEnd(22)} ${typeof v === 'string' ? v : JSON.stringify(v)}`);
+const out = (label: string, v: unknown) => console.log(`${label.padEnd(22)} ${typeof v === 'string' ? v : JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? x.toString() : x))}`);
 
 function explain(e: unknown) {
   if (e instanceof PagaError) {
