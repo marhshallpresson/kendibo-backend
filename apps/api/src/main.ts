@@ -62,6 +62,7 @@ import { registerKycAdminRoutes } from './kyc-admin.routes.js';
 import { registerVirtualAccountRoutes, VIRTUAL_ACCOUNT_ROUTE_POLICY } from './virtual-account.routes.js';
 import { installVirtualAccountHooks, chargeForWalletPayment, reverseWalletCharge, VaError } from '../../../modules/payments/paga/virtual-accounts.js';
 import { onEmit } from '../../../packages/observability/emit.js';
+import { registerAdminPasswordRoutes, ADMIN_PASSWORD_POLICY } from './admin-password.routes.js';
 import { registerAdminConsoleRoutes, ADMIN_CONSOLE_POLICY, accountGate, refreshGate, adminLogin, sendLocked, clientIp, auditQuerySchema } from './admin-console.routes.js';
 import { installAdminAlerts } from '../../../modules/notifications/admin-alerts.service.js';
 import { startLifecycleSweeper } from '../../../modules/notifications/lifecycle.service.js';
@@ -313,7 +314,7 @@ const ROUTE_POLICY: Record<string, RoutePolicy> = {
 };
 // Vendor platform routes (storefronts, trade rules, WhatsApp) declare their own
 // public/permission entries next to the handlers; merged into the same gate.
-Object.assign(ROUTE_POLICY, VENDOR_ROUTE_POLICY, ADMIN_OPS_POLICY, EMAIL_ROUTE_POLICY, VIRTUAL_ACCOUNT_ROUTE_POLICY, ADMIN_CONSOLE_POLICY);
+Object.assign(ROUTE_POLICY, VENDOR_ROUTE_POLICY, ADMIN_OPS_POLICY, EMAIL_ROUTE_POLICY, VIRTUAL_ACCOUNT_ROUTE_POLICY, ADMIN_CONSOLE_POLICY, ADMIN_PASSWORD_POLICY);
 
 app.addHook('onRequest', async (req, reply) => {
   const url = req.routeOptions.url;
@@ -3382,6 +3383,7 @@ registerKycAdminRoutes(app, { fail: fail as never, adminActor: adminActor as nev
 registerVirtualAccountRoutes(app, { authed: authed as never, fail: fail as never });
 installVirtualAccountHooks(onEmit);
 registerAdminConsoleRoutes(app, { fail: fail as never, adminActor: adminActor as never });
+registerAdminPasswordRoutes(app, { fail: fail as never, adminActor: adminActor as never });
 installAdminAlerts();
 if (process.env.NODE_ENV !== 'test') startLifecycleSweeper();
 Object.assign(ROUTE_POLICY, INVOICE_ROUTE_POLICY); registerInvoiceRoutes(app, { fail: fail as never, bookingParty: bookingParty as never, providerActor });

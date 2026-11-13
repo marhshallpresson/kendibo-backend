@@ -38,6 +38,26 @@ function clean(data: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
+/** 08012345678 / 2348012345678 / +234 801 234 5678 → +2348012345678; anything else → null. */
+export function onboardingPhoneE164(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const d = raw.replace(/\D/g, '');
+  if (d.length === 11 && d.startsWith('0')) return `+234${d.slice(1)}`;
+  if (d.length === 13 && d.startsWith('234')) return `+${d}`;
+  return null;
+}
+
+async function linkOnboardingPhone(userId: string, data: Record<string, unknown> | undefined): Promise<void> {
+  const raw = Object.entries(data ?? {}).find(([k, v]) => /phone/i.test(k) && typeof v === 'string')?.[1];
+  const phone = onboardingPhoneE164(raw);
+  if (!phone) return;
+  await q(
+    `UPDATE identity.users SET phone=$2 WHERE id=$1 AND phone IS NULL
+       AND NOT EXISTS (SELECT 1 FROM identity.users o WHERE o.phone=$2 AND o.id<>$1)`,
+    [userId, phone],
+  ).catch(() => undefined);
+}
+
 async function progressFor(userId: string) {
   const r = await q<Record<string, unknown>>(
     `SELECT id, kyc_status, account_type, onboarding_step, onboarding_draft, onboarding_updated_at FROM provider.provider WHERE user_id=$1`, [userId],
@@ -68,6 +88,10 @@ export function registerOnboardingRoutes(app: FastifyInstance, h: Helpers) {
     const parsed = saveSchema.safeParse(req.body ?? {});
     if (!parsed.success) return h.fail(reply, 'VALIDATION_ERROR', parsed.error.issues[0]?.message ?? 'Check the details and try again.', 400);
     const { step, accountType, data } = parsed.data;
+    // A phone typed during onboarding belongs on the account (only if the account has
+    // none and nobody else uses it). Saved BEFORE the profile is created, so the
+    // "profile started" admin alert can show it.
+    await linkOnboardingPhone(a.sub, data as Record<string, unknown>);
     await providerService.onboard(a.sub); // idempotent: first save creates the profile
     const current = await progressFor(a.sub);
     const draft = { ...(current.draft as Record<string, unknown>), [step]: clean(data) };
