@@ -11,6 +11,7 @@ import { z } from 'zod';
 import { q } from '../../packages/database/db.js';
 import { emit } from '../../packages/observability/emit.js';
 import { providerService } from '../providers/provider.service.js';
+import { formatNaira } from '../payments/money.js';
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$/;
 // Words that would let a vendor impersonate the platform or collide with routes.
@@ -304,6 +305,7 @@ h1{font-size:24px;line-height:1.25;margin:0 0 4px}p{margin:0;color:var(--sub)}
   </section>
   ${sf.bio ? `<section class="card"><h2 style="font-size:17px;margin:0 0 6px">About</h2><p>${esc(sf.bio)}</p></section>` : ''}
   ${sf.categories.length ? `<section class="card"><h2 style="font-size:17px;margin:0 0 6px">Services</h2><ul>${sf.categories.map((c) => `<li>${esc(c.name)}</li>`).join('')}</ul></section>` : ''}
+  ${sf.products.length ? `<section class="card"><h2 style="font-size:17px;margin:0 0 6px">Products</h2><ul>${sf.products.map((o) => `<li>${esc(o.name)} · ${esc(formatNaira(BigInt(o.priceKobo)))} per item${o.stockNote ? ` · ${esc(o.stockNote)}` : ''}</li>`).join('')}</ul></section>` : ''}
   ${sf.serviceAreas.length ? `<section class="card"><h2 style="font-size:17px;margin:0 0 6px">Areas covered</h2><p>${esc(sf.serviceAreas.join(', '))}</p></section>` : ''}
   <p style="font-size:13px;text-align:center;margin-top:16px">Payments are held by Kendibo until the job is done.</p>
 </main>
