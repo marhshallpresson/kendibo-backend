@@ -28,7 +28,7 @@ import { currentDraft, openDraft, patchDraft, addPhotoToDraft, saveDraftLocation
 import { nextStep, sendStep, handleFlowTap, patchFromUnderstanding, acknowledge, tradeName, trades, type Asked, type Step } from './flow.js';
 import { parseCommand, menuText, BUILTIN, ONBOARDING_TIP, type Command } from './commands.js';
 import { activeRequestFor, openSessions, switchSession, sessionPrefix, describeSession } from './sessions.js';
-import { RECOVER_TRIGGER, startRecovery, continueRecovery } from './recover.js';
+import { RECOVER_TRIGGER, startRecovery, continueRecovery, recoverWithEmail } from './recover.js';
 import { replyWithInvoice } from './invoice-hook.js';
 import { FACTS, priceLines } from './facts.js';
 import { OPT_IN, OPT_OUT, llmAllowed, sendBusinessInitiated, notifyCustomer, setJobOfferConsent } from './policy.js';
@@ -810,6 +810,14 @@ async function askEmail(to: string, s: Session, userId: string): Promise<boolean
   return false;
 }
 
+async function sendEmailTakenChoice(to: string): Promise<void> {
+  await wa.buttons(to, "That email is already on another Kendibo account. If it's yours, I can link this WhatsApp number to it (we'll email you a code). Or use another email, or skip.", [
+    { id: 'onb:email:mine', title: "It's my account" },
+    { id: 'onb:email:retry', title: 'Use another email' },
+    { id: 'onb:email:skip', title: 'Skip for now' },
+  ]);
+}
+
 /** Returns true when onboarding is finished (caller resumes the first request). */
 async function handleOnboarding(to: string, s: Session, userId: string, text: string, id: string, profileName?: string): Promise<boolean> {
   const step = s.data.onboard;
@@ -827,8 +835,31 @@ async function handleOnboarding(to: string, s: Session, userId: string, text: st
     if (await askEmail(to, s, userId)) { delete s.data.onboard; return true; }
     return false;
   }
+  const SKIP_WORDS = /^(skip|continue|next|later|no|not now|no email|none)[.!]*$/i;
+  if (step === 'email_taken') {
+    const taken = s.data.takenEmail;
+    if (id === 'onb:email:mine' && taken) {
+      delete s.data.onboard; delete s.data.takenEmail;
+      // Same safe flow as /recover: a code goes to that account's email, and
+      // this number moves over only when they reply with it.
+      await recoverWithEmail(to, userId, s.data, taken);
+      return false;
+    }
+    if (id === 'onb:email:retry') {
+      delete s.data.takenEmail;
+      s.data.onboard = 'email';
+      await wa.buttons(to, 'Okay, type the email you want to use.', [{ id: 'onb:email:skip', title: 'Skip for now' }]);
+      return false;
+    }
+    if (!id && !EMAIL_RE.test(text.trim()) && !SKIP_WORDS.test(text.trim())) {
+      await sendEmailTakenChoice(to);
+      return false;
+    }
+    delete s.data.takenEmail;
+    // A new email or "skip": handled as the email step below.
+  }
   // step === 'email'
-  if (id === 'onb:email:skip') {
+  if (id === 'onb:email:skip' || (!id && SKIP_WORDS.test(text.trim()))) {
     delete s.data.onboard;
     await wa.text(to, 'No problem. You can add it later in the app.');
     return true;
@@ -836,11 +867,13 @@ async function handleOnboarding(to: string, s: Session, userId: string, text: st
   const email = text.trim().toLowerCase();
   if (!EMAIL_RE.test(email)) { await wa.buttons(to, "That doesn't look like an email. Type it again, or tap Skip.", [{ id: 'onb:email:skip', title: 'Skip for now' }]); return false; }
   const taken = await q(`SELECT 1 FROM identity.users WHERE lower(email)=$1 AND id<>$2`, [email, userId]).catch(() => []);
-  delete s.data.onboard;
   if (taken[0]) {
-    await wa.text(to, 'That email is already on another Kendibo account, so we have not added it here. You can sign in with it in the app.');
-    return true;
+    s.data.onboard = 'email_taken';
+    s.data.takenEmail = email;
+    await sendEmailTakenChoice(to);
+    return false;
   }
+  delete s.data.onboard;
   await q(`UPDATE identity.users SET email_pending=$2 WHERE id=$1`, [userId, email]);
   const nameRow = await q<{ name: string | null }>(`SELECT name FROM identity.users WHERE id=$1`, [userId]).catch(() => []);
   try {

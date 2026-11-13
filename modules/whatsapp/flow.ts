@@ -16,7 +16,7 @@ import { matchKeywords } from '../catalog/category-match.js';
 
 export type Step = 'need' | 'trade' | 'photo' | 'budget' | 'location' | 'day' | 'window' | 'confirm';
 /** Per-conversation flags kept in messaging.whatsapp_session.data. */
-export interface Asked { photo?: boolean; budget?: boolean; dayPick?: boolean; lang?: 'en' | 'pcm'; cancelDraftId?: string; pendingText?: string; onboard?: 'name' | 'name_text' | 'email'; recover?: 'ask' | 'code'; recoverId?: string }
+export interface Asked { photo?: boolean; budget?: boolean; dayPick?: boolean; lang?: 'en' | 'pcm'; cancelDraftId?: string; pendingText?: string; onboard?: 'name' | 'name_text' | 'email' | 'email_taken'; takenEmail?: string; recover?: 'ask' | 'code'; recoverId?: string }
 
 const naira = (k: bigint | number | string) => `₦${(Number(k) / 100).toLocaleString('en-NG', { maximumFractionDigits: 0 })}`;
 const say = (lang: Asked['lang'], en: string, pcm?: string) => (lang === 'pcm' && pcm ? pcm : en);

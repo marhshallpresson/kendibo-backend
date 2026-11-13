@@ -71,6 +71,13 @@ export async function continueRecovery(waId: string, currentUserId: string, a: R
   return { kind: 'not_mine' };
 }
 
+/** Onboarding found the email on another account and the customer says it's theirs. */
+export async function recoverWithEmail(waId: string, currentUserId: string, a: RecoverState, email: string): Promise<RecoverOutcome> {
+  a.recover = 'ask';
+  delete a.recoverId;
+  return askedForAccount(waId, currentUserId, a, email);
+}
+
 async function askedForAccount(waId: string, currentUserId: string, a: RecoverState, t: string): Promise<RecoverOutcome> {
   const email = EMAIL_RE.test(t) ? t.toLowerCase() : null;
   const phone = email ? null : normalisePhone(t);
