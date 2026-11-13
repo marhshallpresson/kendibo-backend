@@ -269,8 +269,10 @@ async function handleOfferTap(waId: string, offerId: string, accept: boolean) {
   const providerId = String(prov[0].id);
   if (accept) {
     const { vendorEligibilityService } = await import('../vendors/eligibility.service.js');
-    if (!(await vendorEligibilityService.allowed(providerId, offer[0].category_id))) {
-      await wa.text(waId, "You can't accept jobs in this trade yet. Open the Kendibo app to finish your verification.");
+    const { tierService } = await import('../tiers/tier.service.js');
+    const amountKobo = await tierService.jobAmountKobo({ requestOfferId: offerId }).catch(() => null);
+    if (!(await vendorEligibilityService.allowed(providerId, offer[0].category_id, { amountKobo, accepting: true, ref: offerId }))) {
+      await wa.text(waId, "You can't accept this job yet: it needs more verification or a higher tier than you have. Type /tier or open the Kendibo app.");
       return;
     }
   }
@@ -1128,6 +1130,14 @@ async function runCommand(cmd: Command, to: string, s: Session, userId: string):
   if (cmd.cmd === 'stop') return false; // handled by the opt-out above
   if (cmd.cmd === 'verify') {
     await wa.ctaUrl(to, "Verify your ID on Kendibo's secure page. It takes about a minute. Never send your NIN or BVN in this chat.", 'Verify my ID', idCheckLink(to, userId));
+    return true;
+  }
+  if (cmd.cmd === 'tier') {
+    // Pros: current tier, limits and what the next tier needs.
+    const prov = await q<{ id: string }>(`SELECT id FROM provider.provider WHERE user_id=$1`, [userId]).catch(() => []);
+    if (!prov[0]) { await wa.text(to, 'Tiers are for Kendibo pros and vendors. Open the Kendibo Pro app to join.'); return true; }
+    const { tierService } = await import('../tiers/tier.service.js');
+    await wa.text(to, await tierService.tierText(String(prov[0].id)).catch(() => "We couldn't load your tier right now. Please try again shortly."));
     return true;
   }
   // Completion: DONE confirms the job the pro marked finished; PROBLEM freezes it

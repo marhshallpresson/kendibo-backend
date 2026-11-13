@@ -47,6 +47,13 @@ describe('body-less JSON POSTs', () => {
     assert.equal(draft.details.fullName, 'Aniekan Etim');
     assert.equal(draft.details.nin, undefined, 'NIN never stored in the draft');
     assert.equal(draft.details.bvn, undefined, 'BVN never stored in the draft');
+    const linked = await q<{ phone: string | null }>(`SELECT phone FROM identity.users WHERE id=$1`, [uid]);
+    assert.equal(linked[0].phone, '+2348030000000', 'the phone typed in onboarding is linked to the account');
+
+    // A phone already used by another account is never taken over.
+    const other = String((await q<{ id: string }>(`INSERT INTO identity.users (email, name) VALUES ($1,'Second Pro') RETURNING id`, [`p-${randomUUID()}@kendibo.local`]))[0].id);
+    await app.inject({ method: 'PUT', url: '/v1/provider/onboarding/progress', headers: { authorization: `Bearer ${signAccess(other, [])}` }, payload: { step: 'details', data: { phone: '0803 000 0000' } } });
+    assert.equal((await q<{ phone: string | null }>(`SELECT phone FROM identity.users WHERE id=$1`, [other]))[0].phone, null);
 
     // Going back to edit step 1 keeps the furthest step reached.
     const back = await app.inject({ method: 'PUT', url: '/v1/provider/onboarding/progress', headers: auth, payload: { step: 'account', accountType: 'business', data: { kind: 'business' } } });

@@ -2,10 +2,15 @@
 // GET  /v1/provider/onboarding/progress  -> where the pro is and what they entered
 // PUT  /v1/provider/onboarding/progress  -> save one step (creates the provider
 //                                           profile on the first save)
+// Documents and CAC are optional: finishing Tier 1 (contact, NIN — verified or
+// in manual review — selfie, a trade and a service area) is enough to start
+// low-risk work. `tier1` in the response says what is still missing; Tier 2/3
+// documents are collected later (GET /v1/provider/tier).
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { q } from '../../../packages/database/db.js';
 import { providerService } from '../../../modules/providers/provider.service.js';
+import { tierService } from '../../../modules/tiers/tier.service.js';
 
 interface Helpers {
   authed: (req: never) => { sub: string } | null;
@@ -38,6 +43,26 @@ function clean(data: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
+/** 08012345678 / 2348012345678 / +234 801 234 5678 → +2348012345678; anything else → null. */
+export function onboardingPhoneE164(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const d = raw.replace(/\D/g, '');
+  if (d.length === 11 && d.startsWith('0')) return `+234${d.slice(1)}`;
+  if (d.length === 13 && d.startsWith('234')) return `+${d}`;
+  return null;
+}
+
+async function linkOnboardingPhone(userId: string, data: Record<string, unknown> | undefined): Promise<void> {
+  const raw = Object.entries(data ?? {}).find(([k, v]) => /phone/i.test(k) && typeof v === 'string')?.[1];
+  const phone = onboardingPhoneE164(raw);
+  if (!phone) return;
+  await q(
+    `UPDATE identity.users SET phone=$2 WHERE id=$1 AND phone IS NULL
+       AND NOT EXISTS (SELECT 1 FROM identity.users o WHERE o.phone=$2 AND o.id<>$1)`,
+    [userId, phone],
+  ).catch(() => undefined);
+}
+
 async function progressFor(userId: string) {
   const r = await q<Record<string, unknown>>(
     `SELECT id, kyc_status, account_type, onboarding_step, onboarding_draft, onboarding_updated_at FROM provider.provider WHERE user_id=$1`, [userId],
@@ -45,9 +70,12 @@ async function progressFor(userId: string) {
   const p = r[0];
   if (!p) return { started: false, step: 'account' as Step, accountType: null, draft: {}, kycStatus: null, steps: ONBOARDING_STEPS, updatedAt: null };
   const draft = typeof p.onboarding_draft === 'string' ? JSON.parse(p.onboarding_draft) : (p.onboarding_draft ?? {});
+  const tier1 = await tierService.tier1Status(String(p.id)).catch(() => ({ done: false, missing: [] as string[], manualReview: false }));
   return {
     started: true,
     providerId: String(p.id),
+    /** Tier 1 complete = eligible for low-risk jobs (no documents/CAC needed). */
+    tier1,
     step: (p.onboarding_step as Step) ?? 'account',
     accountType: (p.account_type as string) ?? null,
     draft,
@@ -68,6 +96,10 @@ export function registerOnboardingRoutes(app: FastifyInstance, h: Helpers) {
     const parsed = saveSchema.safeParse(req.body ?? {});
     if (!parsed.success) return h.fail(reply, 'VALIDATION_ERROR', parsed.error.issues[0]?.message ?? 'Check the details and try again.', 400);
     const { step, accountType, data } = parsed.data;
+    // A phone typed during onboarding belongs on the account (only if the account has
+    // none and nobody else uses it). Saved BEFORE the profile is created, so the
+    // "profile started" admin alert can show it.
+    await linkOnboardingPhone(a.sub, data as Record<string, unknown>);
     await providerService.onboard(a.sub); // idempotent: first save creates the profile
     const current = await progressFor(a.sub);
     const draft = { ...(current.draft as Record<string, unknown>), [step]: clean(data) };

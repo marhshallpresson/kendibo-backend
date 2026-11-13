@@ -206,6 +206,11 @@ async function onEvent(event: string, p: Record<string, unknown>): Promise<unkno
     case 'offering.created': return providerStep(pid, 'first_price', 'First price listed', [`Category: ${String(p.categoryId ?? '')}`]);
     case 'provider.availability': return p.online ? providerStep(pid, 'first_online', 'First time online') : null;
     case 'provider.verified': return providerStep(pid, 'approved', 'Provider approved', [`Level: ${String(p.level ?? '')}`]);
+    // Tiers (modules/tiers): a paid upgrade waiting for review, and Tier-3 jobs above the review threshold.
+    case 'provider.tier_application': return providerStep(pid, 'tier_application', `Tier ${String(p.targetTier ?? '')} upgrade to review`,
+      [`Fee paid: ₦${(Number(p.feeKobo ?? 0) / 100).toLocaleString('en-NG')} (${String(p.method ?? '')})`, 'Approve or reject it in the tier applications queue.'], false);
+    case 'provider.large_job_flagged': return providerStep(pid, 'large_job', 'Large job accepted (review)',
+      [`Amount: ₦${(Number(p.amountKobo ?? 0) / 100).toLocaleString('en-NG')}`, `Category: ${String(p.categoryId ?? '')}`, `Ref: ${String(p.ref ?? '')}`], false);
     case 'category.provider_created': {
       const prov = await providerInfo(pid);
       return sendAdminAlert({

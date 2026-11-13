@@ -62,6 +62,9 @@ import { registerKycAdminRoutes } from './kyc-admin.routes.js';
 import { registerVirtualAccountRoutes, VIRTUAL_ACCOUNT_ROUTE_POLICY } from './virtual-account.routes.js';
 import { installVirtualAccountHooks, chargeForWalletPayment, reverseWalletCharge, VaError } from '../../../modules/payments/paga/virtual-accounts.js';
 import { onEmit } from '../../../packages/observability/emit.js';
+import { registerAdminPasswordRoutes, ADMIN_PASSWORD_POLICY } from './admin-password.routes.js';
+import { registerTierRoutes, TIER_ROUTE_POLICY } from './tier.routes.js';
+import { tierService, TIER_REF_PREFIX, SUB_REF_PREFIX } from '../../../modules/tiers/tier.service.js';
 import { registerAdminConsoleRoutes, ADMIN_CONSOLE_POLICY, accountGate, refreshGate, adminLogin, sendLocked, clientIp, auditQuerySchema } from './admin-console.routes.js';
 import { installAdminAlerts } from '../../../modules/notifications/admin-alerts.service.js';
 import { startLifecycleSweeper } from '../../../modules/notifications/lifecycle.service.js';
@@ -313,7 +316,7 @@ const ROUTE_POLICY: Record<string, RoutePolicy> = {
 };
 // Vendor platform routes (storefronts, trade rules, WhatsApp) declare their own
 // public/permission entries next to the handlers; merged into the same gate.
-Object.assign(ROUTE_POLICY, VENDOR_ROUTE_POLICY, ADMIN_OPS_POLICY, EMAIL_ROUTE_POLICY, VIRTUAL_ACCOUNT_ROUTE_POLICY, ADMIN_CONSOLE_POLICY);
+Object.assign(ROUTE_POLICY, VENDOR_ROUTE_POLICY, ADMIN_OPS_POLICY, EMAIL_ROUTE_POLICY, VIRTUAL_ACCOUNT_ROUTE_POLICY, ADMIN_CONSOLE_POLICY, ADMIN_PASSWORD_POLICY, TIER_ROUTE_POLICY);
 
 app.addHook('onRequest', async (req, reply) => {
   const url = req.routeOptions.url;
@@ -752,7 +755,7 @@ app.post('/v1/bookings', async (req, reply) => {
     const addr = await propertyService.listAddresses(a.sub);
     const address = addr.items.find(x => x.id === body.addressId) || addr.items[0];
     if (address && address.latitude && address.longitude) {
-      const candidates = await dispatchService.findCandidates({ serviceId: body.serviceId, lat: address.latitude, lng: address.longitude });
+      const candidates = await dispatchService.findCandidates({ serviceId: body.serviceId, lat: address.latitude, lng: address.longitude, amountKobo: BigInt(String(booking.priceKobo ?? 0).split('.')[0] || '0') || null });
       for (const cand of candidates.slice(0, 5)) {
         await dispatchService.assign(booking.id, cand.providerId).catch(() => {});
       }
@@ -872,7 +875,7 @@ app.get('/v1/bookings/:id/match/candidates', async (req, reply) => {
   const lng = addr[0]?.lng != null ? Number(addr[0].lng) : null;
   if (lat == null || lng == null) return { data: { slaExhausted: true, candidates: [] } };
 
-  const cands = await dispatchService.findCandidates({ serviceId: b.serviceId, lat, lng });
+  const cands = await dispatchService.findCandidates({ serviceId: b.serviceId, lat, lng, amountKobo: BigInt(b.priceKobo) });
   const candidates: Record<string, unknown>[] = [];
   for (const c of cands) {
     const prov = await providerService.byId(c.providerId);
@@ -912,7 +915,7 @@ app.post('/v1/bookings/:id/match/pick', async (req, reply) => {
 
   const addr = await q<Record<string, unknown>>(`SELECT lat, lng FROM property.address WHERE id=$1`, [b.addressId]);
   if (addr[0]?.lat == null || addr[0]?.lng == null) return fail(reply, 'NO_CANDIDATE', 'No serviceable location', 409);
-  const cands = await dispatchService.findCandidates({ serviceId: b.serviceId, lat: Number(addr[0].lat), lng: Number(addr[0].lng) });
+  const cands = await dispatchService.findCandidates({ serviceId: b.serviceId, lat: Number(addr[0].lat), lng: Number(addr[0].lng), amountKobo: BigInt(b.priceKobo) });
   if (!cands.some((c) => c.providerId === providerId)) return fail(reply, 'NO_CANDIDATE', 'Provider is not eligible', 409);
   try {
     const offer = await dispatchService.assign(bookingId, providerId);
@@ -995,6 +998,12 @@ async function settleSuccessfulPayment(reference: string, amountKobo: bigint): P
     const userId = reference.split('_')[1];
     try { await walletService.credit(userId, Number(amountKobo), reference, 'topup'); } catch (e) { observability.captureException(e); }
     observability.track('wallet.topup_succeeded', { psp: 'bachs', reference });
+    return;
+  }
+  // Tier upgrade fee / Kendibo Pro subscription paid by checkout.
+  // TODO(ledger): post these platform fees to the ledger once a fee-income account exists.
+  if (reference.startsWith(TIER_REF_PREFIX) || reference.startsWith(SUB_REF_PREFIX)) {
+    try { await tierService.onCheckoutPaid(reference, amountKobo); } catch (e) { observability.captureException(e); }
     return;
   }
   try { await postCollection(reference, amountKobo, currentPeriod()); } catch (e) { observability.captureException(e); }
@@ -1476,7 +1485,7 @@ app.post('/v1/provider/dispatch-feed/respond', async (req, reply) => {
       `SELECT o.provider_id, r.category_id FROM booking.request_offer o JOIN booking.service_request r ON r.id=o.request_id WHERE o.id=$1`, [offerId],
     );
     if (!own[0] || String(own[0].provider_id) !== me.id) return fail(reply, 'NOT_FOUND', 'Offer not found', 404);
-    if (!(await vendorEligibilityService.allowed(me.id, own[0].category_id))) return fail(reply, 'NOT_ELIGIBLE', 'Complete your verification first.', 403);
+    if (!(await vendorEligibilityService.allowed(me.id, own[0].category_id, { amountKobo: BigInt(counterKobo) }))) return fail(reply, 'NOT_ELIGIBLE', 'Complete your verification first, and keep the price within your tier limit.', 403);
     try { return { data: await requestService.counterOffer(offerId, me.id, BigInt(counterKobo)) }; }
     catch (e: unknown) {
       const m = (e as Error).message;
@@ -1505,8 +1514,15 @@ app.post('/v1/provider/dispatch-feed/respond', async (req, reply) => {
     if (!r[0]) return fail(reply, 'NOT_FOUND', 'Request not found', 404);
     categoryId = r[0].category_id ? String(r[0].category_id) : null;
   }
-  if (accept && !(await vendorEligibilityService.allowed(me.id, categoryId))) {
-    const why = await vendorEligibilityService.evaluate(me.id, categoryId ?? '').catch(() => null);
+  // Tier caps: the job's price and the pro's open jobs (modules/tiers).
+  const jobCtx = accept ? {
+    accepting: true, ref: offerId ?? requestId ?? null,
+    amountKobo: await tierService.jobAmountKobo(
+      feedType === 'job_offer' ? { assignmentId: offerId } : feedType === 'request_offer' ? { requestOfferId: offerId } : { requestId },
+    ).catch(() => null),
+  } : {};
+  if (accept && !(await vendorEligibilityService.allowed(me.id, categoryId, jobCtx))) {
+    const why = await vendorEligibilityService.evaluate(me.id, categoryId ?? '', jobCtx).catch(() => null);
     return fail(reply, 'NOT_ELIGIBLE', `Complete these first: ${(why?.missing ?? ['verification']).join(', ')}`, 403);
   }
 
@@ -1619,7 +1635,11 @@ app.post('/v1/provider/online', async (req, reply) => {
     const rows = await q<{ kyc_status: string; status: string; verify_level: string }>(
       `SELECT kyc_status, status, verify_level FROM provider.provider WHERE id=$1`, [me.id]);
     const r = rows[0];
-    if (!r || String(r.kyc_status) !== 'VERIFIED' || String(r.status) !== 'active' || String(r.verify_level) === 'suspended') {
+    // NIN in manual review: a pro who finished Tier 1 may work at Tier 1 limits meanwhile.
+    const manualTier1 = r && String(r.kyc_status) === 'UNDER_REVIEW'
+      ? await tierService.tier1Status(me.id).then((t) => t.manualReview && t.done).catch(() => false)
+      : false;
+    if (!r || (String(r.kyc_status) !== 'VERIFIED' && !manualTier1) || String(r.status) !== 'active' || String(r.verify_level) === 'suspended') {
       return fail(reply, 'KYC_REQUIRED', 'Complete identity verification before going online', 403);
     }
   }
@@ -1637,6 +1657,20 @@ app.post('/v1/provider/offers/:id/respond', async (req, reply) => {
   const offerId = (req.params as { id: string }).id;
   const owned = await q<{ provider_id: string }>(`SELECT provider_id FROM dispatch.assignment WHERE id=$1`, [offerId]);
   if (!owned[0] || String(owned[0].provider_id) !== me.id) return fail(reply, 'NOT_FOUND', 'Offer unavailable', 404);
+  if (accept) {
+    // Same gate as the dispatch feed: category rules + tier caps on this job.
+    const jobRow = await q<{ job_id: string }>(`SELECT job_id FROM dispatch.assignment WHERE id=$1`, [offerId]);
+    const jobId = String(jobRow[0]?.job_id ?? '');
+    const c = await q<{ category_id: string }>(
+      `SELECT s.category_id FROM booking.booking b JOIN catalog.service s ON s.id=b.service_id WHERE b.id::text=$1`, [jobId],
+    ).catch(() => []);
+    const categoryId = c[0]?.category_id ? String(c[0].category_id) : null;
+    const jobCtx = { accepting: true, ref: offerId, amountKobo: await tierService.jobAmountKobo({ bookingId: jobId }).catch(() => null) };
+    if (!(await vendorEligibilityService.allowed(me.id, categoryId, jobCtx))) {
+      const why = await vendorEligibilityService.evaluate(me.id, categoryId ?? '', jobCtx).catch(() => null);
+      return fail(reply, 'NOT_ELIGIBLE', `Complete these first: ${(why?.missing ?? ['verification']).join(', ')}`, 403);
+    }
+  }
   let result: Record<string, unknown>;
   try {
     result = (await providerService.respondToOffer(offerId, accept)) as Record<string, unknown>;
@@ -2651,8 +2685,10 @@ app.post('/v1/provider/requests/:id/respond', async (req, reply) => {
   if (!offer[0] || String(offer[0].provider_id) !== me.id) return fail(reply, 'NOT_FOUND', 'Offer not found', 404);
   // Re-check the category rules at the moment of acceptance (or counter): KYC can
   // lapse, a licence can expire, or the vendor can hit their concurrent-job cap.
-  if ((accept || counterKobo !== undefined) && !(await vendorEligibilityService.allowed(me.id, offer[0].category_id))) {
-    const why = await vendorEligibilityService.evaluate(me.id, String(offer[0].category_id ?? '')).catch(() => null);
+  // A counter-price must also fit the pro's per-job tier cap.
+  const counterCtx = counterKobo !== undefined ? { amountKobo: BigInt(counterKobo) } : {};
+  if ((accept || counterKobo !== undefined) && !(await vendorEligibilityService.allowed(me.id, offer[0].category_id, counterCtx))) {
+    const why = await vendorEligibilityService.evaluate(me.id, String(offer[0].category_id ?? ''), counterCtx).catch(() => null);
     return fail(reply, 'NOT_ELIGIBLE', `Complete these first: ${(why?.missing ?? ['verification']).join(', ')}`, 403);
   }
   // One counter-price per offer; the customer then accepts or declines it.
@@ -2665,8 +2701,11 @@ app.post('/v1/provider/requests/:id/respond', async (req, reply) => {
     }
   }
   if (accept === undefined) return fail(reply, 'BAD_REQUEST', 'Send accept (true/false) or a counterKobo price.', 400);
-  if (accept && !(await vendorEligibilityService.allowed(me.id, offer[0].category_id))) {
-    const why = await vendorEligibilityService.evaluate(me.id, String(offer[0].category_id ?? '')).catch(() => null);
+  const acceptCtx = accept
+    ? { accepting: true, ref: offerId, amountKobo: await tierService.jobAmountKobo({ requestOfferId: offerId }).catch(() => null) }
+    : {};
+  if (accept && !(await vendorEligibilityService.allowed(me.id, offer[0].category_id, acceptCtx))) {
+    const why = await vendorEligibilityService.evaluate(me.id, String(offer[0].category_id ?? ''), acceptCtx).catch(() => null);
     return fail(reply, 'NOT_ELIGIBLE', `Complete these first: ${(why?.missing ?? ['verification']).join(', ')}`, 403);
   }
   try {
@@ -2851,6 +2890,7 @@ const offeringError = (reply: FastifyReply, e: unknown) => {
   if (m === 'BAD_MAX_QUANTITY') return fail(reply, 'BAD_MAX_QUANTITY', 'Max quantity must be between 1 and 1,000.', 400);
   if (m === 'ASSET_NOT_FOUND') return fail(reply, 'ASSET_NOT_FOUND', 'Upload the product photo first (it must be your own image).', 400);
   if (m === 'NOT_FOUND') return fail(reply, 'NOT_FOUND', 'Price not found', 404);
+  if (m.startsWith('LISTING_LIMIT:')) return fail(reply, 'LISTING_LIMIT', `Your tier allows ${m.split(':')[1]} active product listings. Pause one, or upgrade your tier to list more.`, 409);
   return fail(reply, 'OFFERING_ERROR', m, 400);
 };
 app.get('/v1/provider/offerings', async (req, reply) => {
@@ -2862,7 +2902,7 @@ app.get('/v1/provider/offerings', async (req, reply) => {
 app.get('/v1/provider/offerings/preview', async (req, reply) => {
   const me = await providerActor(req as never, reply); if (!me) return reply;
   const { categoryId, priceKobo } = z.object({ categoryId: z.string().min(1), priceKobo: z.string().regex(/^\d+$/) }).parse(req.query);
-  return { data: await earningsFor(categoryId, BigInt(priceKobo)) };
+  return { data: await earningsFor(categoryId, BigInt(priceKobo), me.id) };
 });
 app.post('/v1/provider/offerings', async (req, reply) => {
   const me = await providerActor(req as never, reply); if (!me) return reply;
@@ -3388,6 +3428,8 @@ registerKycAdminRoutes(app, { fail: fail as never, adminActor: adminActor as nev
 registerVirtualAccountRoutes(app, { authed: authed as never, fail: fail as never });
 installVirtualAccountHooks(onEmit);
 registerAdminConsoleRoutes(app, { fail: fail as never, adminActor: adminActor as never });
+registerAdminPasswordRoutes(app, { fail: fail as never, adminActor: adminActor as never });
+registerTierRoutes(app, { fail: fail as never, adminActor: adminActor as never, providerActor: providerActor as never, payments });
 installAdminAlerts();
 if (process.env.NODE_ENV !== 'test') startLifecycleSweeper();
 Object.assign(ROUTE_POLICY, INVOICE_ROUTE_POLICY); registerInvoiceRoutes(app, { fail: fail as never, bookingParty: bookingParty as never, providerActor });

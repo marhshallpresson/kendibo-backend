@@ -6,11 +6,18 @@ import { q } from '../../packages/database/db.js';
 import { emit } from '../../packages/observability/emit.js';
 import { categoryRulesService } from './category-rules.service.js';
 
+// `kyc_tier_N`: the trade needs provider tier N (category_rule.min_kyc_tier,
+// compared with the provider tier since 059 — modules/tiers/tier.service.ts).
+// 'capacity': open-job limit of the tier. 'job_cap': the job is above the
+// tier's per-job cap (only when a job is given).
 export type MissingRequirement =
   | 'account_active' | 'kyc_approved' | `kyc_tier_${number}` | 'face_match' | 'cac'
-  | 'licence' | 'insurance' | 'certificate' | `experience_${number}y` | 'capacity';
+  | 'licence' | 'insurance' | 'certificate' | `experience_${number}y` | 'capacity' | 'job_cap';
 
 export interface Eligibility { providerId: string; categoryId: string; eligible: boolean; missing: MissingRequirement[] }
+
+/** The job being offered or accepted, when known (per-job tier cap, large-job flag). */
+export interface JobContext { amountKobo?: bigint | null; accepting?: boolean; ref?: string | null }
 
 /** Enforced in production (and wherever VENDOR_ELIGIBILITY_ENFORCED=true). In
  *  local/test runs unverified seed vendors still receive work so flows can be
@@ -22,17 +29,21 @@ export function eligibilityEnforced(): boolean {
 const ACTIVE_JOB_STATES =['PROVIDER_ACCEPTED', 'EN_ROUTE', 'ARRIVED', 'CHECK_IN', 'INSPECTION', 'PRE_SERVICE', 'IN_PROGRESS', 'AWAITING_APPROVAL'];
 
 export const vendorEligibilityService = {
-  async evaluate(providerId: string, categoryId: string): Promise<Eligibility> {
+  async evaluate(providerId: string, categoryId: string, job: JobContext = {}): Promise<Eligibility> {
     const rows = await q<Record<string, unknown>>(`SELECT * FROM provider.provider WHERE id=$1`, [providerId]);
     const p = rows[0];
     if (!p) throw new Error('PROVIDER_NOT_FOUND');
     const rule = await categoryRulesService.ruleFor(categoryId);
     const missing: MissingRequirement[] = [];
+    const { tierService } = await import('../tiers/tier.service.js');
+    const tier = await tierService.snapshot(providerId);
+    // NIN in manual review with Tier 1 complete: may work at Tier 1 (capped there).
+    const manualOk = tier.manualReview && tier.tier >= 1;
 
     if (String(p.status ?? 'active') !== 'active') missing.push('account_active');
-    if (String(p.kyc_status ?? '').toUpperCase() !== 'VERIFIED') missing.push('kyc_approved');
-    if (Number(p.kyc_tier ?? 0) < rule.minKycTier) missing.push(`kyc_tier_${rule.minKycTier}`);
-    if (rule.requireFaceMatch && p.face_verified !== true) missing.push('face_match');
+    if (String(p.kyc_status ?? '').toUpperCase() !== 'VERIFIED' && !manualOk) missing.push('kyc_approved');
+    if (tier.tier < rule.minKycTier) missing.push(`kyc_tier_${rule.minKycTier}`);
+    if (rule.requireFaceMatch && p.face_verified !== true && !manualOk) missing.push('face_match');
     if (rule.requireCac && p.cac_verified !== true) missing.push('cac');
 
     const needed = new Set<string>(rule.requiredDocuments);
@@ -64,7 +75,21 @@ export const vendorEligibilityService = {
       `SELECT COUNT(*) AS n FROM dispatch.assignment a JOIN booking.booking b ON b.id::text = a.job_id
         WHERE a.provider_id=$1 AND a.status='accepted' AND b.status = ANY($2)`, [providerId, ACTIVE_JOB_STATES],
     ).catch(() => [{ n: '0' }]);
-    if (Number(busy[0]?.n ?? 0) >= rule.maxConcurrentJobs) missing.push('capacity');
+    // Open-job limit comes from the tier (null = unlimited); before Tier 1 the
+    // trade's own max_concurrent_jobs still applies.
+    const tierDef = tier.tier >= 1 ? tier.cfg.tiers[tier.tier as 1 | 2 | 3] : null;
+    const openLimit = tierDef ? tierDef.maxOpenJobs : rule.maxConcurrentJobs;
+    if (openLimit !== null && Number(busy[0]?.n ?? 0) >= openLimit) missing.push('capacity');
+
+    const amount = job.amountKobo ?? null;
+    if (amount !== null) {
+      const cap = tier.cfg.tiers[tier.tier === 0 ? 1 : tier.tier].maxJobKobo;
+      if (cap !== null && amount > cap) missing.push('job_cap');
+      // Tier 3 has no cap, but very large jobs are flagged for an admin to look at.
+      if (job.accepting && cap === null && amount > tier.cfg.tier3.largeJobFlagKobo && missing.length === 0) {
+        emit('provider.large_job_flagged', { providerId, categoryId, amountKobo: amount.toString(), ref: job.ref ?? null });
+      }
+    }
 
     return { providerId, categoryId, eligible: missing.length === 0, missing };
   },
@@ -109,19 +134,33 @@ export const vendorEligibilityService = {
   },
 
   /** The gate dispatch, broadcast and offer acceptance call. */
-  async allowed(providerId: string, categoryId: string | null | undefined): Promise<boolean> {
-    const ok = await this.canWork(providerId, categoryId).catch(() => false);
+  async allowed(providerId: string, categoryId: string | null | undefined, job: JobContext = {}): Promise<boolean> {
+    const ok = await this.canWork(providerId, categoryId, job).catch(() => false);
     if (!ok) emit('vendor.eligibility_blocked', { providerId, categoryId: categoryId ?? null, enforced: eligibilityEnforced() });
     return ok || !eligibilityEnforced();
   },
 
-  async canWork(providerId: string, categoryId: string | null | undefined): Promise<boolean> {
+  async canWork(providerId: string, categoryId: string | null | undefined, job: JobContext = {}): Promise<boolean> {
     if (!categoryId) {
-      // Uncategorised request: the vendor must at least be cleared in some trade.
+      // Uncategorised request: the vendor must at least be cleared in some trade,
+      // and the job must fit the tier's per-job cap and open-job limit.
       const any = await q(`SELECT 1 FROM provider.category_enrollment WHERE provider_id=$1 AND status='eligible' LIMIT 1`, [providerId]);
-      return !!any[0];
+      if (!any[0]) return false;
+      const { tierService } = await import('../tiers/tier.service.js');
+      const s = await tierService.snapshot(providerId);
+      if (s.tier === 0) return false;
+      const def = s.cfg.tiers[s.tier];
+      if (job.amountKobo != null && def.maxJobKobo !== null && job.amountKobo > def.maxJobKobo) return false;
+      if (def.maxOpenJobs !== null) {
+        const busy = await q<{ n: string }>(
+          `SELECT COUNT(*) AS n FROM dispatch.assignment a JOIN booking.booking b ON b.id::text = a.job_id
+            WHERE a.provider_id=$1 AND a.status='accepted' AND b.status = ANY($2)`, [providerId, ACTIVE_JOB_STATES],
+        ).catch(() => [{ n: '0' }]);
+        if (Number(busy[0]?.n ?? 0) >= def.maxOpenJobs) return false;
+      }
+      return true;
     }
-    return (await this.evaluate(providerId, categoryId)).eligible;
+    return (await this.evaluate(providerId, categoryId, job)).eligible;
   },
 
   async submitCredential(providerId: string, input: { kind: 'licence' | 'insurance' | 'certificate'; assetId: string; categoryId?: string; label?: string; number?: string; expiresAt?: string }) {

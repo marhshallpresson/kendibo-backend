@@ -147,7 +147,7 @@ export const matchingService = {
       const radius = Number(p.service_radius_km ?? 15) || 15;
       if (d > radius) continue;
       const id = String(p.id);
-      if (!(await vendorEligibilityService.allowed(id, req.categoryId))) continue;
+      if (!(await vendorEligibilityService.allowed(id, req.categoryId, { amountKobo: req.budgetKobo ?? null }))) continue;
       const [rev, jobs, qual, skills] = await Promise.all([
         q<{ n: string; avg: string | null }>(`SELECT COUNT(*) AS n, AVG(provider) AS avg FROM payment.review WHERE provider_id=$1`, [id]).catch(() => [{ n: '0', avg: null }]),
         q<{ n: string }>(`SELECT COUNT(*) AS n FROM provider.earning WHERE provider_id=$1`, [id]).catch(() => [{ n: '0' }]),
@@ -164,7 +164,9 @@ export const matchingService = {
         cancellations: Number(qual[0]?.cancellations ?? 0), need: req.need ?? '', profile,
         budgetKobo: req.budgetKobo ?? null, typicalKobo, online: p.online === true,
       });
-      const s = score(f, model.weights);
+      // Tier 2/3 and Kendibo Pro rank higher (also feeds WhatsApp suggestions); points are on a 0-100 scale.
+      const { tierService } = await import('../tiers/tier.service.js');
+      const s = score(f, model.weights) + (await tierService.rankBoost(id).catch(() => 0)) / 100;
       const rating = reviewCount > 0 && avg !== null ? Math.round(avg * 10) / 10 : null;
       out.push({
         providerId: id,
