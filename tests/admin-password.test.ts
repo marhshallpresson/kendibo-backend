@@ -24,7 +24,7 @@ async function seat(role = 'SUPER_ADMIN') {
   return { id, email };
 }
 const login = (email: string, password: string, ip = '10.0.0.1') =>
-  app.inject({ method: 'POST', url: '/v1/admin/login/password', headers: { 'x-forwarded-for': ip }, payload: { email, password } });
+  app.inject({ method: 'POST', url: '/v1/admin/login/password', remoteAddress: ip, headers: { 'x-forwarded-for': ip }, payload: { email, password } });
 
 describe('admin password sign-in', () => {
   it('hashes with scrypt and rejects weak passwords', async () => {
@@ -77,13 +77,14 @@ describe('admin password sign-in', () => {
     await adminPassword.set(a.id, 'Kendibo-Console-2026', true);
     const s = (await login(a.email, 'Kendibo-Console-2026', '10.2.0.1')).json().data;
     const auth = { authorization: `Bearer ${s.access}`, 'x-forwarded-for': '10.2.0.1' };
-    const noCurrent = await app.inject({ method: 'POST', url: '/v1/admin/password', headers: auth, payload: { newPassword: 'Another-Strong-2027' } });
+    const asIp = { remoteAddress: '10.2.0.1' };
+    const noCurrent = await app.inject({ method: 'POST', ...asIp, url: '/v1/admin/password', headers: auth, payload: { newPassword: 'Another-Strong-2027' } });
     assert.equal(noCurrent.statusCode, 401);
-    const weak = await app.inject({ method: 'POST', url: '/v1/admin/password', headers: auth, payload: { currentPassword: 'Kendibo-Console-2026', newPassword: 'short' } });
+    const weak = await app.inject({ method: 'POST', ...asIp, url: '/v1/admin/password', headers: auth, payload: { currentPassword: 'Kendibo-Console-2026', newPassword: 'short' } });
     assert.equal(weak.json().error.code, 'WEAK_PASSWORD');
-    const ok = await app.inject({ method: 'POST', url: '/v1/admin/password', headers: auth, payload: { currentPassword: 'Kendibo-Console-2026', newPassword: 'Another-Strong-2027' } });
+    const ok = await app.inject({ method: 'POST', ...asIp, url: '/v1/admin/password', headers: auth, payload: { currentPassword: 'Kendibo-Console-2026', newPassword: 'Another-Strong-2027' } });
     assert.equal(ok.statusCode, 200, ok.body);
-    const st = await app.inject({ method: 'GET', url: '/v1/admin/password', headers: auth });
+    const st = await app.inject({ method: 'GET', ...asIp, url: '/v1/admin/password', headers: auth });
     assert.deepEqual(st.json().data, { hasPassword: true, mustChange: false });
     assert.equal((await login(a.email, 'Another-Strong-2027', '10.2.0.2')).statusCode, 200);
   });
