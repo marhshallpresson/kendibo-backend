@@ -39,7 +39,7 @@ type State = 'BOT' | 'HUMAN';
 // Session data = the booking flow's flags plus two of the router's own: when
 // the provider sign-up button was last sent, and whether a new user was asked
 // "book or offer services?". Both survive draft resets.
-type BotData = Asked & { vendorCtaAt?: number; roleAsked?: boolean };
+type BotData = Asked & { vendorCtaAt?: number; roleAsked?: boolean; suspendedNoticeAt?: number };
 interface Session { waId: string; userId: string | null; state: State; data: BotData; updatedAt: number }
 const freshData = (d: BotData): BotData => ({
   lang: d.lang, ...(d.vendorCtaAt ? { vendorCtaAt: d.vendorCtaAt } : {}), ...(d.roleAsked ? { roleAsked: true } : {}),
@@ -410,6 +410,18 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
     `SELECT COUNT(*) AS n FROM messaging.whatsapp_inbound WHERE wa_id=$1 AND received_at > $2`, [to, new Date(Date.now() - 3600_000).toISOString()],
   ).catch(() => [{ n: '0' }]);
   if (Number(recent[0]?.n ?? 0) > 40) return;
+
+  // Suspended account (admin action): no booking flow. The notice goes out at
+  // most once per 24h so a chatty suspended user isn't spammed.
+  const acct = (await q<{ status: string | null }>(`SELECT status FROM identity.users WHERE id=$1`, [user.id]).catch(() => []))[0];
+  if (String(acct?.status ?? '') === 'suspended') {
+    if (Date.now() - Number(s.data.suspendedNoticeAt ?? 0) >= 24 * 3600_000) {
+      s.data.suspendedNoticeAt = Date.now();
+      await saveSession(s);
+      await wa.text(to, 'Your Kendibo account is on hold. If you think this is a mistake, email support@kendibo.ng.');
+    }
+    return;
+  }
 
   // RECOVER (lost or changed number): before the consent gate, because the old
   // account already agreed and a brand-new number shouldn't onboard first.

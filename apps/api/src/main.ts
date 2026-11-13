@@ -540,7 +540,13 @@ app.post('/v1/auth/google', async (req, reply) => {
   } catch (e: unknown) {
     const code = String((e as Error).message);
     if (code === 'ACCOUNT_SUSPENDED') return fail(reply, code, 'This account is suspended. Contact Kendibo support.', 403);
-    if (['BAD_GOOGLE_TOKEN', 'BAD_GOOGLE_AUDIENCE', 'GOOGLE_TOKEN_EXPIRED', 'GOOGLE_UNVERIFIED'].includes(code)) {
+    if (code === 'ADMIN_LOGIN_LOCKED') {
+      const lk = e as { retryAfter?: number; adminId?: string };
+      const retry = Number(lk.retryAfter ?? 0);
+      await adminLogin.locked(String(lk.adminId), retry, { ip: clientIp(req as never), ua: req.headers['user-agent'] ? String(req.headers['user-agent']) : null });
+      return sendLocked(reply, fail as never, retry);
+    }
+    if (['BAD_GOOGLE_TOKEN','BAD_GOOGLE_AUDIENCE', 'GOOGLE_TOKEN_EXPIRED', 'GOOGLE_UNVERIFIED'].includes(code)) {
       return fail(reply, 'GOOGLE_REJECTED', 'Google sign-in failed. Try again.', 401);
     }
     return fail(reply, 'GOOGLE_FAILED', 'Google sign-in unavailable. Try OTP instead.', 502, true);
