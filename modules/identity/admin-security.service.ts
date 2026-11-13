@@ -158,6 +158,48 @@ export const adminTwoFactor = {
   },
   async disable(userId: string) {
     await q(`DELETE FROM identity.admin_2fa WHERE user_id=$1`, [userId]);
+    await q(`DELETE FROM identity.admin_recovery_code WHERE user_id=$1`, [userId]);
+  },
+};
+
+// ── recovery codes: one-time codes for a lost authenticator (057) ────────────
+const RECOVERY_COUNT = 10;
+// No 0/o/1/l/i so codes read back cleanly from paper or a screenshot.
+const RECOVERY_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
+/** Lowercase, no spaces or hyphens: "ABCD-EFGH" and "abcdefgh" are the same code. */
+export const normalizeRecoveryCode = (code: string) => String(code ?? '').toLowerCase().replace(/[\s-]/g, '');
+const hashRecoveryCode = (code: string) => crypto.createHash('sha256').update(normalizeRecoveryCode(code)).digest('hex');
+const randomRecoveryCode = () => {
+  let s = '';
+  for (let i = 0; i < 8; i++) s += RECOVERY_ALPHABET[crypto.randomInt(RECOVERY_ALPHABET.length)];
+  return `${s.slice(0, 4)}-${s.slice(4)}`;
+};
+export const adminRecoveryCodes = {
+  /** Replaces every code for the user with a fresh set. Plaintext is returned once; only hashes are stored. */
+  async regenerate(userId: string): Promise<string[]> {
+    const codes = Array.from({ length: RECOVERY_COUNT }, randomRecoveryCode);
+    await q(`DELETE FROM identity.admin_recovery_code WHERE user_id=$1`, [userId]);
+    for (const c of codes) {
+      await q(`INSERT INTO identity.admin_recovery_code (user_id, code_hash) VALUES ($1,$2)`, [userId, hashRecoveryCode(c)]);
+    }
+    return codes;
+  },
+  async remaining(userId: string): Promise<number> {
+    const r = await q<{ n: string | number }>(`SELECT COUNT(*) AS n FROM identity.admin_recovery_code WHERE user_id=$1 AND used_at IS NULL`, [userId]);
+    return Number(r[0]?.n ?? 0);
+  },
+  /** Spends an unused code (single use). Hashes are compared in constant time. */
+  async consume(userId: string, code: string): Promise<boolean> {
+    const want = Buffer.from(hashRecoveryCode(code), 'hex');
+    const rows = await q<{ id: string; code_hash: string }>(`SELECT id, code_hash FROM identity.admin_recovery_code WHERE user_id=$1 AND used_at IS NULL`, [userId]);
+    let hit: string | null = null;
+    for (const r of rows) {
+      const h = Buffer.from(String(r.code_hash), 'hex');
+      if (h.length === want.length && crypto.timingSafeEqual(h, want) && hit == null) hit = String(r.id);
+    }
+    if (hit == null) return false;
+    const claimed = await q(`UPDATE identity.admin_recovery_code SET used_at=now() WHERE id=$1 AND used_at IS NULL RETURNING id`, [hit]);
+    return Boolean(claimed[0]);
   },
 };
 

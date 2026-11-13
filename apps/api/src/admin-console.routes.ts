@@ -22,7 +22,7 @@ import { revokeAll, refreshSubject, verifyAccess, type AccessClaims } from '../.
 import { auditService, type AuditContext } from '../../../modules/audit/audit.service.js';
 import { identityService } from '../../../modules/identity/identity.service.js';
 import {
-  adminTwoFactor, adminLoginChallenge, adminLoginLock, adminSessions, lockKeys, adminTwoFactorRequired,
+  adminTwoFactor, adminRecoveryCodes, normalizeRecoveryCode, adminLoginChallenge, adminLoginLock, adminSessions, lockKeys, adminTwoFactorRequired,
 } from '../../../modules/identity/admin-security.service.js';
 import { walletService } from '../../../modules/wallet/wallet.service.js';
 import { verificationService } from '../../../modules/providers/quality.service.js';
@@ -571,7 +571,7 @@ export function registerAdminConsoleRoutes(app: FastifyInstance, h: Helpers) {
   app.get('/v1/admin/2fa/status', async (req) => {
     const a = (await actor(req))!;
     const s = await adminTwoFactor.status(a.sub);
-    return { data: { ...s, required: adminTwoFactorRequired() } };
+    return { data: { ...s, recoveryCodesRemaining: s.enabled ? await adminRecoveryCodes.remaining(a.sub) : 0, required: adminTwoFactorRequired() } };
   });
 
   app.post('/v1/admin/2fa/enroll', async (req, reply) => {
@@ -600,8 +600,24 @@ export function registerAdminConsoleRoutes(app: FastifyInstance, h: Helpers) {
     const bearer = String(req.headers.authorization ?? '');
     const claims = bearer.startsWith('Bearer ') ? verifyAccess(bearer.slice(7)) : null;
     if (claims?.sid) await adminSessions.markMfa(claims.sid);
+    // One-time recovery codes for a lost phone. Shown only in this response.
+    const recoveryCodes = await adminRecoveryCodes.regenerate(a.sub);
     await auditService.log(a.sub, 'admin.2fa.enable', a.sub, reqCtx(req, { entityType: 'user' }));
-    return { data: { enabled: true } };
+    return { data: { enabled: true, recoveryCodes } };
+  });
+
+  // Replaces all recovery codes. Requires a current authenticator code.
+  app.post('/v1/admin/2fa/recovery-codes/regenerate', async (req, reply) => {
+    const a = (await actor(req))!;
+    const { code } = z.object({ code: z.string().trim().min(6).max(8) }).parse(req.body ?? {});
+    if (!(await adminTwoFactor.enabled(a.sub))) return h.fail(reply, 'TWO_FACTOR_NOT_ENABLED', 'Two-factor is not on.', 409);
+    if (!(await adminTwoFactor.check(a.sub, code))) {
+      await auditService.log(a.sub, 'admin.2fa.recovery_regenerate_failed', a.sub, reqCtx(req, { entityType: 'user' }));
+      return h.fail(reply, 'BAD_TWO_FACTOR_CODE', 'That code is not right. Try the newest code from your authenticator app.', 400);
+    }
+    const recoveryCodes = await adminRecoveryCodes.regenerate(a.sub);
+    await auditService.log(a.sub, 'admin.2fa.recovery_regenerate', a.sub, reqCtx(req, { entityType: 'user', meta: { count: recoveryCodes.length } }));
+    return { data: { recoveryCodes } };
   });
 
   app.post('/v1/admin/2fa/disable', async (req, reply) => {
@@ -630,15 +646,25 @@ export function registerAdminConsoleRoutes(app: FastifyInstance, h: Helpers) {
     const user = (await q<Record<string, unknown>>(`SELECT * FROM identity.users WHERE id=$1`, [ch.userId]))[0];
     if (!user) return h.fail(reply, 'CHALLENGE_INVALID', 'This sign-in has expired. Start again.', 401);
     if (String(user.status ?? '') === 'suspended') return h.fail(reply, 'ACCOUNT_SUSPENDED', 'This account is suspended. Contact Kendibo support.', 403);
+    // The field takes either the authenticator's 6-digit code or an unused recovery code.
+    let factor = 'otp+totp';
     if (!(await adminTwoFactor.check(ch.userId, body.data.code))) {
-      await adminLoginChallenge.failedAttempt(ch.id);
-      const locked = await adminLogin.failed(ch.userId, 'totp', ctx);
-      if (locked > 0) return sendLocked(reply, h.fail, locked);
-      return h.fail(reply, 'BAD_TWO_FACTOR_CODE', 'That code is not right. Try the newest code from your authenticator app.', 401);
+      const recovered = await adminRecoveryCodes.consume(ch.userId, normalizeRecoveryCode(body.data.code));
+      if (!recovered) {
+        await adminLoginChallenge.failedAttempt(ch.id);
+        const locked = await adminLogin.failed(ch.userId, 'totp', ctx);
+        if (locked > 0) return sendLocked(reply, h.fail, locked);
+        return h.fail(reply, 'BAD_TWO_FACTOR_CODE', 'That code is not right. Try the newest code from your authenticator app.', 401);
+      }
+      factor = 'otp+recovery';
     }
     if (!(await adminLoginChallenge.consume(ch.id))) return h.fail(reply, 'CHALLENGE_INVALID', 'This sign-in has expired. Start again.', 401);
     const s = await identityService.issueSession(user, { ...(ch.device as Record<string, string>), ip: ctx.ip ?? undefined }, { mfa: true });
-    await adminLogin.succeeded(ch.userId, s, 'otp+totp', ctx);
+    if (factor === 'otp+recovery') {
+      const remaining = await adminRecoveryCodes.remaining(ch.userId);
+      await auditService.log(ch.userId, 'admin.2fa.recovery_used', ch.userId, { ...ctx, entityType: 'user', meta: { remaining } });
+    }
+    await adminLogin.succeeded(ch.userId, s, factor, ctx);
     return { data: { ...s, isNew: false } };
   });
 }
