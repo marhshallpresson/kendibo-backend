@@ -8,7 +8,7 @@ import { providerService } from '../providers/provider.service.js';
 import { isAdminRole, rolePerms } from '../authorization/rbac.js';
 import { sms, email } from '../notifications/channels.js';
 import { templates } from '../notifications/mail.templates.js';
-import { adminTwoFactor, adminLoginChallenge, adminSessions } from './admin-security.service.js';
+import { adminTwoFactor, adminLoginChallenge, adminSessions, adminLoginLock, lockKeys } from './admin-security.service.js';
 
 export type LoginDevice = { fp?: string; platform?: string; model?: string; os?: string; appVersion?: string; ip?: string; city?: string; ua?: string };
 /** Admin with 2FA on: the first factor passed, the session waits for POST /v1/admin/login/2fa. */
@@ -385,6 +385,12 @@ export const identityService = {
         `UPDATE identity.users SET role='SUPER_ADMIN', updated_at=now() WHERE id=$1 RETURNING *`, [userRow.id],
       );
       if (upd[0]) userRow = upd[0];
+    }
+    // Admin seats share the password/OTP lockout (per account and per IP): a
+    // locked seat gets no session via Google either. Caller answers 429.
+    if (isAdminRole(String(userRow.role ?? '').toUpperCase())) {
+      const retryAfter = await adminLoginLock.retryAfter(lockKeys(String(userRow.id), device?.ip ?? null));
+      if (retryAfter > 0) throw Object.assign(new Error('ADMIN_LOGIN_LOCKED'), { retryAfter, adminId: String(userRow.id) });
     }
     const challenge = await this.loginGate(userRow, device);
     if (challenge) return { ...challenge, isNew };
