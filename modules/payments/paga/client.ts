@@ -81,7 +81,10 @@ export class PagaClient {
     try {
       res = await this.doFetch(url, {
         method,
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...headers },
+        // Accept-Language must be explicit: Node's fetch defaults it to "*", and Paga's
+        // Collect service (paymentRequest, status, history) answers that with
+        // HTTP 500 {"statusCode":"-1","statusMessage":"system error"} (found 2026-11-13).
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'Accept-Language': 'en', ...headers },
         ...(method === 'GET' ? {} : { body: JSON.stringify(body) }),
         signal: AbortSignal.timeout(this.cfg.timeoutMs),
       });
@@ -92,6 +95,7 @@ export class PagaClient {
     const json = await res.json().catch(() => ({}));
     if (res.status === 401) throw new PagaError('UNAUTHORIZED', 'keys rejected or not for this environment', 401, json);
     if (res.status === 403) throw new PagaError('IP_NOT_WHITELISTED', 'server IP is not whitelisted at Paga', 403, json);
+    if (res.status === 429) throw new PagaError('RATE_LIMITED', 'Paga rate limit; retry later with the same reference', 429, json);
     if (res.status === 400) throw new PagaError('BAD_REQUEST', String((json as any)?.statusMessage ?? (json as any)?.message ?? 'validation failed (often the hash)'), 400, json);
     if (!res.ok) throw new PagaError(`HTTP_${res.status}`, 'Paga error', res.status, json);
     return json;

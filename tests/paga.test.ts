@@ -44,6 +44,8 @@ describe('PagaClient auth per product', () => {
     assert.equal(calls[0].url, 'https://beta-collect.paga.com/status');
     assert.equal(calls[0].headers.Authorization, `Basic ${Buffer.from('pub_test:sec_test').toString('base64')}`);
     assert.equal(calls[0].headers.hash, sha512('r1hash_test'));
+    // Node fetch would send "Accept-Language: *", which Paga Collect answers with "system error".
+    assert.equal(calls[0].headers['Accept-Language'], 'en');
   });
   it('Business uses principal/credentials/hash on the business-rest path', async () => {
     const { f, calls } = stubFetch(() => ({ json: { responseCode: 0, banks: [] } }));
