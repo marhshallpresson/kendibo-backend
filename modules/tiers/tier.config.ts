@@ -180,7 +180,7 @@ export interface TierConfigJSON {
   pro: { plan: 'pro_monthly'; priceKobo: string; periodDays: number; minTier: number; commissionBps: number; rankBoost: number; benefits: string[] };
 }
 
-const koboStr = z.string().regex(/^d{1,18}$/, 'must be a whole number of kobo (digits only)');
+const koboStr = z.string().regex(/^\d{1,18}$/, 'must be a whole number of kobo (digits only)');
 const nonNegInt = z.number().int().min(0);
 const bps = z.number().int().min(0).max(10000);
 const tierDefSchema = z.object({

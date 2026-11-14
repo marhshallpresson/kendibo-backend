@@ -566,7 +566,7 @@ describe('Kendibo Pro and Tier 3', () => {
     const r2 = await tierService.sweepSubscriptions();
     assert.ok(r1.reminded >= 1);
     assert.equal(r2.reminded, 0, 'once per period');
-    const n = await q(`SELECT 1 FROM notification.notification WHERE recipient_id=$1 AND template='tier.pro_renewal_reminder'`, [b.uid]);
+    const n = await q(`SELECT 1 FROM notification.notification WHERE recipient_id=$1 AND template='tier.pro_renewal_reminder' AND channel='inapp'`, [b.uid]);
     assert.equal(n.length, 1);
   });
 });
