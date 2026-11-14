@@ -29,6 +29,7 @@ import { emit } from '../../packages/observability/emit.js';
 import { walletService } from '../wallet/wallet.service.js';
 import { auditService, type AuditContext } from '../audit/audit.service.js';
 import { MANUAL_VERIFICATION } from '../kyc/kyc-availability.js';
+import { notifyProvider, claimOnce, naira } from './tier.notify.js';
 import { tierConfig, upgradeFee, type BusinessKind, type TierConfig, type TierNo } from './tier.config.js';
 
 export type ApplicationStatus = 'pending_payment' | 'under_review' | 'approved' | 'rejected';
@@ -63,6 +64,11 @@ async function providerRow(providerId: string): Promise<Row | null> {
   return r[0] ?? null;
 }
 
+async function userIdOf(providerId: string): Promise<string | null> {
+  const r = await q<{ user_id: string }>(`SELECT user_id FROM provider.provider WHERE id=$1`, [providerId]).catch(() => []);
+  return r[0] ? String(r[0].user_id) : null;
+}
+
 const count = async (sql: string, params: unknown[]) => Number((await q<{ n: string }>(sql, params).catch(() => [{ n: '0' }]))[0]?.n ?? 0);
 
 export function isManualReview(p: Row): boolean {
@@ -75,30 +81,28 @@ async function requirementsOf(p: Row, cfg: TierConfig): Promise<Requirement[]> {
   const verified = String(p.kyc_status ?? '').toUpperCase() === 'VERIFIED';
   const manual = isManualReview(p);
 
-  const selfieDocs = await count(`SELECT COUNT(*) AS n FROM kyc.submission_document WHERE provider_id=$1 AND kind='selfie'`, [id]);
-  const faceChecks = await count(
-    `SELECT COUNT(*) AS n FROM kyc.verification_check WHERE subject_type='provider' AND subject_id=$1 AND check_kind IN ('doc_face', 'face_liveness')`, [id],
-  );
-  const skills = await count(`SELECT COUNT(*) AS n FROM provider.skill WHERE provider_id=$1`, [id]);
-  const enrolled = await count(`SELECT COUNT(*) AS n FROM provider.category_enrollment WHERE provider_id=$1`, [id]);
-  const addressDocs = await count(`SELECT COUNT(*) AS n FROM kyc.submission_document WHERE provider_id=$1 AND kind='address'`, [id]);
-  const addressChecks = await count(
-    `SELECT COUNT(*) AS n FROM kyc.verification_check WHERE subject_type='provider' AND subject_id=$1 AND check_kind='address' AND status='passed'`, [id],
-  );
-  const photos = await count(`SELECT COUNT(*) AS n FROM provider.gallery WHERE provider_id=$1`, [id]);
-  const refs = await count(`SELECT COUNT(*) AS n FROM provider.tier_reference WHERE provider_id=$1 AND status<>'rejected'`, [id]);
-  const certs = await count(
-    `SELECT COUNT(*) AS n FROM provider.credential WHERE provider_id=$1 AND kind IN ('certificate', 'licence') AND status IN ('submitted', 'approved')`, [id],
-  );
-  const completed = await count(`SELECT COUNT(*) AS n FROM provider.earning WHERE provider_id=$1`, [id]);
-  const rating = await q<{ avg: string | null; n: string }>(
-    `SELECT AVG(provider) AS avg, COUNT(*) AS n FROM payment.review WHERE provider_id=$1`, [id],
-  ).catch(() => []);
-  const avg = rating[0]?.avg != null ? Number(rating[0].avg) : null;
-  const disputes = await count(
-    `SELECT COUNT(*) AS n FROM payment.dispute d JOIN dispatch.assignment a ON a.job_id = d.job_id
-      WHERE a.provider_id=$1 AND a.status='accepted' AND d.status IN ('open', 'review')`, [id],
-  );
+  // One round trip: every counter is a scalar subquery in a single statement.
+  const c = (await q<Record<string, unknown>>(
+    `SELECT
+       (SELECT COUNT(*) FROM kyc.submission_document WHERE provider_id=$1 AND kind='selfie') AS selfie_docs,
+       (SELECT COUNT(*) FROM kyc.verification_check WHERE subject_type='provider' AND subject_id=$1 AND check_kind IN ('doc_face', 'face_liveness')) AS face_checks,
+       (SELECT COUNT(*) FROM provider.skill WHERE provider_id=$1) AS skills,
+       (SELECT COUNT(*) FROM provider.category_enrollment WHERE provider_id=$1) AS enrolled,
+       (SELECT COUNT(*) FROM kyc.submission_document WHERE provider_id=$1 AND kind='address') AS address_docs,
+       (SELECT COUNT(*) FROM kyc.verification_check WHERE subject_type='provider' AND subject_id=$1 AND check_kind='address' AND status='passed') AS address_checks,
+       (SELECT COUNT(*) FROM provider.gallery WHERE provider_id=$1) AS photos,
+       (SELECT COUNT(*) FROM provider.tier_reference WHERE provider_id=$1 AND status<>'rejected') AS refs,
+       (SELECT COUNT(*) FROM provider.credential WHERE provider_id=$1 AND kind IN ('certificate', 'licence') AND status IN ('submitted', 'approved')) AS certs,
+       (SELECT COUNT(*) FROM provider.earning WHERE provider_id=$1) AS completed,
+       (SELECT AVG(provider) FROM payment.review WHERE provider_id=$1) AS avg_rating,
+       (SELECT COUNT(*) FROM payment.dispute d JOIN dispatch.assignment a ON a.job_id = d.job_id
+         WHERE a.provider_id=$1 AND a.status='accepted' AND d.status IN ('open', 'review')) AS disputes`, [id],
+  ))[0] ?? {};
+  const n = (k: string) => Number(c[k] ?? 0);
+  const selfieDocs = n('selfie_docs'), faceChecks = n('face_checks'), skills = n('skills'), enrolled = n('enrolled');
+  const addressDocs = n('address_docs'), addressChecks = n('address_checks'), photos = n('photos'), refs = n('refs');
+  const certs = n('certs'), completed = n('completed'), disputes = n('disputes');
+  const avg = c.avg_rating != null ? Number(c.avg_rating) : null;
 
   const business = String(p.account_type ?? '') === 'business';
   return [
@@ -121,6 +125,9 @@ async function requirementsOf(p: Row, cfg: TierConfig): Promise<Requirement[]> {
     { key: 'no_open_disputes', label: 'No open disputes', tier: 3, done: disputes === 0 },
   ];
 }
+
+/** Per-call memo: one snapshot per provider across eligibility and ranking. */
+export type SnapshotMemo = Map<string, Promise<TierSnapshot>>;
 
 export interface TierSnapshot {
   providerId: string; userId: string; row: Row;
@@ -159,11 +166,28 @@ export function limitsFor(cfg: TierConfig, tier: 0 | TierNo, proActive: boolean)
 }
 
 export const tierService = {
-  async snapshot(providerId: string): Promise<TierSnapshot> {
+  newSnapshotMemo(): SnapshotMemo { return new Map(); },
+
+  /**
+   * Pure read (no side effects): safe on hot paths. Pass a memo (see
+   * newSnapshotMemo) to share one snapshot per provider within a call.
+   * Subscription renewals run from the sweeper and in view(), never here.
+   */
+  async snapshot(providerId: string, memo?: SnapshotMemo): Promise<TierSnapshot> {
+    if (!memo) return this.computeSnapshot(providerId);
+    let hit = memo.get(providerId);
+    if (!hit) {
+      hit = this.computeSnapshot(providerId);
+      memo.set(providerId, hit);
+      hit.catch(() => memo.delete(providerId));
+    }
+    return hit;
+  },
+
+  async computeSnapshot(providerId: string): Promise<TierSnapshot> {
     const cfg = await tierConfig();
     const row = await providerRow(providerId);
     if (!row) throw new TierError('NOT_FOUND', 'Provider profile not found', 404);
-    await this.refreshSubscription(providerId).catch(() => undefined);
     const requirements = await requirementsOf(row, cfg);
     const tier1Done = requirements.filter((r) => r.tier === 1).every((r) => r.done);
     const manual = isManualReview(row);
@@ -219,8 +243,8 @@ export const tierService = {
   },
 
   /** Ranking points (0-100 dispatch scale) from tier and an active Pro subscription. */
-  async rankBoost(providerId: string): Promise<number> {
-    const s = await this.snapshot(providerId).catch(() => null);
+  async rankBoost(providerId: string, memo?: SnapshotMemo): Promise<number> {
+    const s = await this.snapshot(providerId, memo).catch(() => null);
     if (!s || s.tier === 0) return 0;
     const t = s.cfg.tiers[s.tier].rankBoost;
     return s.tier < 3 && s.proActive ? t + s.cfg.pro.rankBoost : t;
@@ -259,6 +283,7 @@ export const tierService = {
   /** GET /v1/provider/tier */
   async view(providerId: string) {
     await this.checkRefunds(providerId).catch(() => undefined);
+    await this.refreshSubscription(providerId).catch(() => undefined); // lazy renewal: here and in the sweeper only
     const s = await this.snapshot(providerId);
     const { cfg, tier } = s;
     const shown: TierNo = tier === 0 ? 1 : tier;
@@ -266,21 +291,28 @@ export const tierService = {
     const business = String(s.row.account_type ?? '') === 'business';
     const apps = await q<Row>(`SELECT * FROM provider.tier_application WHERE provider_id=$1 ORDER BY created_at DESC LIMIT 1`, [providerId]);
     const app = apps[0] ?? null;
-    let next: { tier: TierNo; feeKobo: string; canApply: boolean; missing: string[] } | null = null;
+    const accountType: 'individual' | 'business' = business ? 'business' : 'individual';
+    let next: { tier: TierNo; name: string; feeKobo: string; refundAfterJobs: number; limits: TierLimits; canApply: boolean; missing: string[] } | null = null;
     if (tier < 3) {
       const target = (tier <= 1 ? 2 : 3) as 2 | 3;
       const missing = s.requirements.filter((r) => r.tier <= target && !r.done && (tier === 0 || r.tier > 1)).map((r) => r.key);
       const reviewing = Boolean(app && String(app.status) === 'under_review');
-      next = { tier: target, feeKobo: upgradeFee(cfg, target, business ? 'business' : 'individual').toString(), canApply: tier >= 1 && missing.length === 0 && !reviewing, missing };
+      next = {
+        tier: target, name: cfg.tiers[target].name, feeKobo: upgradeFee(cfg, target, accountType).toString(),
+        refundAfterJobs: cfg.refundAfterJobs[target], limits: limitsFor(cfg, target, false),
+        canApply: tier >= 1 && missing.length === 0 && !reviewing, missing,
+      };
     }
     const locked = await q<{ id: string; name: string; min_kyc_tier: number }>(
       `SELECT c.id, c.name, r.min_kyc_tier FROM catalog.category c JOIN catalog.category_rule r ON r.category_id = c.id
         WHERE c.active AND r.min_kyc_tier > $1 ORDER BY r.min_kyc_tier, c.name`, [tier],
     );
+    const refs = await q<Row>(`SELECT id, kind, name, status FROM provider.tier_reference WHERE provider_id=$1 ORDER BY created_at`, [providerId]);
     const sub = s.subscription;
     const active = subActive(sub);
     return {
       tier: shown,
+      accountType,
       /** Additive: false while Tier 1 is not complete (no tiered work yet). */
       active: tier >= 1,
       name: def.name,
@@ -291,6 +323,7 @@ export const tierService = {
       application: app ? {
         id: String(app.id), targetTier: Number(app.target_tier), status: String(app.status) as ApplicationStatus,
         ...(app.reason ? { reason: String(app.reason) } : {}),
+        ...(String(app.status) === 'rejected' && String(app.refund_status) === 'refunded' ? { refundedKobo: String(app.fee_kobo) } : {}),
       } : null,
       subscription: {
         active,
@@ -299,9 +332,13 @@ export const tierService = {
         endsAt: active && sub ? new Date(String(sub.current_period_end)).toISOString() : null,
         /** Additive: Tier 3 gets the Pro perks without subscribing. */
         includedByTier: tier === 3,
+        cancelAtPeriodEnd: Boolean(active && sub && sub.cancel_at_period_end === true),
+        periodDays: cfg.pro.periodDays,
+        minTier: cfg.pro.minTier,
         priceKobo: cfg.pro.priceKobo.toString(),
         benefits: cfg.pro.benefits,
       },
+      references: refs.map((r) => ({ id: String(r.id), kind: String(r.kind), name: String(r.name), status: String(r.status) })),
       lockedCategories: locked.map((c) => ({ id: String(c.id), name: String(c.name), minTier: Number(c.min_kyc_tier) })),
     };
   },
@@ -333,7 +370,8 @@ export const tierService = {
   },
 
   /** POST /v1/provider/tier/apply */
-  async apply(providerId: string, targetTier: 2 | 3, businessKind: BusinessKind | undefined, payments: CheckoutPort) {
+  /** The price kind comes from the account type; a client-sent businessKind is ignored (kept for API compatibility). */
+  async apply(providerId: string, targetTier: 2 | 3, _clientBusinessKind: BusinessKind | undefined, payments: CheckoutPort) {
     const s = await this.snapshot(providerId);
     if (s.tier === 0) {
       throw new TierError('REQUIREMENTS_UNMET', 'Finish Tier 1 first.', 409,
@@ -344,7 +382,7 @@ export const tierService = {
     const missing = s.requirements.filter((r) => r.tier <= targetTier && r.tier > 1 && !r.done).map((r) => r.key);
     if (missing.length) throw new TierError('REQUIREMENTS_UNMET', 'Some requirements are not met yet.', 409, missing);
 
-    const kind: BusinessKind = businessKind ?? (String(s.row.account_type ?? '') === 'business' ? 'business' : 'individual');
+    const kind: BusinessKind = String(s.row.account_type ?? '') === 'business' ? 'business' : 'individual';
     const fee = upgradeFee(s.cfg, targetTier, kind);
 
     const open = await q<Row>(
@@ -420,6 +458,18 @@ export const tierService = {
     return false;
   },
 
+  /** The user who owns a tier_/sub_ checkout reference (null when unknown). */
+  async checkoutOwner(reference: string): Promise<string | null> {
+    const sql = reference.startsWith(TIER_REF_PREFIX)
+      ? `SELECT p.user_id FROM provider.tier_application a JOIN provider.provider p ON p.id = a.provider_id WHERE a.payment_reference=$1`
+      : reference.startsWith(SUB_REF_PREFIX)
+        ? `SELECT p.user_id FROM provider.subscription s JOIN provider.provider p ON p.id = s.provider_id WHERE s.payment_reference=$1`
+        : null;
+    if (!sql) return null;
+    const r = await q<{ user_id: string }>(sql, [reference]).catch(() => []);
+    return r[0] ? String(r[0].user_id) : null;
+  },
+
   async listApplications(status?: string, limit = 100) {
     const where = status ? `WHERE a.status=$1` : '';
     const rows = await q<Row>(
@@ -464,6 +514,14 @@ export const tierService = {
     await this.setGranted(providerId, Math.max(prev, target), 'application', by, null);
     await auditService.log(by, 'provider.tier.application_approved', applicationId, { ...ctx, entityType: 'tier_application', meta: { providerId, from: prev, to: target } });
     emit('provider.tier_changed', { providerId, from: prev, to: target, by, via: 'application' });
+    const cfgA = await tierConfig();
+    const uidA = await userIdOf(providerId);
+    if (uidA) {
+      await notifyProvider(uidA, 'tier.application_approved', `You are now Tier ${target} ${cfgA.tiers[target as TierNo].name}`,
+        fee > 0n
+          ? `Your upgrade was approved. Your ${naira(fee)} fee comes back to your wallet after ${cfgA.refundAfterJobs[target as 2 | 3]} completed jobs.`
+          : 'Your upgrade was approved.');
+    }
     return { id: applicationId, status: 'approved' as ApplicationStatus, providerId, tier: target };
   },
 
@@ -488,6 +546,11 @@ export const tierService = {
     }
     await auditService.log(by, 'provider.tier.application_rejected', applicationId, { ...ctx, entityType: 'tier_application', reason, meta: { providerId, refundedKobo } });
     emit('provider.tier_application_rejected', { providerId, applicationId, reason });
+    const uidR = await userIdOf(providerId);
+    if (uidR) {
+      await notifyProvider(uidR, 'tier.application_rejected', 'Your Tier upgrade was not approved',
+        `Reason: ${reason}.${refundedKobo !== '0' ? ` ${naira(refundedKobo)} was refunded to your wallet.` : ''}`);
+    }
     return { id: applicationId, status: 'rejected' as ApplicationStatus, providerId, reason, refundedKobo };
   },
 
@@ -523,36 +586,56 @@ export const tierService = {
       await walletService.credit(String(prov[0].user_id), Number(big(a.fee_kobo)), ref, 'refund');
       await q(`UPDATE provider.tier_application SET refund_status='refunded', refund_reference=$2, refunded_at=now() WHERE id=$1`, [a.id, ref]);
       emit('provider.tier_fee_refunded', { providerId, applicationId: String(a.id), amountKobo: String(a.fee_kobo) });
+      await notifyProvider(String(prov[0].user_id), 'tier.fee_refunded', 'Your upgrade fee is back',
+        `${naira(String(a.fee_kobo))} was credited to your wallet after ${cfg.refundAfterJobs[target]} completed jobs at Tier ${target}.`);
       n++;
     }
     return n;
   },
 
   // ── Kendibo Pro subscription ───────────────────────────────────────────────
-  async activate(subscriptionId: string, reference: string, amountKobo: bigint) {
+  /**
+   * Start or renew a period. Compare-and-set: it only applies while the row is
+   * still in the state the caller saw (pending_payment, or active at
+   * `renewFromPeriods`), so a duplicate or concurrent call is a no-op (null).
+   */
+  async activate(subscriptionId: string, reference: string, amountKobo: bigint, renewFromPeriods?: number) {
     const cfg = await tierConfig();
     const s = (await q<Row>(`SELECT * FROM provider.subscription WHERE id=$1`, [subscriptionId]))[0];
     if (!s) return null;
+    const expectStatus = renewFromPeriods === undefined ? 'pending_payment' : 'active';
+    const expectPeriods = renewFromPeriods ?? Number(s.periods ?? 0);
+    if (String(s.status) !== expectStatus || Number(s.periods ?? 0) !== expectPeriods) return null;
     const now = Date.now();
     const startMs = String(s.status) === 'active' && ms(s.current_period_end) > now ? ms(s.current_period_end) : now;
     const endMs = startMs + cfg.pro.periodDays * 86_400_000;
-    const renewing = Number(s.periods ?? 0) > 0;
-    await q(
+    const renewing = expectPeriods > 0;
+    const upd = await q<Row>(
       `UPDATE provider.subscription SET status='active', periods=periods+1, current_period_start=$2, current_period_end=$3,
-              payment_reference=$4, expired_at=NULL, updated_at=now() WHERE id=$1`,
-      [subscriptionId, new Date(startMs).toISOString(), new Date(endMs).toISOString(), reference],
+              payment_reference=$4, price_kobo=$7, expired_at=NULL, updated_at=now()
+        WHERE id=$1 AND status=$5 AND periods=$6 RETURNING id`,
+      [subscriptionId, new Date(startMs).toISOString(), new Date(endMs).toISOString(), reference, expectStatus, expectPeriods, amountKobo.toString()],
     );
+    if (!upd[0]) return null; // lost the race: someone else already activated / renewed
     await q(
       `INSERT INTO provider.subscription_event (subscription_id, provider_id, kind, amount_kobo, reference) VALUES ($1,$2,$3,$4,$5)`,
       [subscriptionId, s.provider_id, renewing ? 'renew' : 'start', amountKobo.toString(), reference],
     );
     emit(renewing ? 'provider.subscription_renewed' : 'provider.subscription_started', { providerId: String(s.provider_id), subscriptionId });
+    const uid = await userIdOf(String(s.provider_id));
+    if (uid) {
+      await notifyProvider(uid, renewing ? 'tier.pro_renewed' : 'tier.pro_started',
+        renewing ? 'Kendibo Pro renewed' : 'Kendibo Pro is active',
+        `${naira(amountKobo)} paid. Your Pro perks run until ${new Date(endMs).toISOString().slice(0, 10)}.`);
+    }
     return { periodEnd: new Date(endMs).toISOString() };
   },
 
   /** POST /v1/provider/subscription */
   async subscribe(providerId: string, payments: CheckoutPort) {
+    await this.refreshSubscription(providerId).catch(() => undefined); // settle a lapsed period before reading state
     const s = await this.snapshot(providerId);
+    if (s.tier === 3) throw new TierError('INCLUDED_BY_TIER', 'Kendibo Pro perks are included with Tier 3.', 409);
     if (s.tier < s.cfg.pro.minTier) {
       throw new TierError('TIER_TOO_LOW', `Kendibo Pro is for Tier ${s.cfg.pro.minTier} and above.`, 409,
         s.requirements.filter((r) => r.tier <= s.cfg.pro.minTier && !r.done).map((r) => r.key));
@@ -602,33 +685,75 @@ export const tierService = {
   },
 
   /**
-   * Period over: cancelled -> expired; otherwise renew from the wallet (stable
-   * ref per period), and expire when the balance is short or the pro has
-   * dropped below Tier 2. Runs lazily on every tier read.
+   * Period over: cancelled -> expired; Tier 3 -> expired as 'included_by_tier'
+   * (never charged: the perks come with the tier); otherwise renew from the
+   * wallet (stable ref per period), and expire when the balance is short or
+   * the pro has dropped below Tier 2. Called from the sweeper and from view()
+   * - never from snapshot(). Every write is compare-and-set on `periods`.
    */
   async refreshSubscription(providerId: string): Promise<void> {
     const cfg = await tierConfig();
     const rows = await q<Row>(`SELECT * FROM provider.subscription WHERE provider_id=$1 AND status='active'`, [providerId]);
     for (const s of rows) {
       if (ms(s.current_period_end) > Date.now()) continue;
-      const expire = async (why: string) => {
-        await q(`UPDATE provider.subscription SET status='expired', expired_at=now(), updated_at=now() WHERE id=$1 AND status='active'`, [s.id]);
+      const periods = Number(s.periods ?? 0);
+      const uid = await userIdOf(providerId);
+      const expire = async (why: string, message: string) => {
+        const upd = await q<Row>(
+          `UPDATE provider.subscription SET status='expired', expired_at=now(), updated_at=now() WHERE id=$1 AND status='active' AND periods=$2 RETURNING id`, [s.id, periods],
+        );
+        if (!upd[0]) return;
         await q(`INSERT INTO provider.subscription_event (subscription_id, provider_id, kind) VALUES ($1,$2,'expire')`, [s.id, providerId]);
         emit('provider.subscription_expired', { providerId, subscriptionId: String(s.id), why });
+        if (uid) await notifyProvider(uid, 'tier.pro_expired', 'Kendibo Pro ended', message);
       };
-      if (s.cancel_at_period_end === true) { await expire('cancelled'); continue; }
+      if (s.cancel_at_period_end === true) { await expire('cancelled', 'Your Kendibo Pro subscription ended as you asked. You can subscribe again any time.'); continue; }
       const p = await q<Row>(`SELECT user_id, tier FROM provider.provider WHERE id=$1`, [providerId]);
-      if (!p[0] || Number(p[0].tier ?? 0) < cfg.pro.minTier) { await expire('tier_too_low'); continue; }
+      if ((await this.snapshot(providerId).catch(() => null))?.tier === 3) {
+        await expire('included_by_tier', 'Kendibo Pro perks are now included with your Tier 3, so there is nothing to pay. You were not charged.');
+        continue;
+      }
+      if (!p[0] || Number(p[0].tier ?? 0) < cfg.pro.minTier) { await expire('tier_too_low', `Kendibo Pro needs Tier ${cfg.pro.minTier} or above, so it ended.`); continue; }
       const price = cfg.pro.priceKobo;
-      const reference = `${SUB_REF_PREFIX}${String(s.id)}_${Number(s.periods ?? 1) + 1}`;
+      const reference = `${SUB_REF_PREFIX}${String(s.id)}_${periods + 1}`;
+      let debited = false;
       try {
         await walletService.debit(String(p[0].user_id), Number(price), reference, 'payment');
-        await q(`UPDATE provider.subscription SET price_kobo=$2 WHERE id=$1`, [s.id, price.toString()]);
-        await this.activate(String(s.id), reference, price);
+        debited = true;
       } catch {
-        await expire('insufficient_funds');
+        await expire('insufficient_funds', `Your wallet did not have ${naira(price)} to renew Kendibo Pro, so it ended. Top up and subscribe again to get your perks back.`);
       }
+      if (debited) await this.activate(String(s.id), reference, price, periods);
     }
+  },
+
+  /**
+   * Background pass (lifecycle sweeper): renew / expire every lapsed period,
+   * and once per period remind Pro members whose wallet will not cover the
+   * renewal in the next 3 days. Idempotent.
+   */
+  async sweepSubscriptions(now = new Date()): Promise<{ refreshed: number; reminded: number }> {
+    const subs = await q<Row>(`SELECT * FROM provider.subscription WHERE status='active'`);
+    let refreshed = 0, reminded = 0;
+    const cfg = await tierConfig();
+    for (const s of subs) {
+      try {
+        const end = ms(s.current_period_end);
+        if (end <= now.getTime()) { await this.refreshSubscription(String(s.provider_id)); refreshed++; continue; }
+        if (s.cancel_at_period_end === true || end - now.getTime() > 3 * 86_400_000) continue;
+        const uid = await userIdOf(String(s.provider_id));
+        if (!uid) continue;
+        const snap = await this.snapshot(String(s.provider_id));
+        if (snap.tier === 3) continue; // included: nothing will be charged
+        const balance = BigInt(await walletService.getBalance(uid));
+        if (balance >= cfg.pro.priceKobo) continue;
+        if (!(await claimOnce(uid, 'pro_renewal_reminder', `${String(s.id)}:${Number(s.periods ?? 0)}`))) continue;
+        await notifyProvider(uid, 'tier.pro_renewal_reminder', 'Kendibo Pro renews soon',
+          `Your Pro renews on ${new Date(end).toISOString().slice(0, 10)} for ${naira(cfg.pro.priceKobo)}, but your wallet has ${naira(balance)}. Top up to keep your perks.`);
+        reminded++;
+      } catch (e) { console.warn('[tiers] subscription sweep failed:', (e as Error).message); }
+    }
+    return { refreshed, reminded };
   },
 
   /** One-message summary for the WhatsApp /tier command. */

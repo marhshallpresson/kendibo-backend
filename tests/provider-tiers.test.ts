@@ -359,3 +359,241 @@ describe('admin tier changes', () => {
     assert.deepEqual(logs.map((l) => l.reason), ['Registered business, site visit done', 'Two no-shows this month']);
   });
 });
+
+// ── Tier config in the database (admin editable) ─────────────────────────────
+describe('tier config in the database', () => {
+  it('migration 060 seeded the full default config; GET returns config, defaults and metadata', async () => {
+    const sa = await user('SUPER_ADMIN', 'Root Admin');
+    assert.equal((await app.inject({ method: 'GET', url: '/v1/admin/settings/tiers', remoteAddress: ip() })).statusCode, 401);
+    assert.equal((await call('GET', '/v1/admin/settings/tiers', await user('PROVIDER'))).statusCode, 403);
+    const res = await call('GET', '/v1/admin/settings/tiers', sa);
+    assert.equal(res.statusCode, 200, res.body);
+    const d = res.json().data;
+    assert.deepEqual(d.config, d.defaults, 'seed equals the built-in defaults');
+    assert.equal(d.config.tiers['1'].maxJobKobo, '5000000');
+    assert.equal(d.config.tiers['3'].maxJobKobo, null);
+    assert.equal(d.config.upgradeFeeKobo['3'].business, '2000000');
+    assert.equal(d.config.pro.priceKobo, '300000');
+    assert.ok('updatedAt' in d && 'updatedBy' in d);
+  });
+
+  it('PUT validates, saves, audit-logs before/after and takes effect immediately', async () => {
+    const sa = await user('SUPER_ADMIN', 'Root Admin');
+    const cur = (await call('GET', '/v1/admin/settings/tiers', sa)).json().data.config;
+    const bad = await call('PUT', '/v1/admin/settings/tiers', sa, { ...cur, standardCommissionBps: 20000, pro: { ...cur.pro, priceKobo: '12.5', benefits: new Array(11).fill('x') } });
+    assert.equal(bad.statusCode, 400, bad.body);
+    assert.equal(bad.json().error.code, 'VALIDATION_ERROR');
+    assert.ok(bad.json().error.fields.standardCommissionBps);
+    assert.ok(bad.json().error.fields['pro.priceKobo']);
+    assert.ok(bad.json().error.fields['pro.benefits']);
+    assert.equal((await call('PUT', '/v1/admin/settings/tiers', await user('PROVIDER'), cur)).statusCode, 403);
+
+    const next = { ...cur, pro: { ...cur.pro, priceKobo: '350000' }, upgradeFeeKobo: { ...cur.upgradeFeeKobo, '2': '300000' } };
+    const ok = await call('PUT', '/v1/admin/settings/tiers', sa, next);
+    assert.equal(ok.statusCode, 200, ok.body);
+    assert.equal(ok.json().data.config.pro.priceKobo, '350000');
+    const { uid } = await pro();
+    const v = (await call('GET', '/v1/provider/tier', uid)).json().data;
+    assert.equal(v.next.feeKobo, '300000');
+    assert.equal(v.subscription.priceKobo, '350000');
+    const logs = await q<{ meta: unknown }>(`SELECT meta FROM audit.log WHERE action='settings.tiers.update' AND actor=$1`, [sa]);
+    assert.equal(logs.length, 1);
+    const meta = (typeof logs[0].meta === 'string' ? JSON.parse(logs[0].meta) : logs[0].meta) as any;
+    assert.equal(meta.before.pro.priceKobo, '300000');
+    assert.equal(meta.after.pro.priceKobo, '350000');
+    const g = (await call('GET', '/v1/admin/settings/tiers', sa)).json().data;
+    assert.ok(g.updatedAt);
+    assert.equal(g.updatedBy, sa);
+    // restore defaults for the other tests
+    assert.equal((await call('PUT', '/v1/admin/settings/tiers', sa, cur)).statusCode, 200);
+  });
+
+  it('falls back to the code defaults (with a warning) when the row is missing or invalid', async () => {
+    const { tierConfig, resetTierConfigCache, DEFAULT_TIER_CONFIG } = await import('../modules/tiers/tier.config.js');
+    const saved = (await q<{ value: unknown }>(`SELECT value FROM configuration.platform_setting WHERE key='tiers.config'`))[0].value;
+    const warns: string[] = [];
+    const orig = console.warn;
+    console.warn = (...a: unknown[]) => { warns.push(a.join(' ')); };
+    try {
+      await q(`UPDATE configuration.platform_setting SET value='{"pro":{"priceKobo":"abc"}}'::jsonb WHERE key='tiers.config'`);
+      resetTierConfigCache();
+      assert.equal((await tierConfig()).pro.priceKobo, DEFAULT_TIER_CONFIG.pro.priceKobo);
+      await q(`DELETE FROM configuration.platform_setting WHERE key='tiers.config'`);
+      resetTierConfigCache();
+      assert.equal((await tierConfig()).upgradeFeeKobo[2], DEFAULT_TIER_CONFIG.upgradeFeeKobo[2]);
+    } finally {
+      console.warn = orig;
+      await q(`DELETE FROM configuration.platform_setting WHERE key='tiers.config'`);
+      await q(`INSERT INTO configuration.platform_setting (key, value) VALUES ('tiers.config', $1::jsonb)`, [typeof saved === 'string' ? saved : JSON.stringify(saved)]);
+      resetTierConfigCache();
+    }
+    assert.equal(warns.filter((w) => w.includes('[tiers]')).length, 2);
+  });
+});
+
+// ── Provider tier view: everything the app used to hardcode ──────────────────
+describe('GET /v1/provider/tier extras', () => {
+  it('sends accountType, next details, subscription extras and references', async () => {
+    const { uid } = await pro({ accountType: 'business' });
+    await call('POST', '/v1/provider/tier/references', uid, { name: 'Mama Tee', phone: '08030001111' });
+    const v = (await call('GET', '/v1/provider/tier', uid)).json().data;
+    assert.equal(v.accountType, 'business');
+    assert.equal(v.next.name, 'Verified');
+    assert.equal(v.next.refundAfterJobs, 3);
+    assert.equal(v.next.limits.maxJobKobo, '50000000');
+    assert.equal(v.next.limits.payoutHoldHours, 24);
+    assert.equal(v.subscription.cancelAtPeriodEnd, false);
+    assert.equal(v.subscription.periodDays, 30);
+    assert.equal(v.subscription.minTier, 2);
+    assert.equal(v.references.length, 1);
+    assert.deepEqual(Object.keys(v.references[0]).sort(), ['id', 'kind', 'name', 'status']);
+  });
+
+  it('shows refundedKobo on a rejected, refunded application and notifies the provider', async () => {
+    const { uid, pid } = await pro();
+    await meetTier2(pid, uid);
+    await walletService.credit(uid, 250_000, `wt_${uid}_rf`, 'topup');
+    const ap = await call('POST', '/v1/provider/tier/apply', uid, { targetTier: 2 });
+    assert.equal(ap.statusCode, 200, ap.body);
+    const id = ap.json().data.applicationId;
+    const rj = await call('POST', `/v1/admin/tier-applications/${id}/reject`, await admin(), { reason: 'Blurry photos' });
+    assert.equal(rj.statusCode, 200, rj.body);
+    const v = (await call('GET', '/v1/provider/tier', uid)).json().data;
+    assert.equal(v.application.status, 'rejected');
+    assert.equal(v.application.refundedKobo, '250000');
+    const inbox = await q<{ body: string }>(`SELECT body FROM notification.notification WHERE recipient_id=$1 AND template='tier.application_rejected'`, [uid]);
+    assert.ok(inbox.length >= 1, 'provider notified');
+    assert.match(String(inbox[0].body), /Blurry photos/);
+  });
+
+  it('tells the provider on approval', async () => {
+    const { uid, pid } = await pro();
+    await meetTier2(pid, uid);
+    await walletService.credit(uid, 250_000, `wt_${uid}_ap`, 'topup');
+    const ap = await call('POST', '/v1/provider/tier/apply', uid, { targetTier: 2 });
+    const ok = await call('POST', `/v1/admin/tier-applications/${ap.json().data.applicationId}/approve`, await admin());
+    assert.equal(ok.statusCode, 200, ok.body);
+    const n = await q(`SELECT 1 FROM notification.notification WHERE recipient_id=$1 AND template='tier.application_approved'`, [uid]);
+    assert.ok(n.length >= 1);
+  });
+});
+
+describe('apply prices by account type', () => {
+  it('derives the price kind from the account and ignores a client-sent businessKind', async () => {
+    const { uid, pid } = await pro({ accountType: 'individual' });
+    await meetTier2(pid, uid);
+    await q(`UPDATE provider.provider SET office_address='1 Shop Rd', cac_number='RC123' WHERE id=$1`, [pid]);
+    await q(`UPDATE provider.provider SET tier=2 WHERE id=$1`, [pid]);
+    for (let i = 0; i < 10; i++) {
+      await q(`INSERT INTO provider.earning (provider_id, job_id, amount_kobo) VALUES ($1,$2,1000)`, [pid, `job-${randomUUID()}`]);
+    }
+    for (let i = 0; i < 10; i++) await q(`INSERT INTO payment.review (booking_id, provider_id, provider, quality, punctuality, professionalism, result) VALUES ($1,$2,5,5,5,5,5)`, [randomUUID(), pid]);
+    const res = await call('POST', '/v1/provider/tier/apply', uid, { targetTier: 3, businessKind: 'business' });
+    assert.equal(res.statusCode, 200, res.body);
+    const row = (await q<{ fee_kobo: string; business_kind: string }>(`SELECT fee_kobo, business_kind FROM provider.tier_application WHERE id=$1`, [res.json().data.applicationId]))[0];
+    assert.equal(row.business_kind, 'individual');
+    assert.equal(String(row.fee_kobo), '1000000', 'individual Tier 3 fee, not the business one');
+  });
+});
+
+// ── Pro for Tier 3, renewal race, reads without side effects ────────────────
+describe('Kendibo Pro and Tier 3', () => {
+  it('409 INCLUDED_BY_TIER for Tier 3', async () => {
+    const { uid, pid } = await pro();
+    await call('POST', `/v1/admin/providers/${pid}/tier`, await admin(), { tier: 3, reason: 'Registered business' });
+    const res = await call('POST', '/v1/provider/subscription', uid, { plan: 'pro_monthly' });
+    assert.equal(res.statusCode, 409, res.body);
+    assert.equal(res.json().error.code, 'INCLUDED_BY_TIER');
+  });
+
+  it('does not charge a Tier 3 provider at renewal: expires as included_by_tier', async () => {
+    const { uid, pid } = await pro();
+    const adm = await admin();
+    await call('POST', `/v1/admin/providers/${pid}/tier`, adm, { tier: 2, reason: 'Verified' });
+    await walletService.credit(uid, 900_000, `wt_${uid}_t3`, 'topup');
+    assert.equal((await call('POST', '/v1/provider/subscription', uid, { plan: 'pro_monthly' })).statusCode, 200);
+    const balance = await walletService.getBalance(uid);
+    await call('POST', `/v1/admin/providers/${pid}/tier`, adm, { tier: 3, reason: 'Upgraded' });
+    await q(`UPDATE provider.subscription SET current_period_end=$2 WHERE provider_id=$1`, [pid, new Date(Date.now() - 1000).toISOString()]);
+    await tierService.refreshSubscription(pid);
+    assert.equal(await walletService.getBalance(uid), balance, 'no debit');
+    const sub = (await q<{ status: string }>(`SELECT status FROM provider.subscription WHERE provider_id=$1`, [pid]))[0];
+    assert.equal(sub.status, 'expired');
+    const inbox = await q<{ body: string }>(`SELECT body FROM notification.notification WHERE recipient_id=$1 AND template='tier.pro_expired'`, [uid]);
+    assert.ok(inbox.length >= 1);
+    assert.match(String(inbox[0].body), /included with your Tier 3/);
+  });
+
+  it('concurrent renewals debit and extend once (activation is compare-and-set)', async () => {
+    const { uid, pid } = await pro();
+    await call('POST', `/v1/admin/providers/${pid}/tier`, await admin(), { tier: 2, reason: 'Verified' });
+    await walletService.credit(uid, 900_000, `wt_${uid}_race`, 'topup');
+    assert.equal((await call('POST', '/v1/provider/subscription', uid, { plan: 'pro_monthly' })).statusCode, 200);
+    assert.equal(await walletService.getBalance(uid), 600_000);
+    await q(`UPDATE provider.subscription SET current_period_end=$2 WHERE provider_id=$1`, [pid, new Date(Date.now() - 1000).toISOString()]);
+    await Promise.all([tierService.refreshSubscription(pid), tierService.refreshSubscription(pid), tierService.refreshSubscription(pid)]);
+    assert.equal(await walletService.getBalance(uid), 300_000, 'one debit');
+    const sub = (await q<{ periods: number; current_period_end: string }>(`SELECT periods, current_period_end FROM provider.subscription WHERE provider_id=$1`, [pid]))[0];
+    assert.equal(Number(sub.periods), 2);
+    const days = (new Date(String(sub.current_period_end)).getTime() - Date.now()) / 86_400_000;
+    assert.ok(days > 29 && days < 31, `extended once (${days.toFixed(1)}d)`);
+    const renews = await q(`SELECT 1 FROM provider.subscription_event WHERE provider_id=$1 AND kind='renew'`, [pid]);
+    assert.equal(renews.length, 1);
+    // A duplicate activation of a settled period is a no-op.
+    const sid = String((await q<{ id: string }>(`SELECT id FROM provider.subscription WHERE provider_id=$1`, [pid]))[0].id);
+    assert.equal(await tierService.activate(sid, 'dup', 300_000n), null);
+  });
+
+  it('snapshot() has no side effects; the sweeper expires lapsed periods and reminds once per period', async () => {
+    const { uid, pid } = await pro();
+    await call('POST', `/v1/admin/providers/${pid}/tier`, await admin(), { tier: 2, reason: 'Verified' });
+    await walletService.credit(uid, 300_000, `wt_${uid}_sw`, 'topup');
+    assert.equal((await call('POST', '/v1/provider/subscription', uid, { plan: 'pro_monthly' })).statusCode, 200);
+    await q(`UPDATE provider.subscription SET current_period_end=$2 WHERE provider_id=$1`, [pid, new Date(Date.now() - 1000).toISOString()]);
+    await tierService.snapshot(pid);
+    const mid = (await q<{ status: string; periods: number }>(`SELECT status, periods FROM provider.subscription WHERE provider_id=$1`, [pid]))[0];
+    assert.equal(mid.status, 'active');
+    assert.equal(Number(mid.periods), 1);
+    await tierService.sweepSubscriptions();
+    assert.equal((await q<{ status: string }>(`SELECT status FROM provider.subscription WHERE provider_id=$1`, [pid]))[0].status, 'expired');
+
+    const b = await pro();
+    await call('POST', `/v1/admin/providers/${b.pid}/tier`, await admin(), { tier: 2, reason: 'Verified' });
+    await walletService.credit(b.uid, 300_000, `wt_${b.uid}_sw`, 'topup');
+    assert.equal((await call('POST', '/v1/provider/subscription', b.uid, { plan: 'pro_monthly' })).statusCode, 200);
+    await q(`UPDATE provider.subscription SET current_period_end=$2 WHERE provider_id=$1`, [b.pid, new Date(Date.now() + 2 * 86_400_000).toISOString()]);
+    const r1 = await tierService.sweepSubscriptions();
+    const r2 = await tierService.sweepSubscriptions();
+    assert.ok(r1.reminded >= 1);
+    assert.equal(r2.reminded, 0, 'once per period');
+    const n = await q(`SELECT 1 FROM notification.notification WHERE recipient_id=$1 AND template='tier.pro_renewal_reminder'`, [b.uid]);
+    assert.equal(n.length, 1);
+  });
+});
+
+describe('tier/sub checkout status for the provider', () => {
+  it('GET /v1/payments/:reference is visible to the owning provider only', async () => {
+    const { uid, pid } = await pro();
+    await meetTier2(pid, uid);
+    const ap = await call('POST', '/v1/provider/tier/apply', uid, { targetTier: 2 }); // empty wallet -> checkout
+    assert.equal(ap.statusCode, 200, ap.body);
+    const reference = ap.json().data.payment.reference;
+    assert.match(reference, /^tier_/);
+    const mine = await call('GET', `/v1/payments/${reference}`, uid);
+    assert.equal(mine.statusCode, 200, mine.body);
+    assert.equal(mine.json().data.reference, reference);
+    assert.ok(['pending', 'successful', 'failed'].includes(mine.json().data.status));
+    assert.equal((await call('GET', `/v1/payments/${reference}`, await user('PROVIDER'))).statusCode, 404);
+  });
+});
+
+describe('error handler', () => {
+  it('hides driver details on 5xx in production only', async () => {
+    const { errorBody } = await import('../apps/api/src/safe-error.js');
+    const pgErr = Object.assign(new Error('password authentication failed for user "x"'), { code: '28P01', statusCode: 500 });
+    assert.deepEqual(errorBody(500, pgErr, true), { statusCode: 500, error: 'Internal Server Error', message: 'Something went wrong. Please try again.' });
+    assert.equal(errorBody(500, pgErr, false), pgErr);
+    const e4 = Object.assign(new Error('Bad'), { statusCode: 404 });
+    assert.equal(errorBody(404, e4, true), e4, '4xx unchanged');
+  });
+});

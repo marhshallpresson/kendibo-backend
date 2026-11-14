@@ -5,6 +5,7 @@
 import { q } from '../../packages/database/db.js';
 import { emit } from '../../packages/observability/emit.js';
 import { categoryRulesService } from './category-rules.service.js';
+import type { SnapshotMemo } from '../tiers/tier.service.js';
 
 // `kyc_tier_N`: the trade needs provider tier N (category_rule.min_kyc_tier,
 // compared with the provider tier since 059 — modules/tiers/tier.service.ts).
@@ -17,7 +18,11 @@ export type MissingRequirement =
 export interface Eligibility { providerId: string; categoryId: string; eligible: boolean; missing: MissingRequirement[] }
 
 /** The job being offered or accepted, when known (per-job tier cap, large-job flag). */
-export interface JobContext { amountKobo?: bigint | null; accepting?: boolean; ref?: string | null }
+export interface JobContext {
+  amountKobo?: bigint | null; accepting?: boolean; ref?: string | null;
+  /** Per-call tier snapshot memo: one snapshot per provider across allowed() and rankBoost(). */
+  snapshots?: SnapshotMemo;
+}
 
 /** Enforced in production (and wherever VENDOR_ELIGIBILITY_ENFORCED=true). In
  *  local/test runs unverified seed vendors still receive work so flows can be
@@ -36,7 +41,7 @@ export const vendorEligibilityService = {
     const rule = await categoryRulesService.ruleFor(categoryId);
     const missing: MissingRequirement[] = [];
     const { tierService } = await import('../tiers/tier.service.js');
-    const tier = await tierService.snapshot(providerId);
+    const tier = await tierService.snapshot(providerId, job.snapshots);
     // NIN in manual review with Tier 1 complete: may work at Tier 1 (capped there).
     const manualOk = tier.manualReview && tier.tier >= 1;
 
@@ -147,7 +152,7 @@ export const vendorEligibilityService = {
       const any = await q(`SELECT 1 FROM provider.category_enrollment WHERE provider_id=$1 AND status='eligible' LIMIT 1`, [providerId]);
       if (!any[0]) return false;
       const { tierService } = await import('../tiers/tier.service.js');
-      const s = await tierService.snapshot(providerId);
+      const s = await tierService.snapshot(providerId, job.snapshots);
       if (s.tier === 0) return false;
       const def = s.cfg.tiers[s.tier];
       if (job.amountKobo != null && def.maxJobKobo !== null && job.amountKobo > def.maxJobKobo) return false;

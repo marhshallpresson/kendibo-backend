@@ -56,6 +56,7 @@ import { configureWhatsappBot } from '../../../modules/whatsapp/whatsapp.bot.js'
 import { registerVendorRoutes, VENDOR_ROUTE_POLICY } from './vendor.routes.js';
 import { registerAdminOpsRoutes, ADMIN_OPS_POLICY } from './admin-ops.routes.js';
 import { registerEvidenceRoutes } from './evidence.routes.js';
+import { errorBody } from './safe-error.js';
 import { registerEmailRoutes, EMAIL_ROUTE_POLICY } from './email.routes.js';
 import { registerOnboardingRoutes } from './onboarding.routes.js';
 import { registerKycAdminRoutes } from './kyc-admin.routes.js';
@@ -217,7 +218,7 @@ app.setErrorHandler((err, req, reply) => {
   }
   const status = (err as { statusCode?: number }).statusCode ?? 500;
   if (status >= 500) req.log.error({ err }, 'request failed');
-  return reply.code(status).send(err);
+  return reply.code(status).send(errorBody(status, err, process.env.NODE_ENV === 'production'));
 });
 function authed(req: { headers: Record<string, string | undefined> }): { sub: string; permissions: string[]; sid?: string; iat?: number } | null {
   const h = req.headers.authorization;
@@ -2504,6 +2505,8 @@ app.post('/v1/change-orders/:id/approve', async (req, reply) => {
 // to the user that minted them. Admins with payment:view may read any.
 async function paymentVisible(p: Record<string, unknown>, sub: string): Promise<boolean> {
   if (String(p.reference).startsWith(`wt_${sub}_`)) return true;
+  // Tier upgrade fee / Kendibo Pro checkouts live in payment.payment with no booking: they belong to the provider's user.
+  if (/^(tier_|sub_)/.test(String(p.reference)) && (await tierService.checkoutOwner(String(p.reference))) === sub) return true;
   const b = p.booking_id ? await bookingService.getRaw(String(p.booking_id)) : null;
   if (b?.userId === sub) return true;
   const rows = await q<{ role: string }>(`SELECT role FROM identity.users WHERE id=$1`, [sub]);

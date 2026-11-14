@@ -5,6 +5,7 @@ import { catalogService } from '../catalog/catalog.service.js';
 import { q } from '../../packages/database/db.js';
 import { observability } from '../../packages/observability/watchup.adapter.js';
 import { geoService } from '../geo/geo.service.js';
+import { mapLimit } from '../../packages/shared/map-limit.js';
 
 export interface Candidate { providerId: string; score: number; distanceKm: number }
 const WEIGHTS = { distance: 0.5, rating: 0.25, workload: 0.15, fairness: 0.1 };
@@ -27,33 +28,35 @@ export const dispatchService = {
     const radius = job.radiusKm ?? 15;
     const userZone = await geoService.checkZone(job.lat, job.lng);
     const out: Candidate[] = [];
-    for (const p of await providerService.allOnline()) {
-      if (svc?.requiresSkill && !p.skills.includes(svc.requiresSkill)) continue;
-      if (p.lat === undefined || p.lng === undefined) continue;
+    const { tierService } = await import('../tiers/tier.service.js');
+    const snapshots = tierService.newSnapshotMemo();
+    const evaluate = async (p: Awaited<ReturnType<typeof providerService.allOnline>>[number]): Promise<Candidate | null> => {
+      if (svc?.requiresSkill && !p.skills.includes(svc.requiresSkill)) return null;
+      if (p.lat === undefined || p.lng === undefined) return null;
       
       const providerZone = await geoService.checkZone(p.lat, p.lng);
       // Strict city match required for dispatch (Uber/Bolt model)
-      if (!userZone.serviceable || !providerZone.serviceable || userZone.cityId !== providerZone.cityId) continue;
+      if (!userZone.serviceable || !providerZone.serviceable || userZone.cityId !== providerZone.cityId) return null;
       
       const d = haversineKm([job.lat, job.lng], [p.lat, p.lng]);
-      if (d > radius) continue;
+      if (d > radius) return null;
       if (svc?.requiresSkill) {
         const prov = await q<{ kyc_status: string }>(`SELECT kyc_status FROM provider.provider WHERE id=$1`, [p.id]);
-        if (prov[0]?.kyc_status !== 'VERIFIED') continue; // skilled work needs KYC
+        if (prov[0]?.kyc_status !== 'VERIFIED') return null; // skilled work needs KYC
       }
       // Category rules (KYC tier, face match, licence, capacity) decide who may be offered the job.
       // ...and the tier: per-job cap (when the price is known) and open-job limit.
-      if (!(await vendorEligibilityService.allowed(p.id, categoryId, { amountKobo: job.amountKobo ?? null }))) continue;
+      if (!(await vendorEligibilityService.allowed(p.id, categoryId, { amountKobo: job.amountKobo ?? null, snapshots }))) return null;
       const qual = await q<Record<string, unknown>>(`SELECT * FROM provider.quality WHERE provider_id=$1`, [p.id]);
       const rating = Number(qual[0]?.rating ?? 4.5) || 4.5;
       const loadRows = await q<{ c: number }>(`SELECT count(*) c FROM dispatch.assignment WHERE provider_id=$1 AND status='accepted'`, [p.id]);
       const load = Number(loadRows[0]?.c ?? 0);
       // Tier 2/3 and an active Kendibo Pro subscription rank higher.
-      const { tierService } = await import('../tiers/tier.service.js');
-      const boost = await tierService.rankBoost(p.id).catch(() => 0);
+      const boost = await tierService.rankBoost(p.id, snapshots).catch(() => 0);
       const score = 100 - WEIGHTS.distance * d * 4 + WEIGHTS.rating * rating * 10 - WEIGHTS.workload * load * 5 + Math.random() * WEIGHTS.fairness * 10 + boost;
-      out.push({ providerId: p.id, score: Math.round(score * 10) / 10, distanceKm: Math.round(d * 100) / 100 });
-    }
+      return { providerId: p.id, score: Math.round(score * 10) / 10, distanceKm: Math.round(d * 100) / 100 };
+    };
+    for (const c of await mapLimit(await providerService.allOnline(), 6, evaluate)) if (c) out.push(c);
     return out.sort((a, b) => b.score - a.score);
   },
   async assign(jobId: string, providerId: string, expiresInSeconds?: number) {

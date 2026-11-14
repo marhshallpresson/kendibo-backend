@@ -173,7 +173,7 @@ export const requestService = {
     const { vendorEligibilityService } = await import('../vendors/eligibility.service.js');
     const { tierService } = await import('../tiers/tier.service.js');
     const amountKobo = await tierService.jobAmountKobo({ requestId: r.id }).catch(() => null);
-    if (!(await vendorEligibilityService.allowed(r.preferredProviderId, r.categoryId, { amountKobo }))) return ranked;
+    if (!(await vendorEligibilityService.allowed(r.preferredProviderId, r.categoryId, { amountKobo, snapshots: tierService.newSnapshotMemo() }))) return ranked;
     const rest = ranked.candidates.filter((c) => c.providerId !== r.preferredProviderId);
     const own = ranked.candidates.find((c) => c.providerId === r.preferredProviderId) ?? { providerId: r.preferredProviderId, score: 100, distanceKm: 0 };
     return { ...ranked, candidates: [own, ...rest].slice(0, 10), note: `${ranked.note}+PREFERRED` };
@@ -201,12 +201,16 @@ export const requestService = {
     // A plumbing request must never reach a painter: only vendors cleared for
     // the request's trade (category rules) are offered it.
     const scored: MatchCandidate[] = [];
-    for (const c of nearby) {
-      if (scored.length >= 10) break;
-      if (await vendorEligibilityService.allowed(c.providerId, r.categoryId, { amountKobo })) {
+    const snapshots = tierService.newSnapshotMemo();
+    // Bounded concurrency, in order, stopping once 10 are cleared.
+    const BATCH = 5;
+    for (let i = 0; i < nearby.length && scored.length < 10; i += BATCH) {
+      const batch = await Promise.all(nearby.slice(i, i + BATCH).map(async (c) => {
+        if (!(await vendorEligibilityService.allowed(c.providerId, r.categoryId, { amountKobo, snapshots }))) return null;
         // Tier 2/3 and Kendibo Pro rank higher among the cleared vendors.
-        scored.push({ ...c, score: Math.round((c.score + (await tierService.rankBoost(c.providerId).catch(() => 0))) * 10) / 10 });
-      }
+        return { ...c, score: Math.round((c.score + (await tierService.rankBoost(c.providerId, snapshots).catch(() => 0))) * 10) / 10 } as MatchCandidate;
+      }));
+      for (const c of batch) if (c && scored.length < 10) scored.push(c);
     }
     scored.sort((a, b) => b.score - a.score);
     return { requestId: r.id, candidates: scored, note: r.categoryId ? 'CATEGORY_MATCHED' : 'PROXIMITY_MATCHED' };

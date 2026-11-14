@@ -211,11 +211,20 @@ export async function lifecycleSweep(now = new Date()): Promise<{ sent: number; 
 }
 
 let timer: NodeJS.Timeout | null = null;
+let tierTimer: NodeJS.Timeout | null = null;
+async function tierSweep() {
+  const { tierService } = await import('../tiers/tier.service.js');
+  await tierService.sweepSubscriptions();
+}
 /** Hourly, like startReminderSweeper. main.ts skips it under NODE_ENV=test. */
 export function startLifecycleSweeper(everyMs = HOUR) {
   if (timer) return;
   timer = setInterval(() => { void lifecycleSweep().catch((e) => observability.captureException(e)); }, everyMs);
   timer.unref?.();
+  // Kendibo Pro renewals / expiries / renewal reminders (tier.service.ts): more often than hourly
+  // so a lapsed period is settled quickly. Idempotent (compare-and-set + once-per-period claim).
+  tierTimer = setInterval(() => { void tierSweep().catch((e) => observability.captureException(e)); }, Math.min(everyMs, 15 * 60_000));
+  tierTimer.unref?.();
 }
 
 // ── Consent ─────────────────────────────────────────────────────────────────

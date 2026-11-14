@@ -135,6 +135,8 @@ export function localDb(): IMemoryDb {
   run('057_admin_2fa_recovery_codes.sql');
   run('058_admin_password.sql');
   run('059_provider_tiers.sql');
+  run('060_tier_config_seed.sql');
+  run('061_tier_perf_indexes.sql');
   run('043_invoices_schedule_updates.sql');
   run('040_whatsapp_sessions_recovery.sql');
   console.log('[localdb] pg-mem ready (001-019, 021-032)');

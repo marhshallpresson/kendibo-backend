@@ -12,6 +12,7 @@
 //    ("4.8 from 23 reviews · 2.1 km away · fits your ₦20,000 budget").
 //
 // Exact vendor coordinates are never returned — only rounded distance.
+import { mapLimit } from '../../packages/shared/map-limit.js';
 import { q } from '../../packages/database/db.js';
 import { emit } from '../../packages/observability/emit.js';
 import { vendorEligibilityService } from '../vendors/eligibility.service.js';
@@ -141,13 +142,15 @@ export const matchingService = {
       typicalKobo = s[0]?.p ? BigInt(String(s[0].p).split('.')[0]) : null;
     }
     const out: (RankedVendor & { features: FeatureVector })[] = [];
-    for (const p of rows) {
-      if (String(p.status ?? 'active') !== 'active') continue;
+    const { tierService } = await import('../tiers/tier.service.js');
+    const snapshots = tierService.newSnapshotMemo();
+    const evaluate = async (p: (typeof rows)[number]): Promise<(RankedVendor & { features: FeatureVector }) | null> => {
+      if (String(p.status ?? 'active') !== 'active') return null;
       const d = haversineKm(req.lat, req.lng, Number(p.lat), Number(p.lng));
       const radius = Number(p.service_radius_km ?? 15) || 15;
-      if (d > radius) continue;
+      if (d > radius) return null;
       const id = String(p.id);
-      if (!(await vendorEligibilityService.allowed(id, req.categoryId, { amountKobo: req.budgetKobo ?? null }))) continue;
+      if (!(await vendorEligibilityService.allowed(id, req.categoryId, { amountKobo: req.budgetKobo ?? null, snapshots }))) return null;
       const [rev, jobs, qual, skills] = await Promise.all([
         q<{ n: string; avg: string | null }>(`SELECT COUNT(*) AS n, AVG(provider) AS avg FROM payment.review WHERE provider_id=$1`, [id]).catch(() => [{ n: '0', avg: null }]),
         q<{ n: string }>(`SELECT COUNT(*) AS n FROM provider.earning WHERE provider_id=$1`, [id]).catch(() => [{ n: '0' }]),
@@ -165,10 +168,9 @@ export const matchingService = {
         budgetKobo: req.budgetKobo ?? null, typicalKobo, online: p.online === true,
       });
       // Tier 2/3 and Kendibo Pro rank higher (also feeds WhatsApp suggestions); points are on a 0-100 scale.
-      const { tierService } = await import('../tiers/tier.service.js');
-      const s = score(f, model.weights) + (await tierService.rankBoost(id).catch(() => 0)) / 100;
+      const s = score(f, model.weights) + (await tierService.rankBoost(id, snapshots).catch(() => 0)) / 100;
       const rating = reviewCount > 0 && avg !== null ? Math.round(avg * 10) / 10 : null;
-      out.push({
+      return {
         providerId: id,
         name: String(p.business_name || p.user_name || 'Kendibo vendor'),
         score: Math.round(s * 1000) / 1000,
@@ -179,8 +181,9 @@ export const matchingService = {
         slug: p.slug ? String(p.slug) : null,
         online: p.online === true,
         features: f,
-      });
-    }
+      };
+    };
+    for (const v of await mapLimit(rows, 6, evaluate)) if (v) out.push(v);
     out.sort((a, b) => b.score - a.score);
     const top = out.slice(0, limit);
     if (req.requestId) {

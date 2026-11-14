@@ -10,12 +10,18 @@
 //   POST /v1/admin/tier-applications/:id/approve
 //   POST /v1/admin/tier-applications/:id/reject   { reason }
 //   POST /v1/admin/providers/:id/tier             { tier, reason }
+//   GET  /v1/admin/settings/tiers                 -> { config, defaults, updatedAt, updatedBy }   (configuration:edit)
+//   PUT  /v1/admin/settings/tiers                 full TierConfigJSON -> { config }; audit-logged
 // Amounts are never read from the client: fees and prices come from tier.config.ts.
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { adminCan, type Permission } from '../../../modules/authorization/rbac.js';
 import { tierService, TierError, type CheckoutPort } from '../../../modules/tiers/tier.service.js';
 import { clientIp } from './admin-console.routes.js';
+import { q } from '../../../packages/database/db.js';
+import { setSetting } from '../../../modules/settings/settings.service.js';
+import { auditService } from '../../../modules/audit/audit.service.js';
+import { DEFAULT_TIER_CONFIG, tierConfig, tierConfigSchema, tierConfigToJSON, resetTierConfigCache } from '../../../modules/tiers/tier.config.js';
 
 interface Helpers {
   fail: (reply: FastifyReply, code: string, message: string, status?: number, retryable?: boolean) => unknown;
@@ -25,6 +31,8 @@ interface Helpers {
 }
 
 export const TIER_ROUTE_POLICY: Record<string, Permission> = {
+  'GET /v1/admin/settings/tiers': 'configuration:edit',
+  'PUT /v1/admin/settings/tiers': 'configuration:edit',
   'GET /v1/admin/tier-applications': 'provider:verify',
   'POST /v1/admin/tier-applications/:id/approve': 'provider:verify',
   'POST /v1/admin/tier-applications/:id/reject': 'provider:verify',
@@ -125,5 +133,44 @@ export function registerTierRoutes(app: FastifyInstance, h: Helpers) {
     if (!parsed.success) return h.fail(reply, 'VALIDATION_ERROR', 'Send tier (1, 2 or 3) and a reason.', 400);
     try { return { data: await tierService.adminSetTier((req.params as { id: string }).id, parsed.data.tier, parsed.data.reason, a.sub, ctxOf(req)) }; }
     catch (e) { return sendError(reply, e); }
+  });
+
+  // ── Tier prices / limits, editable by admins (configuration:edit) ───────────
+  const settingsAdmin = async (req: FastifyRequest, reply: FastifyReply) => {
+    const a = await h.adminActor(req as never);
+    if (!a) { void h.fail(reply, 'UNAUTHENTICATED', 'Login required', 401); return null; }
+    if ('denied' in a || !adminCan(a.role, 'configuration:edit')) { void h.fail(reply, 'FORBIDDEN', 'Configuration access required', 403); return null; }
+    return a;
+  };
+
+  app.get('/v1/admin/settings/tiers', async (req, reply) => {
+    if (!(await settingsAdmin(req, reply))) return reply;
+    resetTierConfigCache();
+    const row = await q<{ updated_at: unknown; updated_by: unknown }>(`SELECT updated_at, updated_by FROM configuration.platform_setting WHERE key='tiers.config'`).catch(() => []);
+    return {
+      data: {
+        config: tierConfigToJSON(await tierConfig()),
+        defaults: tierConfigToJSON(DEFAULT_TIER_CONFIG),
+        updatedAt: row[0]?.updated_at ? new Date(String(row[0].updated_at)).toISOString() : null,
+        updatedBy: row[0]?.updated_by ? String(row[0].updated_by) : null,
+      },
+    };
+  });
+
+  app.put('/v1/admin/settings/tiers', async (req, reply) => {
+    const a = await settingsAdmin(req, reply); if (!a) return reply;
+    const parsed = tierConfigSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      const fields: Record<string, string> = {};
+      for (const i of parsed.error.issues) { const k = i.path.join('.') || '(body)'; if (!fields[k]) fields[k] = i.message; }
+      const first = Object.entries(fields)[0];
+      return reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: first ? `${first[0]}: ${first[1]}` : 'Invalid tier config', retryable: false, fields } });
+    }
+    const before = tierConfigToJSON(await tierConfig());
+    const after = parsed.data;
+    await setSetting('tiers.config', after, a.sub);
+    resetTierConfigCache();
+    await auditService.log(a.sub, 'settings.tiers.update', 'tiers.config', { ...ctxOf(req), entityType: 'setting', meta: { before, after } }).catch(() => {});
+    return { data: { config: tierConfigToJSON(await tierConfig()) } };
   });
 }
