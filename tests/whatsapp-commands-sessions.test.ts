@@ -8,6 +8,8 @@ import { randomUUID } from 'node:crypto';
 import { q } from '../packages/database/db.js';
 
 process.env.NODE_ENV = 'test';
+// These tests walk the full onboarding (consent, name, email); the default is the light one.
+process.env.WHATSAPP_ONBOARDING = 'full';
 let app: { inject: (opts: any) => Promise<any>; close?: () => Promise<void> };
 type Mail = { to: string; subject: string; html: string };
 const mails: Mail[] = [];

@@ -5,6 +5,8 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { q } from '../packages/database/db.js';
 
+// The email step exists only in the full onboarding; the default is the light one.
+process.env.WHATSAPP_ONBOARDING = 'full';
 let app: { close?: () => Promise<void> };
 before(async () => {
   process.env.DATABASE_URL = '';

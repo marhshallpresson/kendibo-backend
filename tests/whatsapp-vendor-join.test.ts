@@ -11,6 +11,8 @@ import { randomUUID } from 'node:crypto';
 import { q } from '../packages/database/db.js';
 
 process.env.NODE_ENV = 'test';
+// The post-onboarding question belongs to the full onboarding; the default is the light one.
+process.env.WHATSAPP_ONBOARDING = 'full';
 const SIGNUP = 'https://example.test/join-provider';
 let app: { close?: () => Promise<void> };
 type Cta = { to: string; body: string; label: string; url: string };

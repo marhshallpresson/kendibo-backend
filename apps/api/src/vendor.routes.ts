@@ -17,9 +17,9 @@ import { kycSpendReport } from '../../../modules/kyc/kyc-cost.guard.js';
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
 import { verifySubscription, verifySignature, whatsappConfigured } from '../../../modules/whatsapp/whatsapp.client.js';
-import { verifyLink } from '../../../modules/whatsapp/links.js';
-import { renderLocationPage, renderVendorsPage, renderMessagePage, renderVerifyPage, renderTermsPage, pageCsp } from '../../../modules/whatsapp/web-pages.js';
-import { enqueueInbound, continueAfterLocation, startInboundSweeper, payLinkTarget, continueAfterVerification, confirmPendingEmail, type InboundMessage } from '../../../modules/whatsapp/whatsapp.bot.js';
+import { verifyLink, termsLink } from '../../../modules/whatsapp/links.js';
+import { renderLocationPage, renderVendorsPage, renderMessagePage, renderVerifyPage, renderTermsPage, renderPayConfirmPage, pageCsp } from '../../../modules/whatsapp/web-pages.js';
+import { enqueueInbound, continueAfterLocation, startInboundSweeper, payLinkTarget, payLinkPreview, continueAfterVerification, confirmPendingEmail, type InboundMessage } from '../../../modules/whatsapp/whatsapp.bot.js';
 import { applyTemplateWebhook, startTemplateStatusSync } from '../../../modules/whatsapp/templates.js';
 import { saveDraftLocation } from '../../../modules/whatsapp/draft.js';
 import { notifyCustomer } from '../../../modules/whatsapp/policy.js';
@@ -282,9 +282,9 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
     });
   }
   const waNumber = () => process.env.WHATSAPP_BUSINESS_NUMBER || undefined;
-  const html = (reply: FastifyReply, nonce: string, withMaps: boolean, page: string, status = 200) => reply
+  const html = (reply: FastifyReply, nonce: string, withMaps: boolean, page: string, status = 200, csp = pageCsp(nonce, withMaps)) => reply
     .code(status)
-    .header('Content-Security-Policy', pageCsp(nonce, withMaps))
+    .header('Content-Security-Policy', csp)
     .header('Cache-Control', 'no-store')
     .header('Referrer-Policy', 'no-referrer')
     .type('text/html; charset=utf-8')
@@ -454,17 +454,30 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
         : { title: 'Nothing to confirm', message: 'This email is already confirmed, or the request was replaced. You can add an email in the app.' };
     return html(reply, nonce, false, renderMessagePage({ ...page, nonce, waNumber: waNumber() }));
   });
-  app.get('/w/terms', async (_req, reply) => {
-    const nonce = newNonce();
-    return html(reply, nonce, false, renderTermsPage(nonce));
-  });
+  // Old WhatsApp messages link here; the terms live on the main website now.
+  app.get('/w/terms', async (_req, reply) => reply.redirect(termsLink(), 302));
+  void renderTermsPage;
 
+  // Pay button → review page (this number's own unpaid booking) → checkout on Confirm.
   app.get('/w/pay', async (req, reply) => {
     const nonce = newNonce();
-    const claims = verifyLink(String((req.query as { t?: string }).t ?? ''), 'pay');
+    const t = String((req.query as { t?: string }).t ?? '');
+    const claims = verifyLink(t, 'pay');
+    if (!claims) return expired(reply, nonce);
+    const out = await payLinkPreview(claims.w, claims.d).catch(() => ({ done: 'Payment is unavailable right now. Try again in a minute.' }));
+    if ('done' in out) return html(reply, nonce, false, renderMessagePage({ title: 'Payment', message: out.done, nonce, waNumber: waNumber() }));
+    // The Confirm form posts here and is redirected (303) to the payment provider's
+    // checkout. Browsers apply form-action to that redirect too, so this one page
+    // allows https targets; every other page keeps form-action 'self'.
+    const csp = pageCsp(nonce, false).replace("form-action 'self'", "form-action 'self' https:");
+    return html(reply, nonce, false, renderPayConfirmPage({ token: t, nonce, termsUrl: termsLink(), preview: out.preview }), 200, csp);
+  });
+  app.post('/w/pay', async (req, reply) => {
+    const nonce = newNonce();
+    const claims = verifyLink(String(((req.body ?? {}) as { t?: string }).t ?? ''), 'pay');
     if (!claims) return expired(reply, nonce);
     const target = await payLinkTarget(claims.w, claims.d).catch(() => ({ done: 'Payment is unavailable right now. Try again in a minute.' }));
-    if ('url' in target) return reply.redirect(target.url, 302);
+    if ('url' in target) return reply.redirect(target.url, 303);
     return html(reply, nonce, false, renderMessagePage({ title: 'Payment', message: target.done, nonce, waNumber: waNumber() }));
   });
 

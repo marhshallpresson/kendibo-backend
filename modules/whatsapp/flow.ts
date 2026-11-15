@@ -6,7 +6,7 @@
 //   need → trade → photo (optional) → budget (optional) → location → day → time → confirm
 import { q } from '../../packages/database/db.js';
 import { wa } from './whatsapp.client.js';
-import { locationLink } from './links.js';
+import { locationLink, termsLink } from './links.js';
 import { patchDraft, submitDraft, type Draft } from './draft.js';
 import { WINDOW_HOURS, type TimeWindow } from './nlu/entities.js';
 import type { Understanding } from './nlu/index.js';
@@ -16,7 +16,7 @@ import { matchKeywords } from '../catalog/category-match.js';
 
 export type Step = 'need' | 'trade' | 'photo' | 'budget' | 'location' | 'day' | 'window' | 'confirm';
 /** Per-conversation flags kept in messaging.whatsapp_session.data. */
-export interface Asked { photo?: boolean; budget?: boolean; dayPick?: boolean; lang?: 'en' | 'pcm'; cancelDraftId?: string; pendingText?: string; onboard?: 'name' | 'name_text' | 'email' | 'email_taken'; takenEmail?: string; recover?: 'ask' | 'code'; recoverId?: string }
+export interface Asked { photo?: boolean; budget?: boolean; dayPick?: boolean; lang?: 'en' | 'pcm'; cancelDraftId?: string; pendingText?: string; onboard?: 'name' | 'name_text' | 'email' | 'email_taken'; takenEmail?: string; priceMode?: boolean; recover?: 'ask' | 'code'; recoverId?: string }
 
 const naira = (k: bigint | number | string) => `₦${(Number(k) / 100).toLocaleString('en-NG', { maximumFractionDigits: 0 })}`;
 const say = (lang: Asked['lang'], en: string, pcm?: string) => (lang === 'pcm' && pcm ? pcm : en);
@@ -221,11 +221,16 @@ export async function sendStep(waId: string, d: Draft, a: Asked, lead = ''): Pro
       await wa.buttons(waId, pre + say(L, 'What time suits you?', 'Which time good for you?'), open.map((w) => ({ id: `flow:win:${w}`, title: WINDOW_LABEL[w] })));
       break;
     }
-    case 'confirm':
-      await wa.buttons(waId, `${pre}Here's your request:\n${await summary(d)}\n\nShall I find vendors?`, [
+    case 'confirm': {
+      // Nobody agrees to anything up front: the terms are accepted here, by
+      // sending the first request (recorded in submitDraft).
+      const t = await q<{ at: string | null }>(`SELECT terms_accepted_at AS at FROM identity.users WHERE phone=$1`, [`+${waId.replace(/\D/g, '')}`]).catch(() => [{ at: 'unknown' }]);
+      const terms = t[0]?.at ? '' : `\n\nBy tapping Find vendors you agree to Kendibo's terms and privacy policy: ${termsLink()}`;
+      await wa.buttons(waId, `${pre}Here's your request:\n${await summary(d)}\n\nShall I find vendors?${terms}`, [
         { id: 'flow:confirm', title: 'Find vendors' }, { id: 'flow:change', title: 'Change something' },
       ]);
       break;
+    }
   }
   return step;
 }

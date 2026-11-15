@@ -175,6 +175,31 @@ export function renderPaymentReturnPage(opts: { status: string; reference: strin
   return shell(`${title} — Kendibo`, `<section class="done" role="status"><h2>${esc(title)}</h2><p class="note">${esc(message)}</p>${actions}</section>`, opts.nonce, script);
 }
 
+/**
+ * "Confirm & pay", opened from the WhatsApp pay button. The customer checks the
+ * booking here first; checkout starts only when they tap Confirm (POST).
+ */
+export function renderPayConfirmPage(opts: { token: string; nonce: string; termsUrl: string; preview: { service: string; pro: string | null; when: string | null; address: string | null; amount: string; protectedNote: string } }): string {
+  const p = opts.preview;
+  const row = (k: string, v: string | null) => (v ? `<div class="row" style="padding:8px 0;border-top:1px solid var(--line)"><span class="note" style="margin:0">${esc(k)}</span><strong style="text-align:right">${esc(v)}</strong></div>` : '');
+  const body = `
+<header><h1>Confirm your booking</h1><p>Check the details, then pay securely.</p></header>
+<main>
+  <section class="card" aria-label="Booking details">
+    <h2 style="font-size:17px;margin:0 0 6px">${esc(p.service)}</h2>
+    ${row('Pro', p.pro)}${row('When', p.when)}${row('Where', p.address)}
+    <div class="row" style="padding:10px 0 0;border-top:1px solid var(--line)"><span style="font-weight:700">Total</span><strong style="font-size:20px">${esc(p.amount)}</strong></div>
+  </section>
+  <p class="card" style="background:var(--okbg);border-color:#cdebd6;font-size:14px">${esc(p.protectedNote)}</p>
+  <form method="post" action="/w/pay" id="f">
+    <input type="hidden" name="t" value="${esc(opts.token)}">
+    <button class="btn primary" type="submit" id="go">Confirm &amp; pay ${esc(p.amount)}</button>
+  </form>
+  <p class="note">You choose how to pay on the next, secure page. By paying you agree to Kendibo's <a href="${esc(opts.termsUrl)}">terms</a>.</p>
+</main>`;
+  return shell('Confirm your booking — Kendibo', body, opts.nonce, "document.getElementById('f').addEventListener('submit',function(){var b=document.getElementById('go');b.disabled=true;b.textContent='Opening secure checkout…'});");
+}
+
 export function renderMessagePage(opts: { title: string; message: string; nonce: string; waNumber?: string }): string {
   return shell(`${opts.title} — Kendibo`, `<section class="done"><h2>${esc(opts.title)}</h2><p class="note">${esc(opts.message)}</p>${back(opts.waNumber)}</section>`, opts.nonce);
 }
