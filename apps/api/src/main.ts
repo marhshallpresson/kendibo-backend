@@ -1585,7 +1585,9 @@ app.get('/v1/user/kyc', async (req, reply) => {
 });
 app.post('/v1/user/kyc', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
-  const { nin, bvn, rcNumber, businessName, selfieBase64, documents } = z.object({
+  // selfieBase64 is still accepted from older app versions but ignored:
+  // customers verify with NIN/BVN only (face checks are for providers).
+  const { nin, bvn, rcNumber, businessName, documents: rawDocuments } = z.object({
     nin: z.string().optional(), bvn: z.string().optional(),
     rcNumber: z.string().optional(), businessName: z.string().optional(),
     selfieBase64: z.string().optional(),
@@ -1594,7 +1596,8 @@ app.post('/v1/user/kyc', async (req, reply) => {
       kind: z.enum(['id_front', 'id_back', 'selfie', 'cac', 'address', 'other']),
     })).max(8).optional(),
   }).parse(req.body ?? {});
-  if (documents?.length) {
+  const documents = (rawDocuments ?? []).filter((d) => d.kind !== 'selfie');
+  if (documents.length) {
     try { await kycService.attachUserDocuments(a.sub, documents); }
     catch (e: unknown) {
       const msg = (e as Error).message;
@@ -1603,9 +1606,9 @@ app.post('/v1/user/kyc', async (req, reply) => {
       throw e;
     }
   }
-  if (documents?.length || nin || bvn || rcNumber || selfieBase64) {
+  if (documents.length || nin || bvn || rcNumber) {
     const applied = await kycService.submitUserApplication(a.sub, {
-      nin, bvn, rcNumber, businessName, selfieBase64, documents: documents ?? [],
+      nin, bvn, rcNumber, businessName, documents,
     });
     void slingAutomationService.triggerEvent(
       applied.status === 'VERIFIED' ? 'user.kyc_verified' : 'user.kyc_submitted',

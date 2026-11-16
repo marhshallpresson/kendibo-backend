@@ -12,6 +12,7 @@
 // and verified legal/corporate names for strict payout alignment.
 import { q } from '../../packages/database/db.js';
 import { emit } from '../../packages/observability/emit.js';
+import { notifyCustomerVerified } from './kyc.notify.js';
 import { getSetting } from '../settings/settings.service.js';
 import { mediaService } from '../media/media.service.js';
 import { guardKycAdapter } from './kyc-cost.guard.js';
@@ -1110,8 +1111,12 @@ export const kycService = {
     // Load customer profile name for alignment check
     const userRows = await q<{ name: string | null }>(`SELECT name FROM identity.users WHERE id=$1`, [userId]);
     const submittedName = input.submittedName ?? userRows[0]?.name ?? undefined;
-    const outcome = await this.runTierChecks('user', userId, { ...input, submittedName });
-    // Customers can auto-verify at Tier 1 (NIN or BVN) or Tier 2 (NIN/BVN + Selfie)
+    // Customers verify with NIN or BVN only: no selfie, no face match, no liveness.
+    // A selfie sent by an older app is ignored (and never billed by Prembly).
+    const outcome = await this.runTierChecks('user', userId, {
+      ...input, submittedName, selfieBase64: undefined,
+      documents: (input.documents ?? []).filter((d) => d.kind !== 'selfie'),
+    });
     const minCustomerTier = 1;
     const aligned = outcome.nameAlignment ? outcome.nameAlignment.aligned : true;
     const autoVerify = outcome.tierReached >= minCustomerTier && aligned;
@@ -1121,8 +1126,8 @@ export const kycService = {
     const manual = !autoVerify && Boolean(outcome.unavailableReason);
     const pendingReason = manual ? MANUAL_VERIFICATION : null;
     const submittedMasked = JSON.stringify(maskedSubmission(input));
-    const prior = await q<{ pending_reason: string | null }>(
-      `SELECT pending_reason FROM kyc.customer WHERE user_id = $1`, [userId],
+    const prior = await q<{ pending_reason: string | null; status: string | null }>(
+      `SELECT pending_reason, status FROM kyc.customer WHERE user_id = $1`, [userId],
     ).catch(() => []);
 
     await q(
@@ -1263,6 +1268,7 @@ export const kycService = {
       [userId, adminUserId],
     );
     emit('kyc.user.approved', { userId, by: adminUserId });
+    void notifyCustomerVerified(userId);
   },
 
   async userReject(userId: string, reason: string, adminUserId: string): Promise<void> {
