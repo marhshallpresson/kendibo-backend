@@ -114,11 +114,60 @@ describe('customer KYC: NIN or BVN only', () => {
     prembly(() => json(503, { status: false, detail: 'down' }));
     const sub = await app.inject({ method: 'POST', url: '/v1/user/kyc', headers: auth(pending), payload: { nin: '12345678901' } });
     assert.equal(sub.json().data.status, 'UNDER_REVIEW');
+    await new Promise((r) => setTimeout(r, 20));
+    assert.deepEqual(notices.filter((n) => n.recipientId === pending), [], 'nothing is sent to the customer on submission');
     await K.kycService.userApprove(pending, randomUUID());
     await new Promise((r) => setTimeout(r, 20));
-    assert.deepEqual(notices.filter((n) => n.recipientId === pending).map((n) => n.template), ['user.kyc_submitted', 'kyc.user.verified']);
+    assert.deepEqual(notices.filter((n) => n.recipientId === pending).map((n) => n.template), ['kyc.user.verified']);
     const after = await app.inject({ method: 'GET', url: '/v1/user/kyc', headers: auth(pending) });
     assert.equal(after.json().data.status, 'VERIFIED');
+  });
+
+  it('an admin rejection tells the customer', async () => {
+    const uid = await user('Tolu Bamidele');
+    prembly(() => json(503, { status: false, detail: 'down' }));
+    await app.inject({ method: 'POST', url: '/v1/user/kyc', headers: auth(uid), payload: { nin: '12345678901' } });
+    await K.kycService.userReject(uid, 'Blurry details', randomUUID());
+    await new Promise((r) => setTimeout(r, 20));
+    assert.deepEqual(notices.filter((n) => n.recipientId === uid).map((n) => n.template), ['kyc.user.rejected']);
+  });
+});
+
+describe('customer KYC: full name and date of birth', () => {
+  const withDob = (dob: string) => () => ok({ nin_data: { firstname: 'Ada', surname: 'Okon', birthdate: dob }, data: { firstname: 'Ada', surname: 'Okon', birthdate: dob } });
+
+  it('a matching name and date of birth verify straight away', async () => {
+    const uid = await user('Someone Else');
+    prembly(withDob('12-03-1990'));
+    const res = await app.inject({
+      method: 'POST', url: '/v1/user/kyc', headers: auth(uid),
+      payload: { nin: '30000000001', fullName: 'Ada Okon', dateOfBirth: '1990-03-12' },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal(res.json().data.status, 'VERIFIED', 'the typed full name is used, not the profile name');
+  });
+
+  it('a date of birth that does not match goes to a person, with a clear reason', async () => {
+    const uid = await user('Ada Okon');
+    prembly(withDob('1990-03-12'));
+    const res = await app.inject({
+      method: 'POST', url: '/v1/user/kyc', headers: auth(uid),
+      payload: { nin: '30000000002', fullName: 'Ada Okon', dateOfBirth: '1991-01-01' },
+    });
+    assert.equal(res.json().data.status, 'UNDER_REVIEW');
+    assert.match(String(res.json().data.rejectionReason), /Date of birth/, res.body);
+  });
+
+  it('rejects a badly formatted date of birth', async () => {
+    const uid = await user();
+    prembly(() => ok());
+    const res = await app.inject({ method: 'POST', url: '/v1/user/kyc', headers: auth(uid), payload: { nin: '12345678901', dateOfBirth: '12/03/1990' } });
+    assert.equal(res.statusCode, 400);
+  });
+
+  it('normalizes the common date formats', () => {
+    for (const v of ['1990-03-12', '12-03-1990', '12/03/1990', '1990-03-12T00:00:00.000Z']) assert.equal(K.normalizeDob(v), '1990-03-12', v);
+    assert.equal(K.normalizeDob(''), undefined);
   });
 });
 
