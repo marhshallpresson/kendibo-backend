@@ -42,7 +42,7 @@ import { warrantyService as fullWarranty, supportService, earningsService } from
 import { b2bService } from '../../../modules/b2b/b2b.service.js';
 import { cityService, makerChecker, analyticProps } from '../../../modules/configuration/cities.service.js';
 import { historyService, reminderService, recurringService } from '../../../modules/properties/history.service.js';
-import { evaluateCancellation, markFailed } from '../../../modules/bookings/cancellation.js';
+import { evaluateCancellationLive, markFailed } from '../../../modules/bookings/cancellation.js';
 import { reschedule, rescheduleHistory, flag as flagJob, flagsOf } from '../../../modules/job-engine/job.machine.js';
 import { deviceService } from '../../../modules/devices/device.service.js';
 import { objectStore } from '../../../packages/storage/object.store.js';
@@ -65,6 +65,7 @@ import { installVirtualAccountHooks, chargeForWalletPayment, reverseWalletCharge
 import { onEmit } from '../../../packages/observability/emit.js';
 import { registerAdminPasswordRoutes, ADMIN_PASSWORD_POLICY } from './admin-password.routes.js';
 import { registerTierRoutes, TIER_ROUTE_POLICY } from './tier.routes.js';
+import { registerPricingSettingsRoutes } from './pricing-settings.routes.js';
 import { tierService, TIER_REF_PREFIX, SUB_REF_PREFIX } from '../../../modules/tiers/tier.service.js';
 import { registerAdminConsoleRoutes, ADMIN_CONSOLE_POLICY, accountGate, refreshGate, adminLogin, sendLocked, clientIp, auditQuerySchema } from './admin-console.routes.js';
 import { installAdminAlerts } from '../../../modules/notifications/admin-alerts.service.js';
@@ -2454,7 +2455,7 @@ app.get('/v1/bookings/:id/cancel-quote', async (req, reply) => {
   if (!(await bookingParty(req as never, reply, id))) return reply;
   const b = await bookingService.get(id);
   if (!b) return fail(reply, 'NOT_FOUND', 'Booking not found', 404);
-  return { data: evaluateCancellation(b.status) };
+  return { data: await evaluateCancellationLive(b.status) };
 });
 // ---- USER APP: quote-requests + approve/reject + change orders (PRD §23-25) ----
 app.post('/v1/quote-requests', async (req, reply) => {
@@ -3433,6 +3434,7 @@ installVirtualAccountHooks(onEmit);
 registerAdminConsoleRoutes(app, { fail: fail as never, adminActor: adminActor as never });
 registerAdminPasswordRoutes(app, { fail: fail as never, adminActor: adminActor as never });
 registerTierRoutes(app, { fail: fail as never, adminActor: adminActor as never, providerActor: providerActor as never, payments });
+registerPricingSettingsRoutes(app, { fail: fail as never, adminActor: adminActor as never });
 installAdminAlerts();
 if (process.env.NODE_ENV !== 'test') startLifecycleSweeper();
 Object.assign(ROUTE_POLICY, INVOICE_ROUTE_POLICY); registerInvoiceRoutes(app, { fail: fail as never, bookingParty: bookingParty as never, providerActor });

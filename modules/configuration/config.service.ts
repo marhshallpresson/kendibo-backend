@@ -41,5 +41,7 @@ export const configurationService = {
     flagsCache = null; // admin just changed it — next read must be fresh
     return { k, v };
   },
+  /** Drop the memoised pricebook/flags (after an admin edit). */
+  resetCache() { priceBookCache = null; flagsCache = null; },
   dispatchPolicy(name = 'default') { void name; return { radiusKm: 15 }; },
 };

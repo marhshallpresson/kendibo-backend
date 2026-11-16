@@ -1,18 +1,33 @@
 // Cancellation policy — PRD §26 matrix (configurable) + failed-service reason codes §27.
 import type { JobStatus } from '../job-engine/job.machine.js';
 
+// Refund percentages and callout flags per stage are admin-editable
+// (pricing.config.ts, 'pricing.config' setting); the stage mapping stays here.
+import { DEFAULT_PRICING_CONFIG, pricingConfig, type CancelStage, type PricingConfig } from '../pricing/pricing.config.js';
+
 export interface CancelOutcome { refundBps: number; calloutApplies: boolean; note: string; }
-const MATRIX: { when: string; match: (s: JobStatus, ctx: { providerFault?: boolean; kendiboFault?: boolean }) => CancelOutcome | null }[] = [
-  { when: 'before_assignment', match: (s) => ['DRAFT', 'REQUESTED', 'PAYMENT_PENDING', 'QUOTE_PENDING'].includes(s) ? { refundBps: 10000, calloutApplies: false, note: '100% before assignment' } : null },
-  { when: 'assigned_no_travel', match: (s) => ['CONFIRMED', 'MATCHING', 'PROVIDER_ASSIGNED', 'PROVIDER_ACCEPTED'].includes(s) ? { refundBps: 10000, calloutApplies: false, note: '100% or policy-based' } : null },
-  { when: 'en_route', match: (s) => s === 'EN_ROUTE' ? { refundBps: 8500, calloutApplies: false, note: 'Partial / policy' } : null },
-  { when: 'arrived', match: (s) => ['ARRIVED', 'CHECK_IN'].includes(s) ? { refundBps: 8000, calloutApplies: true, note: 'Callout fee may apply' } : null },
-  { when: 'work_started', match: (s) => ['INSPECTION', 'PRE_SERVICE', 'IN_PROGRESS', 'AWAITING_APPROVAL'].includes(s) ? { refundBps: 5000, calloutApplies: true, note: 'Refund based on performed work' } : null },
+const STAGES: { when: CancelStage; statuses: string[]; note: string }[] = [
+  { when: 'before_assignment', statuses: ['DRAFT', 'REQUESTED', 'PAYMENT_PENDING', 'QUOTE_PENDING'], note: 'Before assignment' },
+  { when: 'assigned_no_travel', statuses: ['CONFIRMED', 'MATCHING', 'PROVIDER_ASSIGNED', 'PROVIDER_ACCEPTED'], note: 'Assigned, not yet travelling' },
+  { when: 'en_route', statuses: ['EN_ROUTE'], note: 'Provider on the way' },
+  { when: 'arrived', statuses: ['ARRIVED', 'CHECK_IN'], note: 'Provider arrived; callout fee may apply' },
+  { when: 'work_started', statuses: ['INSPECTION', 'PRE_SERVICE', 'IN_PROGRESS', 'AWAITING_APPROVAL'], note: 'Work started; refund based on work done' },
 ];
-export function evaluateCancellation(status: JobStatus, ctx: { providerFault?: boolean; kendiboFault?: boolean } = {}): CancelOutcome {
+/** Pure evaluation against a given policy (defaults when none is passed). */
+export function evaluateCancellation(
+  status: JobStatus,
+  ctx: { providerFault?: boolean; kendiboFault?: boolean } = {},
+  policy: PricingConfig['cancellation'] = DEFAULT_PRICING_CONFIG.cancellation,
+): CancelOutcome {
   if (ctx.providerFault || ctx.kendiboFault) return { refundBps: 10000, calloutApplies: false, note: 'Full refund: provider/Kendibo fault' };
-  for (const row of MATRIX) { const o = row.match(status, ctx); if (o) return o; }
+  const row = STAGES.find((r) => r.statuses.includes(status));
+  if (row) return { ...policy[row.when], note: `${row.note} — ${policy[row.when].refundBps / 100}% refund` };
   return { refundBps: 0, calloutApplies: false, note: 'Post-completion: use dispute flow' };
+}
+/** Same, with the live admin-set policy from the database. */
+export async function evaluateCancellationLive(status: JobStatus, ctx: { providerFault?: boolean; kendiboFault?: boolean } = {}): Promise<CancelOutcome> {
+  const cfg = await pricingConfig().catch(() => DEFAULT_PRICING_CONFIG);
+  return evaluateCancellation(status, ctx, cfg.cancellation);
 }
 
 export const FAILED_CODES = [
