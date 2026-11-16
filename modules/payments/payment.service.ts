@@ -9,6 +9,10 @@
 //   test-accounts   Paga sandbox only when the customer AND the assigned pro (if any)
 //                   are flagged identity.users.is_test. Real customers never touch
 //                   sandbox money; test accounts never touch live rails.
+//   all             every booking payment goes to Paga — only with PAGA_ENV=live
+//                   (on the sandbox it behaves like test-accounts). Card top-ups
+//                   stay on Bachs; customers fund the wallet by bank transfer to
+//                   their own Paga account number instead.
 import type { PaymentPort, PSP, CreateCheckoutInput, CheckoutSession, VerifiedPayment } from './payment.port.js';
 import { BachsAdapter } from './bachs.adapter.js';
 import { PagaAdapter } from './paga.adapter.js';
@@ -50,9 +54,11 @@ export class PaymentService {
 
   /** Which PSP a new payment goes to (see PAGA_MODE above). */
   async pspFor(input: CreateCheckoutInput): Promise<PSP> {
-    if (process.env.PAGA_MODE !== 'test-accounts') return 'bachs';
+    const mode = process.env.PAGA_MODE === 'all' ? 'all' : process.env.PAGA_MODE === 'test-accounts' ? 'test-accounts' : 'off';
+    if (mode === 'off') return 'bachs';
     if (!this.pagaInjected && !pagaConfigured()) return 'bachs';
     if (input.bookingId === 'wallet_topup') return 'bachs';
+    if (mode === 'all' && process.env.PAGA_ENV === 'live') return 'paga';
     const customer = await q<{ is_test: boolean }>(
       `SELECT u.is_test FROM booking.booking b JOIN identity.users u ON u.id = b.user_id WHERE b.id = $1`, [input.bookingId],
     ).catch(() => []);

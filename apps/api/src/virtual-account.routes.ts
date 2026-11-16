@@ -4,11 +4,12 @@
 //   POST /v1/wallet/virtual-account/rotate   new number; balance moves across; old number disabled (once per 24h)
 //   GET  /v1/wallet/virtual-account/fundings transfers received, with who sent them
 //   GET  /v1/admin/virtual-accounts?filter=  who has a number, who has paid in, who has not (payment:view)
+//   POST /v1/admin/virtual-accounts/backfill  { limit? } give numbers to verified users without one (configuration:edit)
 //   POST /webhooks/paga/subsidiary           Paga funding / charge / top-up / transfer notifications (public; verified inside)
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import {
-  accountView, rotate, fundingsFor, adminList, handleSubsidiaryNotification, VaError,
+  accountView, rotate, fundingsFor, adminList, handleSubsidiaryNotification, VaError, backfillVirtualAccounts,
 } from '../../../modules/payments/paga/virtual-accounts.js';
 import { observability } from '../../../packages/observability/watchup.adapter.js';
 
@@ -20,6 +21,7 @@ interface Helpers {
 export const VIRTUAL_ACCOUNT_ROUTE_POLICY = {
   'POST /webhooks/paga/subsidiary': 'public', // x-paga-hash-v3 / body hash checked; money only moves after Paga confirms
   'GET /v1/admin/virtual-accounts': 'payment:view',
+  'POST /v1/admin/virtual-accounts/backfill': 'configuration:edit', // creates Paga accounts
 } as const;
 
 const rotateLimiter = new Map<string, number>(); // in-process guard against double taps; the DB enforces the 24h rule
@@ -59,6 +61,11 @@ export function registerVirtualAccountRoutes(app: FastifyInstance, h: Helpers) {
       limit: z.coerce.number().int().min(1).max(500).optional(),
     }).parse(req.query ?? {});
     return { data: await adminList({ filter, limit }) };
+  });
+
+  app.post('/v1/admin/virtual-accounts/backfill', async (req) => {
+    const { limit } = z.object({ limit: z.coerce.number().int().min(1).max(500).optional() }).parse(req.body ?? {});
+    return { data: await backfillVirtualAccounts(limit ?? 50) };
   });
 
   app.post('/webhooks/paga/subsidiary', { config: { rawBody: true } }, async (req) => {

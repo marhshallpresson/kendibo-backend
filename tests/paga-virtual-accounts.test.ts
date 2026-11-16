@@ -8,6 +8,7 @@ import { PagaClient, type PagaConfig } from '../modules/payments/paga/client.js'
 import {
   setVirtualAccountClient, ensureVirtualAccount, accountView, handleSubsidiaryNotification, reconfirmPending,
   chargeForWalletPayment, rotate, fundingsFor, adminList, verifyFundingHash, installVirtualAccountHooks, liveAccount, VaError,
+  backfillVirtualAccounts,
 } from '../modules/payments/paga/virtual-accounts.js';
 import { walletService } from '../modules/wallet/wallet.service.js';
 import { emit, onEmit } from '../packages/observability/emit.js';
@@ -105,6 +106,29 @@ describe('Paga customer account numbers (Subsidiary Accounts)', () => {
     assert.equal((await accountView(await user())).reason, 'disabled');
     process.env.PAGA_MODE = saved;
     assert.equal(calls.length, 0);
+  });
+
+  it('PAGA_MODE=all gives real verified customers a number on live keys only; backfill covers earlier verifications', async () => {
+    const real = await user({ isTest: false });
+    process.env.PAGA_MODE = 'all';
+    assert.equal((await accountView(real)).reason, 'not_test_account', 'sandbox: still test accounts only');
+    process.env.PAGA_ENV = 'live';
+    try {
+      const view = await accountView(real);
+      assert.equal(view.status, 'active', JSON.stringify(view));
+      assert.match(String(view.accountNumber), /^07\d{8}$/);
+      const later = await user({ isTest: false });
+      const unverified = await user({ isTest: false, kyc: 'PENDING' });
+      const r = await backfillVirtualAccounts(500);
+      assert.ok(r.created >= 1, JSON.stringify(r));
+      assert.equal((await liveAccount(later))?.status, 'active');
+      assert.equal(await liveAccount(unverified), null, 'unverified users are never backfilled');
+      const again = await backfillVirtualAccounts(500);
+      assert.equal(again.created, 0, 'idempotent');
+    } finally {
+      process.env.PAGA_ENV = 'sandbox';
+      process.env.PAGA_MODE = 'test-accounts';
+    }
   });
 
   it('creates one sub-account with the documented hash and keeps it', async () => {

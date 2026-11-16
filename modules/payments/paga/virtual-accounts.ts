@@ -7,8 +7,11 @@
 //   rotate ──► new sub-account, move the balance, disable the old one
 //
 // Rules:
-// - Only while PAGA_MODE=test-accounts and the keys are set, and only for users
-//   flagged identity.users.is_test (sandbox money never reaches real customers).
+// - PAGA_MODE=test-accounts: only users flagged identity.users.is_test (sandbox
+//   money never reaches real customers).
+// - PAGA_MODE=all: every KYC-verified user — but ONLY with PAGA_ENV=live. On the
+//   sandbox, 'all' behaves like 'test-accounts', so a real customer is never
+//   shown a sandbox account number they might send real money to.
 // - A notification alone never moves money in our ledger: it must carry a valid
 //   x-paga-hash-v3, or the credit must show in the account's Paga history.
 // - Every Paga call that moves money reuses a stable referenceNumber, so a
@@ -39,8 +42,17 @@ export function setVirtualAccountClient(factory: (() => PagaClient) | null): voi
 }
 const client = () => clientFactory();
 
+export type PagaMode = 'off' | 'test-accounts' | 'all';
+export function pagaMode(): PagaMode {
+  const m = String(process.env.PAGA_MODE ?? '').trim();
+  return m === 'all' ? 'all' : m === 'test-accounts' ? 'test-accounts' : 'off';
+}
+/** Every verified customer pays through Paga: PAGA_MODE=all on live keys only. */
+export function pagaForEveryone(): boolean {
+  return pagaMode() === 'all' && pagaConfig().env === 'live' && pagaConfigured(pagaConfig());
+}
 export function virtualAccountsEnabled(): boolean {
-  return process.env.PAGA_MODE === 'test-accounts' && pagaConfigured(pagaConfig());
+  return pagaMode() !== 'off' && pagaConfigured(pagaConfig());
 }
 
 const callbackUrl = () => `${(process.env.PAGA_CALLBACK_BASE_URL || 'https://api.kendibo.ng').replace(/\/+$/, '')}${CALLBACK_PATH}`;
@@ -75,7 +87,7 @@ export async function eligibility(userId: string): Promise<Eligibility> {
   );
   const u = rows[0];
   if (!u) return { ok: false, reason: 'not_found' };
-  if (!u.is_test) return { ok: false, reason: 'not_test_account' };
+  if (!u.is_test && !pagaForEveryone()) return { ok: false, reason: 'not_test_account' };
   const verified = u.c_status === 'VERIFIED' || u.p_status === 'VERIFIED';
   if (!verified) return { ok: false, reason: 'kyc_not_verified' };
   if (!u.phone && !u.email) return { ok: false, reason: 'no_contact' };
@@ -549,6 +561,37 @@ export async function adminList(opts: { filter?: 'all' | 'funded' | 'never_funde
   }));
   const f = opts.filter ?? 'all';
   return items.filter((i) => f === 'all' || (f === 'funded' && i.fundingCount > 0) || (f === 'never_funded' && i.fundingCount === 0) || (f === 'unconfirmed' && i.unconfirmedCount > 0));
+}
+
+// ---------- backfill ----------
+
+/**
+ * Give an account number to KYC-verified users who do not have one yet (e.g.
+ * verified before Paga was switched on). Sequential, so Paga is not flooded;
+ * one failure never stops the rest. Returns what happened per user.
+ */
+export async function backfillVirtualAccounts(limit = 50): Promise<{ checked: number; created: number; skipped: Record<string, number>; failed: number }> {
+  const n = Math.max(1, Math.min(500, Math.floor(Number(limit) || 50)));
+  const out = { checked: 0, created: 0, skipped: {} as Record<string, number>, failed: 0 };
+  if (!virtualAccountsEnabled()) { out.skipped.disabled = 1; return out; }
+  const rows = await q<{ id: string }>(
+    `SELECT u.id FROM identity.users u
+       LEFT JOIN kyc.customer c ON c.user_id = u.id
+       LEFT JOIN provider.provider p ON p.user_id = u.id
+       LEFT JOIN payment.virtual_account v ON v.user_id = u.id AND v.status IN ('active','pending','rotating')
+      WHERE (c.status = 'VERIFIED' OR p.kyc_status = 'VERIFIED') AND v.id IS NULL
+      ORDER BY u.created_at ASC LIMIT ${n}`,
+  );
+  for (const r of rows) {
+    out.checked++;
+    const elig = await eligibility(String(r.id));
+    if (!elig.ok) { const k = elig.reason ?? 'ineligible'; out.skipped[k] = (out.skipped[k] ?? 0) + 1; continue; }
+    try {
+      const va = await ensureVirtualAccount(String(r.id));
+      if (va?.status === 'active') out.created++; else out.failed++;
+    } catch (e) { out.failed++; observability.captureException(e); }
+  }
+  return out;
 }
 
 // ---------- KYC hook ----------

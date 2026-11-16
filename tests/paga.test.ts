@@ -170,6 +170,18 @@ describe('routing: Paga sandbox only for test accounts', () => {
   }
   const input = (bookingId: string) => ({ bookingId, amountKobo: 500000n, reference: `r_${randomUUID()}`, idempotencyKey: 'k' });
 
+  it('PAGA_MODE=all: every booking on Paga with live keys; on the sandbox it stays test-accounts only', async () => {
+    const envBefore = process.env.PAGA_ENV;
+    process.env.PAGA_MODE = 'all';
+    process.env.PAGA_ENV = 'live';
+    assert.equal(await svc.pspFor(input(await booking(false, false))), 'paga', 'real customer, live keys');
+    assert.equal(await svc.pspFor({ ...input('wallet_topup') }), 'bachs', 'card top-ups stay on Bachs');
+    process.env.PAGA_ENV = 'sandbox';
+    assert.equal(await svc.pspFor(input(await booking(false, false))), 'bachs', 'never sandbox money for real customers');
+    assert.equal(await svc.pspFor(input(await booking(true, true))), 'paga');
+    if (envBefore === undefined) delete process.env.PAGA_ENV; else process.env.PAGA_ENV = envBefore;
+  });
+
   it('PAGA_MODE off (default): always Bachs, even for test accounts', async () => {
     delete process.env.PAGA_MODE;
     assert.equal(await svc.pspFor(input(await booking(true, true))), 'bachs');
