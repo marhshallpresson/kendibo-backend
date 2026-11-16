@@ -43,6 +43,8 @@ type BotData = Asked & { vendorCtaAt?: number; roleAsked?: boolean; suspendedNot
 interface Session { waId: string; userId: string | null; state: State; data: BotData; updatedAt: number }
 const freshData = (d: BotData): BotData => ({
   lang: d.lang, ...(d.vendorCtaAt ? { vendorCtaAt: d.vendorCtaAt } : {}), ...(d.roleAsked ? { roleAsked: true } : {}),
+  // "Check prices" waits for the next message; it is not tied to a draft.
+  ...(d.priceMode ? { priceMode: true } : {}),
 });
 
 export interface InboundMessage {
@@ -142,8 +144,20 @@ const replyText = (m: InboundMessage) =>
   (m.text?.body ?? m.image?.caption ?? m.video?.caption ?? m.document?.caption ?? m.interactive?.button_reply?.title ?? m.interactive?.list_reply?.title ?? m.button?.text ?? '').trim();
 
 // ── Replies ──────────────────────────────────────────────────────────────────
+/** "full" = the old flow (agree first, then name and email). Default "light": just help. */
+const lightOnboarding = () => (process.env.WHATSAPP_ONBOARDING ?? 'light') !== 'full';
+const WELCOME_BUTTONS = [
+  { id: 'menu:book', title: 'Book a service' },
+  { id: 'menu:prices', title: 'Check prices' },
+  { id: 'role:offer', title: 'Offer my services' },
+];
 async function sendWelcome(to: string, name?: string) {
-  await wa.buttons(to, `${firstName(name) ? `Hi ${firstName(name)}! ` : 'Hi! '}I'm Kendibot, Kendibo's automated assistant. What do you need help with?\n\nType AGENT for a person. Vendors: reply START OFFERS for job offers by WhatsApp or SMS, or STOP to opt out.`, MENU_BUTTONS);
+  const hi = firstName(name) ? `Hi ${firstName(name)}! ` : 'Hi! ';
+  if (lightOnboarding()) {
+    await wa.buttons(to, `${hi}I'm Kendibot, Kendibo's assistant. I can find ID-checked pros for cleaning, plumbing, electrical, AC, generators and more, or tell you what a job usually costs. What do you need?\n\nType AGENT for a person. Terms: ${termsLink()}`, WELCOME_BUTTONS);
+    return;
+  }
+  await wa.buttons(to, `${hi}I'm Kendibot, Kendibo's automated assistant. What do you need help with?\n\nType AGENT for a person. Vendors: reply START OFFERS for job offers by WhatsApp or SMS, or STOP to opt out.`, MENU_BUTTONS);
 }
 const sendMenu = (to: string, body = 'What would you like to do?') => wa.buttons(to, body, MENU_BUTTONS);
 
@@ -445,7 +459,19 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
   // Onboarding: a short notice and one tap to agree before the first booking
   // (NDPA 2023 notice + consent). Whatever they asked first is kept and
   // answered straight after they agree, so nobody has to repeat themselves.
-  if ((process.env.WHATSAPP_CONSENT_GATE ?? 'on') !== 'off') {
+  // Light onboarding (default): no wall. People can ask, check prices and leave;
+  // the terms are accepted when they send their first request (flow.ts confirm),
+  // and the ID check and payment happen later on secure pages.
+  if (lightOnboarding() && id === 'consent:agree') {
+    await q(`UPDATE identity.users SET terms_accepted_at=now(), terms_source='whatsapp' WHERE id=$1 AND terms_accepted_at IS NULL`, [user.id]).catch(() => undefined);
+    const pending = s.data.pendingText ?? '';
+    delete s.data.pendingText;
+    await saveSession(s);
+    if (pending) return processInbound({ id: `${m.id}:pending`, from: to, type: 'text', text: { body: pending } }, profileName);
+    await sendWelcome(to, profileName);
+    return;
+  }
+  if (!lightOnboarding() && (process.env.WHATSAPP_CONSENT_GATE ?? 'on') !== 'off') {
     const t = await q<{ at: string | null }>(`SELECT terms_accepted_at AS at FROM identity.users WHERE id=$1`, [user.id]).catch(() => [{ at: 'unknown' }]);
     if (!t[0]?.at) {
       if (id === 'consent:agree') {
@@ -587,6 +613,9 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
         await sendStatus(to, user.id, draft);
       } else if (id === 'menu:help') {
         await handOff(s, user.id, to, 'asked for a person from the menu');
+      } else if (id === 'menu:prices') {
+        s.data.priceMode = true;
+        await wa.text(to, `${FACTS.pricing}\n\nWhich job do you want prices for? For example: AC service, deep cleaning, plumbing, electrical.`);
       } else if (id === 'role:offer') {
         await sendVendorCta(to, s, draft, true);
       } else if (id === 'flow:resume') {
@@ -689,7 +718,21 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
   let route = 'flow';
   const lead = (x: string) => (firstContact ? `${DISCLOSURE}\n\n${x}`.trim() : x);
 
-  if (u.intent === 'human') {
+  // After "Check prices": the job they name gets its prices and a one-tap "Book this".
+  const priceTrade = s.data.priceMode && !draft ? u.trade ?? null : null;
+  delete s.data.priceMode; // one message only, so it never traps the conversation
+
+  if (priceTrade) {
+    route = 'facts';
+    const lines = await priceLines(priceTrade);
+    const name = (await tradeName(priceTrade)) ?? 'This job';
+    await wa.buttons(to, lines
+      ? `${name}:\n${lines}\n\nThe final price is agreed before any work starts, and you pay through Kendibo.`
+      : `${name}: the pro quotes after seeing the job, and you approve the price before any work starts.`, [
+      { id: `cat:${priceTrade}`, title: 'Book this' },
+      { id: 'menu:prices', title: 'Other prices' },
+    ]);
+  } else if (u.intent === 'human') {
     route = 'human';
     await handOff(s, user.id, to, text);
   } else if (wantsToJoin(text, u) || (JOIN_AGAIN_RE.test(text) && Date.now() - (s.data.vendorCtaAt ?? 0) < VENDOR_CTA_GAP_MS)) {
@@ -762,6 +805,40 @@ async function processInbound(m: InboundMessage, profileName?: string): Promise<
   }
   await logTurn(to, text, u, route, step);
   await saveSession(s);
+}
+
+export interface PayPreview {
+  service: string; pro: string | null; when: string | null; address: string | null; amount: string; protectedNote: string;
+}
+/**
+ * What the customer reviews on the "Confirm & pay" page before checkout. Same
+ * checks as payLinkTarget (this number's own booking, still unpaid).
+ */
+export async function payLinkPreview(waId: string, bookingId: string): Promise<{ preview: PayPreview } | { done: string }> {
+  const b = await q<{ status: string; price_kobo: string | null; scheduled_at: string | null; time_window: string | null; service: string | null; pro: string | null; house_number: string | null; street: string | null; city: string | null }>(
+    `SELECT b.status, b.price_kobo, b.scheduled_at, b.time_window, s.name AS service, p.business_name AS pro,
+            a.house_number, a.street, a.city
+       FROM booking.booking b JOIN identity.users u ON u.id = b.user_id
+       LEFT JOIN catalog.service s ON s.id = b.service_id
+       LEFT JOIN provider.provider p ON p.id = b.provider_id
+       LEFT JOIN property.address a ON a.id = b.address_id
+      WHERE b.id=$1 AND u.phone=$2`, [bookingId, e164(waId)],
+  ).catch(() => []);
+  if (!b[0]) return { done: 'This payment link is not valid for this number.' };
+  if (!['REQUESTED', 'PAYMENT_PENDING'].includes(String(b[0].status).toUpperCase())) return { done: 'This booking is already paid or no longer needs payment.' };
+  const paid = await q(`SELECT 1 FROM payment.payment WHERE booking_id=$1 AND status='successful' LIMIT 1`, [bookingId]).catch(() => []);
+  if (paid[0]) return { done: 'This booking is already paid. Thank you! We will keep you posted here.' };
+  const amount = String(b[0].price_kobo ?? '0').split('.')[0] || '0';
+  if (Number(amount) <= 0) return { done: 'Open the Kendibo app to pay for this booking.' };
+  const when = b[0].scheduled_at
+    ? `${new Date(b[0].scheduled_at).toLocaleDateString('en-NG', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'Africa/Lagos' })}${b[0].time_window ? `, ${b[0].time_window}` : ''}`
+    : null;
+  return { preview: {
+    service: b[0].service ?? 'Your booking', pro: b[0].pro, when,
+    address: [[b[0].house_number, b[0].street].filter(Boolean).join(' '), b[0].city].filter(Boolean).join(', ') || null,
+    amount: naira(amount),
+    protectedNote: 'Kendibo holds your payment and only pays the pro after you confirm the job is done.',
+  } };
 }
 
 /**

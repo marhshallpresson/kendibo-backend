@@ -102,6 +102,9 @@ async function idCheckStatus(userId: string): Promise<string | null> {
 export async function submitDraft(waId: string, userId: string, d: Draft): Promise<{ requestId: string; vendors: number; needsVerification?: boolean }> {
   const miss = missingFields(d).filter((m) => m === 'need' || m === 'trade' || m === 'location');
   if (miss.length) throw Object.assign(new Error('DRAFT_INCOMPLETE'), { missing: miss });
+  // Sending the first request is when the customer accepts the terms (the
+  // confirm message shows the link). Recorded once.
+  await q(`UPDATE identity.users SET terms_accepted_at=now(), terms_source='whatsapp' WHERE id=$1 AND terms_accepted_at IS NULL`, [userId]).catch(() => undefined);
   // Optional policy switch: verified customers only. The request stays saved and
   // goes out as soon as the ID check passes (continueAfterVerification).
   const idStatus = await idCheckStatus(userId);

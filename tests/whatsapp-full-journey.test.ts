@@ -39,6 +39,8 @@ async function verified(reference: string) {
 (globalThis as Record<string, unknown>).__PSP__ = { bachs: fakePsp };
 
 process.env.NODE_ENV = 'test';
+// This journey walks the full onboarding (consent, name, email); the default is the light one.
+process.env.WHATSAPP_ONBOARDING = 'full';
 type Res = { statusCode: number; json: () => any; body: string; headers: Record<string, string | string[] | number | undefined> };
 let app: { inject: (opts: unknown) => Promise<Res>; close?: () => Promise<void> };
 

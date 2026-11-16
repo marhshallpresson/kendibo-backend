@@ -42,8 +42,10 @@ export const vendorsLink = (waId: string, draftId: string) => `${webBase()}/w/ve
 export const idCheckLink = (waId: string, userId: string) => `${webBase()}/w/verify?t=${encodeURIComponent(signLink({ w: waId, d: userId, p: 'verify' }, 24 * 3600))}`;
 /** Where would-be providers and vendors sign up (VENDOR_SIGNUP_URL). Read only here. */
 export const vendorSignupUrl = () => (process.env.VENDOR_SIGNUP_URL || '').trim() || 'https://kendibo.ng/#join-provider';
-/** Public terms & privacy summary the onboarding message links to. */
-export const termsLink = () => `${webBase()}/w/terms`;
+/** Main public website (not the API host). SITE_URL overrides it. */
+export const siteBase = () => ((process.env.SITE_URL || '').trim() || 'https://kendibo.ng').replace(/\/+$/, '');
+/** Terms & privacy on the main website (kendibo.ng/terms opens the legal panel). */
+export const termsLink = () => `${siteBase()}/terms`;
 /** Email confirmation link (d = user id). The email is attached only once this is opened. */
 export const emailConfirmLink = (waId: string, userId: string) => `${webBase()}/w/confirm-email?t=${encodeURIComponent(signLink({ w: waId, d: userId, p: 'email' }, 24 * 3600))}`;
 /** Printable invoice / receipt page (w = customer user id, d = invoice id). Long-lived: people keep receipts. */

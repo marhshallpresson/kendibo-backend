@@ -10,6 +10,8 @@ import { q } from '../packages/database/db.js';
 import { signAccess } from '../packages/auth/auth.js';
 
 process.env.NODE_ENV = 'test';
+// These tests walk the full onboarding (consent, name, email); the default is the light one.
+process.env.WHATSAPP_ONBOARDING = 'full';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let app: { inject: (opts: any) => Promise<any>; close?: () => Promise<void> };
