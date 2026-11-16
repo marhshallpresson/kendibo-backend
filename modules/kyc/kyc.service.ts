@@ -12,7 +12,7 @@
 // and verified legal/corporate names for strict payout alignment.
 import { q } from '../../packages/database/db.js';
 import { emit } from '../../packages/observability/emit.js';
-import { notifyCustomerVerified } from './kyc.notify.js';
+import { notifyCustomerVerified, notifyCustomerRejected } from './kyc.notify.js';
 import { getSetting } from '../settings/settings.service.js';
 import { mediaService } from '../media/media.service.js';
 import { guardKycAdapter } from './kyc-cost.guard.js';
@@ -46,6 +46,8 @@ export interface KycCheckResult {
   raw?: Record<string, unknown>;
   /** Provider-side outage (unconfigured, unfunded, quota, timeout, 5xx, thrown) — not a verdict. */
   unavailable?: boolean;
+  /** Date of birth on the NIN/BVN record (YYYY-MM-DD when it can be read). */
+  verifiedDob?: string;
 }
 
 export interface NameAlignmentInput {
@@ -306,6 +308,7 @@ class PremblyKycAdapter implements KycAdapter {
         ? data.confidence
         : undefined;
     const verifiedName = extra?.verifiedName ?? this.extractLegalName(data);
+    const verifiedDob = normalizeDob(data.birthdate ?? data.birthDate ?? data.dateOfBirth ?? data.date_of_birth ?? data.dob ?? data.birth_date);
     const companyName = extra?.companyName ?? (typeof data.company_name === 'string' ? data.company_name : typeof data.companyName === 'string' ? data.companyName : undefined);
     let reason = passed ? undefined : String(r.detail ?? r.message ?? `response_code=${code}`);
     if (code === '04' || /insufficient.*balance/i.test(reason ?? '')) {
@@ -323,6 +326,7 @@ class PremblyKycAdapter implements KycAdapter {
       reason,
       verifiedName,
       companyName,
+      ...(verifiedDob ? { verifiedDob } : {}),
       ...extra,
     };
   }
@@ -726,6 +730,18 @@ async function assetBase64(assetId: string): Promise<string | null> {
   }
 }
 
+/** Any common date form (YYYY-MM-DD, DD-MM-YYYY, DD/MM/YYYY, "12-Jan-1990", ISO) -> YYYY-MM-DD. */
+export function normalizeDob(v: unknown): string | undefined {
+  if (typeof v !== 'string' || !v.trim()) return undefined;
+  const t = v.trim();
+  let m = t.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);
+  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+  m = t.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$/);
+  if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+  const d = new Date(t);
+  return Number.isNaN(d.getTime()) ? undefined : d.toISOString().slice(0, 10);
+}
+
 export interface TierRunInput {
   nin?: string;
   bvn?: string;
@@ -733,6 +749,8 @@ export interface TierRunInput {
   businessName?: string;
   submittedName?: string;
   bankAccountName?: string;
+  /** Date of birth the person typed (YYYY-MM-DD); checked against the NIN/BVN record. */
+  dateOfBirth?: string;
   selfieBase64?: string;
   documents?: { assetId: string; kind: KycDocKind }[];
   adapter?: KycAdapter;
@@ -753,6 +771,8 @@ export interface TierRunOutcome {
   checks: { tier: 1 | 2 | 3; kind: string; passed: boolean; reason?: string; confidence?: number; unavailable?: boolean }[];
   /** First provider-side outage seen (unconfigured, unfunded, quota, timeout, thrown). */
   unavailableReason?: string;
+  /** Set when a date of birth was typed and the ID record has one: do they match? */
+  dobMatches?: boolean;
 }
 
 /** Masked inputs + document references kept with an application (never raw numbers). */
@@ -871,6 +891,7 @@ export const kycService = {
     let bvnLegalName: string | undefined;
     let faceVerified = false;
     let faceConfidence: number | undefined;
+    let recordDob: string | undefined;
 
     const docs = input.documents ?? [];
     const selfieDoc = docs.find((d) => d.kind === 'selfie');
@@ -901,6 +922,7 @@ export const kycService = {
         tier1Passed = true;
         ninMasked = masked;
         ninLegalName = r.verifiedName;
+        recordDob = recordDob ?? r.verifiedDob;
       }
     }
     if (input.bvn) {
@@ -925,6 +947,7 @@ export const kycService = {
         tier1Passed = true;
         bvnMasked = masked;
         bvnLegalName = r.verifiedName;
+        recordDob = recordDob ?? r.verifiedDob;
         if (!ninMasked) ninMasked = masked;
       }
     }
@@ -1029,6 +1052,9 @@ export const kycService = {
       nameAlignment,
       checks,
       unavailableReason,
+      ...(normalizeDob(input.dateOfBirth) && recordDob
+        ? { dobMatches: normalizeDob(input.dateOfBirth) === recordDob }
+        : {}),
     };
   },
 
@@ -1118,9 +1144,14 @@ export const kycService = {
       documents: (input.documents ?? []).filter((d) => d.kind !== 'selfie'),
     });
     const minCustomerTier = 1;
-    const aligned = outcome.nameAlignment ? outcome.nameAlignment.aligned : true;
+    const nameOk = outcome.nameAlignment ? outcome.nameAlignment.aligned : true;
+    const dobOk = outcome.dobMatches !== false;
+    const aligned = nameOk && dobOk;
     const autoVerify = outcome.tierReached >= minCustomerTier && aligned;
     const nextStatus: KycStatus = autoVerify ? 'VERIFIED' : 'UNDER_REVIEW';
+    const mismatchReason = !nameOk
+      ? outcome.nameAlignment?.mismatchReason ?? null
+      : !dobOk ? 'Date of birth does not match the NIN/BVN record.' : null;
     const fastTrackMethod = outcome.faceVerified ? 'prembly_biometric_fast_track' : 'prembly_nin_bvn_instant';
     // The identity provider could not answer: save for a human, not a rejection.
     const manual = !autoVerify && Boolean(outcome.unavailableReason);
@@ -1134,10 +1165,10 @@ export const kycService = {
       `INSERT INTO kyc.customer
          (user_id, status, tier, provider, nin_masked, bvn_masked, verified_legal_name,
           face_verified, face_confidence, name_aligned, name_alignment_score, fast_track_method,
-          submitted_at, reviewed_at, reviewed_by, pending_reason, submitted_masked)
+          submitted_at, reviewed_at, reviewed_by, pending_reason, submitted_masked, rejection_reason)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(),
                CASE WHEN $2 = 'VERIFIED' THEN now() ELSE NULL END,
-               CASE WHEN $2 = 'VERIFIED' THEN 'auto:' || $4 ELSE NULL END, $14, $15)
+               CASE WHEN $2 = 'VERIFIED' THEN 'auto:' || $4 ELSE NULL END, $14, $15, $13)
        ON CONFLICT (user_id) DO UPDATE
          SET status = $2,
              tier = GREATEST(kyc.customer.tier, $3),
@@ -1169,7 +1200,7 @@ export const kycService = {
         aligned,
         outcome.nameAlignment?.score ?? 100,
         fastTrackMethod,
-        !aligned && !manual ? outcome.nameAlignment?.mismatchReason ?? null : null,
+        !aligned && !manual ? mismatchReason : null,
         pendingReason,
         submittedMasked,
       ],
@@ -1181,8 +1212,8 @@ export const kycService = {
           `INSERT INTO kyc.customer
              (user_id, status, tier, provider, nin_masked, bvn_masked, verified_legal_name,
               face_verified, face_confidence, name_aligned, name_alignment_score, fast_track_method, submitted_at,
-              pending_reason, submitted_masked)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),$13,$14)`,
+              pending_reason, submitted_masked, rejection_reason)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),$13,$14,$15)`,
           [
             userId, nextStatus, outcome.tierReached, outcome.provider,
             outcome.ninMasked ?? null, outcome.bvnMasked ?? null,
@@ -1190,6 +1221,7 @@ export const kycService = {
             Boolean(outcome.faceVerified), outcome.faceConfidence ?? null,
             aligned, outcome.nameAlignment?.score ?? 100, fastTrackMethod,
             pendingReason, submittedMasked,
+            !aligned && !manual ? mismatchReason : null,
           ],
         );
       } else {
@@ -1198,7 +1230,8 @@ export const kycService = {
               SET status=$2, tier=$3, provider=$4, nin_masked=COALESCE($5, nin_masked),
                   bvn_masked=COALESCE($6, bvn_masked), verified_legal_name=COALESCE($7, verified_legal_name),
                   face_verified=$8, face_confidence=$9, name_aligned=$10, name_alignment_score=$11,
-                  fast_track_method=$12, submitted_at=now(), pending_reason=$13, submitted_masked=$14
+                  fast_track_method=$12, submitted_at=now(), pending_reason=$13, submitted_masked=$14,
+                  rejection_reason=$15
             WHERE user_id=$1`,
           [
             userId, nextStatus, outcome.tierReached, outcome.provider,
@@ -1207,6 +1240,7 @@ export const kycService = {
             Boolean(outcome.faceVerified), outcome.faceConfidence ?? null,
             aligned, outcome.nameAlignment?.score ?? 100, fastTrackMethod,
             pendingReason, submittedMasked,
+            !aligned && !manual ? mismatchReason : null,
           ],
         );
       }
@@ -1280,6 +1314,7 @@ export const kycService = {
       [userId, reason, adminUserId],
     );
     emit('kyc.user.rejected', { userId, by: adminUserId, reason });
+    void notifyCustomerRejected(userId);
   },
 
   async userDocumentsFor(userId: string): Promise<KycDocument[]> {

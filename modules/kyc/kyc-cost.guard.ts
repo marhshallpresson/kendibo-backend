@@ -35,6 +35,8 @@ const lookupHash = (kind: Kind, id: string) =>
 const cacheable = (r: KycCheckResult): KycCheckResult => ({
   passed: r.passed, provider: r.provider, confidence: r.confidence, reference: r.reference, reason: r.reason,
   verifiedName: r.verifiedName, companyName: r.companyName, rcNumber: r.rcNumber,
+  // Kept so a cached NIN/BVN lookup can still be checked against the typed date of birth.
+  ...(r.verifiedDob ? { verifiedDob: r.verifiedDob } : {}),
 });
 
 async function readCache(kind: Kind, id: string): Promise<KycCheckResult | null> {

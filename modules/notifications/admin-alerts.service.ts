@@ -163,7 +163,6 @@ export async function alertKycManualReview(p: Record<string, unknown>) {
     const u = await userInfo(subjectId);
     who = { name: u.name || 'Unnamed customer', phone: maskPhone(u.phone) };
   }
-  const reason = String(p.reason ?? 'provider unavailable').slice(0, 200);
   return sendAdminAlert({
     kind: 'kyc.manual_review_needed',
     dedupeKey: `kyc:${subjectType}:${subjectId}:manual_review:${String(p.applicationRef ?? 'once')}`,
@@ -171,7 +170,7 @@ export async function alertKycManualReview(p: Record<string, unknown>) {
     lines: [
       `${subjectType === 'provider' ? 'Provider/vendor' : 'Customer'}: ${who.name}`,
       `Phone: ${who.phone}`,
-      `Why: the identity provider could not verify automatically (${reason})`,
+      'Why: the automatic ID check was not available, so a person needs to check this one.',
       'The application is saved as UNDER_REVIEW. Check the documents and approve or reject it.',
     ],
     link: admin('/kyc/queue'),
