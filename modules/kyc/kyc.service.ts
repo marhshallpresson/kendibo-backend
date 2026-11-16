@@ -1129,7 +1129,53 @@ export const kycService = {
         applicationRef: new Date().toISOString(),
       });
     }
+    if (autoVerify) await this.syncCustomerFromProvider({ providerId }).catch(() => false);
     return this.status(providerId);
+  },
+
+  /**
+   * One verified identity for the whole account: when the user's provider KYC
+   * is VERIFIED, mark their customer KYC VERIFIED too (legal name, masked IDs),
+   * so the customer app stops asking them to verify. Never downgrades and never
+   * touches an already-verified customer row. Returns true when it changed something.
+   * (Customer → provider is NOT mirrored: providers also need the face match.)
+   */
+  async syncCustomerFromProvider(by: { userId?: string; providerId?: string }): Promise<boolean> {
+    const rows = await q<Record<string, unknown>>(
+      by.providerId
+        ? `SELECT user_id, kyc_tier, kyc_provider, nin_masked, bvn_masked, verified_legal_name, kyc_submitted_at, kyc_reviewed_by
+             FROM provider.provider WHERE id::text = $1 AND kyc_status = 'VERIFIED'`
+        : `SELECT user_id, kyc_tier, kyc_provider, nin_masked, bvn_masked, verified_legal_name, kyc_submitted_at, kyc_reviewed_by
+             FROM provider.provider WHERE user_id::text = $1 AND kyc_status = 'VERIFIED' LIMIT 1`,
+      [String(by.providerId ?? by.userId ?? '')],
+    );
+    const p = rows[0];
+    if (!p?.user_id) return false;
+    const userId = String(p.user_id);
+    const cur = await q<{ status: string }>(`SELECT status FROM kyc.customer WHERE user_id = $1`, [userId]);
+    if (cur[0]?.status === 'VERIFIED') return false;
+    const vals = [
+      userId, Math.max(1, Number(p.kyc_tier ?? 1)), p.kyc_provider ?? null, p.nin_masked ?? null, p.bvn_masked ?? null,
+      p.verified_legal_name ?? null, p.kyc_submitted_at ?? null, `sync:provider${p.kyc_reviewed_by ? ':' + String(p.kyc_reviewed_by) : ''}`.slice(0, 120),
+    ];
+    if (cur[0]) {
+      await q(
+        `UPDATE kyc.customer SET status = 'VERIFIED', tier = GREATEST(tier, $2), provider = COALESCE(provider, $3),
+                nin_masked = COALESCE(nin_masked, $4), bvn_masked = COALESCE(bvn_masked, $5),
+                verified_legal_name = COALESCE(verified_legal_name, $6), name_aligned = TRUE, name_alignment_score = 100,
+                rejection_reason = NULL, pending_reason = NULL, submitted_at = COALESCE(submitted_at, $7, now()),
+                reviewed_at = now(), reviewed_by = $8, updated_at = now()
+          WHERE user_id = $1`, vals,
+      );
+    } else {
+      await q(
+        `INSERT INTO kyc.customer (user_id, status, tier, provider, nin_masked, bvn_masked, verified_legal_name,
+                name_aligned, name_alignment_score, submitted_at, reviewed_at, reviewed_by)
+         VALUES ($1, 'VERIFIED', $2, $3, $4, $5, $6, TRUE, 100, COALESCE($7, now()), now(), $8)`, vals,
+      );
+    }
+    emit('kyc.user.synced_from_provider', { userId });
+    return true;
   },
 
   /** Customer KYC submission — runs Prembly checks + Name Alignment and updates `kyc.customer`. */
@@ -1262,6 +1308,9 @@ export const kycService = {
   },
 
   async userStatus(userId: string) {
+    // Verified as a provider but not yet on the customer side: sync first.
+    const pre = await q<{ status: string }>(`SELECT status FROM kyc.customer WHERE user_id = $1`, [userId]).catch(() => []);
+    if (pre[0]?.status !== 'VERIFIED') await this.syncCustomerFromProvider({ userId }).catch(() => false);
     const rows = await q<Record<string, unknown>>(
       `SELECT status, tier, provider, nin_masked, bvn_masked, verified_legal_name,
               face_verified, face_confidence, name_aligned, name_alignment_score,
@@ -1294,6 +1343,9 @@ export const kycService = {
   },
 
   async userApprove(userId: string, adminUserId: string): Promise<void> {
+    // An admin may approve someone who never submitted: make sure the row exists.
+    const exists = await q(`SELECT 1 FROM kyc.customer WHERE user_id = $1`, [userId]);
+    if (!exists.length) await q(`INSERT INTO kyc.customer (user_id, status, tier, submitted_at) VALUES ($1, 'PENDING', 1, now())`, [userId]);
     await q(
       `UPDATE kyc.customer
           SET status = 'VERIFIED', rejection_reason = NULL, pending_reason = NULL,
@@ -1508,6 +1560,7 @@ export const kycService = {
       [providerId, adminUserId],
     );
     emit('kyc.approved', { providerId, by: adminUserId });
+    await this.syncCustomerFromProvider({ providerId }).catch(() => false);
   },
 
   async reject(providerId: string, reason: string, adminUserId: string) {
