@@ -5,9 +5,38 @@ dist
 firebase-service-account.json
 /storage/
 node_modules
-
 tmp-wu/
 otp.err
 audit.json
 tests/
 docs/
+
+# tests/ and docs/ above: tracked files stay published; new local files stay private.
+# Env and secrets
+.env*
+!.env.example
+.deploy.env
+*.pem
+*.key
+*.jks
+*.keystore
+*.p12
+credentials*.json
+service-account*.json
+# Logs, dumps, archives
+*.err
+*.out
+*.bak
+*.bak-*
+*.dump
+*.sql.gz
+*.zip
+*.tgz
+coverage/
+.vscode/
+# Agent config (never published)
+AGENTS.md
+GEMINI.md
+CLAUDE.md
+.agents/
+.claude/

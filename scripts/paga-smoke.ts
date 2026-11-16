@@ -1,5 +1,5 @@
 // Paga sandbox smoke test. Talks to Paga only; touches no database.
-// Run on the server (Paga only accepts whitelisted IPs: 203.0.113.10):
+// Run on the server (Paga only accepts whitelisted IPs: this server's outbound IP):
 //   GOMAXPROCS=1 node --env-file=.env --import tsx scripts/paga-smoke.ts [step]
 // steps: keys | banks | pay | status <reference> | account | all (default: all but status)
 // Prints references, account numbers and Paga status codes. Never prints keys.
@@ -14,7 +14,7 @@ function explain(e: unknown) {
   if (e instanceof PagaError) {
     const hint: Record<string, string> = {
       UNAUTHORIZED: 'keys rejected: check PAGA_PUBLIC_KEY / PAGA_SECRET_KEY are the SANDBOX (test) keys',
-      IP_NOT_WHITELISTED: 'Paga refused this server IP: whitelist 203.0.113.10 for the sandbox in the Paga portal',
+      IP_NOT_WHITELISTED: 'Paga refused this server IP: whitelist this server's outbound IP for the sandbox in the Paga portal',
       BAD_REQUEST: 'request refused: usually the hash (check PAGA_HASH_KEY) or a field Paga did not accept',
       TIMEOUT: 'no answer from Paga in time',
       NOT_CONFIGURED: 'keys missing in .env',

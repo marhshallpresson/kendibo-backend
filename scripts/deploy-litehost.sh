@@ -6,8 +6,13 @@
 # itself when its process exits), checks /health/ready and rolls back if it fails.
 # Settings live on the server in ~/shared/kendibo-api/.env (never uploaded).
 set -eu
-HOST="${LITEHOST_HOST:-appuser@203.0.113.10}"
-KEY="${LITEHOST_KEY:-$HOME/.ssh/deploy_key}"
+# Server details are not in the repo. Put them in .deploy.env (git-ignored)
+# next to package.json, or export them:
+#   LITEHOST_HOST=user@server-ip
+#   LITEHOST_KEY=$HOME/.ssh/your_deploy_key
+[ -f .deploy.env ] && . ./.deploy.env
+HOST="${LITEHOST_HOST:?Set LITEHOST_HOST (user@host) in .deploy.env}"
+KEY="${LITEHOST_KEY:?Set LITEHOST_KEY (path to the SSH key) in .deploy.env}"
 APP=kendibo-api
 SSH="ssh -i $KEY -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=10"
 SCP="scp -q -i $KEY -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=10"
