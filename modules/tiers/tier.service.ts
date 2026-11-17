@@ -85,11 +85,11 @@ async function requirementsOf(p: Row, cfg: TierConfig): Promise<Requirement[]> {
   const c = (await q<Record<string, unknown>>(
     `SELECT
        (SELECT COUNT(*) FROM kyc.submission_document WHERE provider_id=$1 AND kind='selfie') AS selfie_docs,
-       (SELECT COUNT(*) FROM kyc.verification_check WHERE subject_type='provider' AND subject_id=$1 AND check_kind IN ('doc_face', 'face_liveness')) AS face_checks,
+       (SELECT COUNT(*) FROM kyc.verification_check WHERE subject_type='provider' AND subject_id=$1::text AND check_kind IN ('doc_face', 'face_liveness')) AS face_checks,
        (SELECT COUNT(*) FROM provider.skill WHERE provider_id=$1) AS skills,
        (SELECT COUNT(*) FROM provider.category_enrollment WHERE provider_id=$1) AS enrolled,
        (SELECT COUNT(*) FROM kyc.submission_document WHERE provider_id=$1 AND kind='address') AS address_docs,
-       (SELECT COUNT(*) FROM kyc.verification_check WHERE subject_type='provider' AND subject_id=$1 AND check_kind='address' AND status='passed') AS address_checks,
+       (SELECT COUNT(*) FROM kyc.verification_check WHERE subject_type='provider' AND subject_id=$1::text AND check_kind='address' AND status='passed') AS address_checks,
        (SELECT COUNT(*) FROM provider.gallery WHERE provider_id=$1) AS photos,
        (SELECT COUNT(*) FROM provider.tier_reference WHERE provider_id=$1 AND status<>'rejected') AS refs,
        (SELECT COUNT(*) FROM provider.credential WHERE provider_id=$1 AND kind IN ('certificate', 'licence') AND status IN ('submitted', 'approved')) AS certs,
