@@ -9,6 +9,9 @@ export interface Service {
   categoryId: string;
   categoryName: string;
   name: string; bookingMode: 'fixed' | 'quote'; baseKobo: bigint; warrantyDays: number; durationMinutes: number; requiresSkill?: string;
+  /** Set when the listing is a verified vendor's offering (id is then the offering id). */
+  source?: 'offering'; offeringId?: string; providerId?: string; providerName?: string;
+  priceUnit?: string; description?: string; rating?: number; reviewCount?: number; completedJobs?: number;
 }
 export interface AddOn { id: string; serviceId: string; name: string; priceKobo: bigint; }
 export type CategoryKind = 'service' | 'product';
@@ -37,6 +40,44 @@ async function groupRows(): Promise<Omit<CategoryGroup, 'categories'>[]> {
     id: String(g.id), name: String(g.name), shortName: String(g.short_name ?? g.name), kind: asKind(g.kind),
     iconName: String(g.icon_name ?? 'Sparkles'), sortOrder: Number(g.sort_order ?? 0),
   }));
+}
+
+/** Active service offerings of verified, active, real (non-test, non-suspended) vendors, as catalog listings. */
+async function offeringListings(f: { category?: string; id?: string }): Promise<Service[]> {
+  const rows = await q<Record<string, unknown>>(
+    `SELECT o.id, o.category_id, c.name AS category_name, o.name, o.description, o.price_kobo, o.price_unit, o.duration_minutes, o.created_at,
+            p.id AS provider_id, p.business_name, p.rating, u.name AS user_name
+       FROM provider.offering o
+       JOIN provider.provider p ON p.id = o.provider_id
+       JOIN identity.users u ON u.id = p.user_id
+       JOIN catalog.category c ON c.id = o.category_id
+      WHERE o.active AND COALESCE(o.kind, 'service') = 'service' AND c.active
+        AND p.kyc_status = 'VERIFIED' AND p.status = 'active'
+        AND COALESCE(u.is_test, false) = false AND u.suspended_at IS NULL
+        AND ($1::text IS NULL OR c.id = $1 OR c.name = $1)
+        AND ($2::text IS NULL OR o.id::text = $2)`,
+    [f.category ?? null, f.id ?? null],
+  );
+  if (!rows.length) return [];
+  const jobs = new Map<string, number>();
+  const reviews = new Map<string, number>();
+  for (const r of await q<{ provider_id: string; n: string }>(`SELECT provider_id, COUNT(*) AS n FROM provider.earning GROUP BY provider_id`).catch(() => [])) jobs.set(String(r.provider_id), Number(r.n));
+  for (const r of await q<{ provider_id: string; n: string }>(`SELECT provider_id, COUNT(*) AS n FROM payment.review GROUP BY provider_id`).catch(() => [])) reviews.set(String(r.provider_id), Number(r.n));
+  const out = rows.map((r) => {
+    const pid = String(r.provider_id);
+    return {
+      svc: {
+        ...toService({ ...r, booking_type: 'fixed', base_price_kobo: r.price_kobo, warranty_days: 0, duration_minutes: r.duration_minutes ?? 60 }),
+        source: 'offering' as const, offeringId: String(r.id), providerId: pid,
+        providerName: String(r.business_name ?? r.user_name ?? 'Kendibo vendor'),
+        priceUnit: String(r.price_unit ?? 'job'), description: r.description ? String(r.description) : '',
+        rating: Number(r.rating ?? 0), reviewCount: reviews.get(pid) ?? 0, completedJobs: jobs.get(pid) ?? 0,
+      } as Service,
+      created: new Date(String(r.created_at)).getTime() || 0,
+    };
+  });
+  out.sort((a, b) => (b.svc.completedJobs! - a.svc.completedJobs!) || (b.svc.rating! - a.svc.rating!) || (b.created - a.created) || a.svc.id.localeCompare(b.svc.id));
+  return out.map((x) => x.svc);
 }
 
 export const catalogService = {
@@ -69,20 +110,24 @@ export const catalogService = {
       .filter((g) => g.categories.length > 0 && (!opts.kind || g.kind === opts.kind || g.categories.some((c) => c.kind === opts.kind)));
   },
 
+  /**
+   * The public service list is built from real vendor offerings: active
+   * offerings of VERIFIED, active, non-suspended, non-test vendors. Nothing is
+   * stored, so verifying a vendor, or adding/editing/pausing/removing an
+   * offering (or suspending/un-verifying the vendor), shows on the next read.
+   * Most popular first: completed jobs, then rating, then newest.
+   */
   async list(category?: string): Promise<Service[]> {
-    const rows = await q<Record<string, unknown>>(
-      `SELECT s.id, s.category_id, c.name AS category_name, s.name, s.booking_type, s.base_price_kobo, s.warranty_days, s.duration_minutes, s.requires_skill
-       FROM catalog.service s JOIN catalog.category c ON c.id = s.category_id
-       WHERE s.active AND ($1::text IS NULL OR c.id = $1 OR c.name = $1)`, [category ?? null],
-    );
-    return rows.map(toService);
+    return offeringListings({ category });
   },
   async get(id: string): Promise<Service | null> {
+    // Legacy catalog.service rows (existing bookings reference them) first, then vendor offerings.
     const rows = await q<Record<string, unknown>>(
       `SELECT s.id, s.category_id, c.name AS category_name, s.name, s.booking_type, s.base_price_kobo, s.warranty_days, s.duration_minutes, s.requires_skill
        FROM catalog.service s JOIN catalog.category c ON c.id = s.category_id WHERE s.id=$1`, [id],
     );
-    return rows[0] ? toService(rows[0]) : null;
+    if (rows[0]) return toService(rows[0]);
+    return (await offeringListings({ id }))[0] ?? null;
   },
   async addOns(serviceId: string): Promise<AddOn[]> {
     const rows = await q<Record<string, unknown>>(`SELECT id, service_id, name, price_kobo FROM catalog.addon WHERE service_id=$1`, [serviceId]);

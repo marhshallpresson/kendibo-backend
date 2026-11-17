@@ -76,6 +76,10 @@ describe('catalogue from the landing page', () => {
   });
 
   it('GET /v1/services returns the category id (and its name separately)', async () => {
+    // The service list is built from verified vendors' offerings (no seeded services).
+    const uid = String((await q<{ id: string }>(`INSERT INTO identity.users (email, role, name) VALUES ($1,'PROVIDER','Cool Air') RETURNING id`, [`ac-${randomUUID()}@kendibo.local`]))[0].id);
+    const pid = String((await q<{ id: string }>(`INSERT INTO provider.provider (user_id, kyc_status, status, kyc_tier) VALUES ($1,'VERIFIED','active',2) RETURNING id`, [uid]))[0].id);
+    await q(`INSERT INTO provider.offering (provider_id, category_id, name, price_kobo) VALUES ($1,'ac','AC service',500000)`, [pid]);
     const res = await app.inject({ method: 'GET', url: '/v1/services?category=ac' });
     const svcs = res.json().data as any[];
     assert.ok(svcs.length >= 1);
