@@ -20,6 +20,7 @@
 // with that number (or creates a CUSTOMER account). Payment is confirmed by
 // the PSP webhook, never by anything typed in the chat.
 import { q } from '../../packages/database/db.js';
+import { expectedChargeKobo, supersedeStalePending } from '../payments/expected-charge.js';
 import { emit } from '../../packages/observability/emit.js';
 import { observability } from '../../packages/observability/watchup.adapter.js';
 import { wa, onMessageSent } from './whatsapp.client.js';
@@ -828,7 +829,8 @@ export async function payLinkPreview(waId: string, bookingId: string): Promise<{
   if (!['REQUESTED', 'PAYMENT_PENDING'].includes(String(b[0].status).toUpperCase())) return { done: 'This booking is already paid or no longer needs payment.' };
   const paid = await q(`SELECT 1 FROM payment.payment WHERE booking_id=$1 AND status='successful' LIMIT 1`, [bookingId]).catch(() => []);
   if (paid[0]) return { done: 'This booking is already paid. Thank you! We will keep you posted here.' };
-  const amount = String(b[0].price_kobo ?? '0').split('.')[0] || '0';
+  // The same expected charge the app checkout uses (accepted quote total, else the booking price).
+  const amount = String(await expectedChargeKobo(bookingId, b[0].price_kobo));
   if (Number(amount) <= 0) return { done: 'Open the Kendibo app to pay for this booking.' };
   const when = b[0].scheduled_at
     ? `${new Date(b[0].scheduled_at).toLocaleDateString('en-NG', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'Africa/Lagos' })}${b[0].time_window ? `, ${b[0].time_window}` : ''}`
@@ -853,8 +855,9 @@ export async function payLinkTarget(waId: string, bookingId: string): Promise<{ 
   if (!['REQUESTED', 'PAYMENT_PENDING'].includes(String(b[0].status).toUpperCase())) return { done: 'This booking is already paid or no longer needs payment.' };
   const paid = await q(`SELECT 1 FROM payment.payment WHERE booking_id=$1 AND status='successful' LIMIT 1`, [bookingId]).catch(() => []);
   if (paid[0]) return { done: 'This booking is already paid. Thank you! We will keep you posted here.' };
-  const amount = BigInt(String(b[0].price_kobo ?? '0').split('.')[0] || '0');
+  const amount = await expectedChargeKobo(bookingId, b[0].price_kobo);
   if (!deps || amount <= 0n) return { done: 'Open the Kendibo app to pay for this booking.' };
+  await supersedeStalePending(bookingId, amount); // an open request for an older price must never settle this booking
   const email = await q<{ email: string | null }>(`SELECT email FROM identity.users WHERE id=$1`, [b[0].user_id]);
   const session = await deps.createCheckout({
     bookingId, amountKobo: amount, ...(email[0]?.email ? { customerEmail: email[0].email } : {}),
@@ -1093,12 +1096,13 @@ export async function notifyRequestAccepted(requestId: string, bookingId: string
     return;
   }
   const b = await q<{ price_kobo: string | null; total_kobo: string | null }>(`SELECT * FROM booking.booking WHERE id=$1`, [bookingId]).catch(() => []);
-  const amount = BigInt(String(b[0]?.price_kobo ?? b[0]?.total_kobo ?? '0').split('.')[0] || '0');
+  const amount = b[0] ? await expectedChargeKobo(bookingId, b[0].price_kobo ?? b[0].total_kobo ?? '0') : 0n;
   const email = await q<{ email: string | null }>(`SELECT email FROM identity.users WHERE id=$1`, [r.user_id]);
   if (!deps || amount <= 0n) {
     await notifyCustomer(to, `${who} accepted your job. Open the Kendibo app to confirm and pay.`);
     return;
   }
+  await supersedeStalePending(bookingId, amount);
   const session = await deps.createCheckout({
     bookingId, amountKobo: amount, ...(email[0]?.email ? { customerEmail: email[0].email } : {}),
     purpose: 'booking', metadata: { source: 'whatsapp' }, idempotencyKey: `wa_accept_${bookingId}`,
