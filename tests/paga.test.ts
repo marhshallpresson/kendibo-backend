@@ -1,6 +1,6 @@
 // Paga integration (sandbox): hashing per endpoint, adapter mapping, routing
 // (test accounts only), callbacks, refunds and payouts. Paga's HTTP is stubbed.
-import { describe, it, before, after, beforeEach } from 'node:test';
+import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import crypto, { randomUUID } from 'node:crypto';
 import { PagaClient, pagaHash, koboToNairaString, nairaToKobo, type PagaConfig } from '../modules/payments/paga/client.js';
@@ -81,7 +81,7 @@ describe('PagaAdapter', () => {
     assert.equal(body.amount, 15000);
     assert.deepEqual(body.paymentMethods, ['BANK_TRANSFER']);
     assert.equal(body.payerCollectionFeeShare + body.payeeCollectionFeeShare, 1);
-    assert.equal(calls[0].headers.hash, sha512('bk_115000NGN2348030000000ada@example.comhash_test'));
+    assert.equal(calls[0].headers.hash, sha512('bk_115000NGN08030000000ada@example.comhash_test'));
     assert.equal(s.psp, 'paga');
     assert.equal(s.checkoutId, 'bk_1');
     assert.equal(s.details?.accountNumber, '3080242757');
@@ -146,52 +146,50 @@ describe('PagaAdapter', () => {
   });
 });
 
-describe('routing: Paga sandbox only for test accounts', () => {
-  const fakeBachs = { name: 'bachs' } as unknown as PaymentPort;
-  const fakePaga = { name: 'paga' } as unknown as PaymentPort;
-  let svc: PaymentService;
+describe('checkout is always Paga', () => {
   const before0 = process.env.PAGA_MODE;
   before(() => { process.env.DATABASE_URL = ''; });
-  beforeEach(() => { svc = new PaymentService({ bachs: fakeBachs, paga: fakePaga }); });
   after(() => { if (before0 === undefined) delete process.env.PAGA_MODE; else process.env.PAGA_MODE = before0; });
 
-  async function booking(customerTest: boolean, proTest: boolean | null): Promise<string> {
-    const cu = String((await q<{ id: string }>(`INSERT INTO identity.users (email, name, is_test) VALUES ($1,'C',$2) RETURNING id`, [`c-${randomUUID()}@kendibo.local`, customerTest]))[0].id);
-    const b = String((await q<{ id: string }>(
-      `INSERT INTO booking.booking (user_id, service_id, price_kobo, price_snapshot, idempotency_key) VALUES ($1,'svc_test',500000,'{}',$2) RETURNING id`,
-      [cu, `idem-${randomUUID()}`],
-    ))[0].id);
-    if (proTest !== null) {
-      const pu = String((await q<{ id: string }>(`INSERT INTO identity.users (email, name, is_test) VALUES ($1,'P',$2) RETURNING id`, [`p-${randomUUID()}@kendibo.local`, proTest]))[0].id);
-      const p = String((await q<{ id: string }>(`INSERT INTO provider.provider (user_id, kyc_status, rating) VALUES ($1,'VERIFIED',5) RETURNING id`, [pu]))[0].id);
-      await q(`INSERT INTO dispatch.assignment (job_id, provider_id, status) VALUES ($1,$2,'accepted')`, [b, p]);
+  it('every purpose goes to Paga whatever PAGA_MODE says, with the owner stored on our row', async () => {
+    const seen: string[] = [];
+    const fake = {
+      name: 'paga',
+      createCheckout: async (input: { reference: string }) => { seen.push(input.reference); return { psp: 'paga', checkoutId: input.reference, checkoutUrl: 'https://pay.test/x', reference: input.reference, status: 'open' }; },
+    } as unknown as PaymentPort;
+    const svc = new PaymentService({ paga: fake });
+    const user = String((await q<{ id: string }>(`INSERT INTO identity.users (email, name) VALUES ($1,'Ada') RETURNING id`, [`c-${randomUUID()}@kendibo.local`]))[0].id);
+    for (const mode of ['off', 'test-accounts', 'all']) {
+      process.env.PAGA_MODE = mode;
+      const s = await svc.createCheckout({ bookingId: 'wallet_topup', purpose: 'topup', amountKobo: 500000n, idempotencyKey: `k-${mode}`, userId: user });
+      assert.equal(s.psp, 'paga');
+      assert.match(s.reference, /^kb_w_[0-9a-f]{24}$/);
     }
-    return b;
-  }
-  const input = (bookingId: string) => ({ bookingId, amountKobo: 500000n, reference: `r_${randomUUID()}`, idempotencyKey: 'k' });
-
-  it('PAGA_MODE=all: every booking on Paga with live keys; on the sandbox it stays test-accounts only', async () => {
-    const envBefore = process.env.PAGA_ENV;
-    process.env.PAGA_MODE = 'all';
-    process.env.PAGA_ENV = 'live';
-    assert.equal(await svc.pspFor(input(await booking(false, false))), 'paga', 'real customer, live keys');
-    assert.equal(await svc.pspFor({ ...input('wallet_topup') }), 'bachs', 'card top-ups stay on Bachs');
-    process.env.PAGA_ENV = 'sandbox';
-    assert.equal(await svc.pspFor(input(await booking(false, false))), 'bachs', 'never sandbox money for real customers');
-    assert.equal(await svc.pspFor(input(await booking(true, true))), 'paga');
-    if (envBefore === undefined) delete process.env.PAGA_ENV; else process.env.PAGA_ENV = envBefore;
+    assert.equal(new Set(seen).size, 3);
+    const row = (await q<{ psp: string; user_id: string }>(`SELECT psp, user_id FROM payment.payment WHERE reference=$1`, [seen[0]]))[0];
+    assert.equal(row.psp, 'paga');
+    assert.equal(row.user_id, user);
   });
 
-  it('PAGA_MODE off (default): always Bachs, even for test accounts', async () => {
-    delete process.env.PAGA_MODE;
-    assert.equal(await svc.pspFor(input(await booking(true, true))), 'bachs');
+  it('passes the real payer name and phone to Paga', async () => {
+    let got: { customerName?: string; metadata?: Record<string, string> } = {};
+    const fake = {
+      name: 'paga',
+      createCheckout: async (input: { reference: string; customerName?: string; metadata?: Record<string, string> }) => { got = input; return { psp: 'paga', checkoutId: input.reference, checkoutUrl: 'https://pay.test/x', reference: input.reference, status: 'open' }; },
+    } as unknown as PaymentPort;
+    const user = String((await q<{ id: string }>(`INSERT INTO identity.users (email, name, phone) VALUES ($1,'Ada Obi','+2348031112222') RETURNING id`, [`c-${randomUUID()}@kendibo.local`]))[0].id);
+    await new PaymentService({ paga: fake }).createCheckout({ bookingId: 'wallet_topup', purpose: 'topup', amountKobo: 100000n, idempotencyKey: 'k-name', userId: user });
+    assert.equal(got.customerName, 'Ada Obi');
+    assert.equal(got.metadata?.phone, '+2348031112222');
   });
-  it('test-accounts mode: Paga only when customer AND pro are test accounts', async () => {
-    process.env.PAGA_MODE = 'test-accounts';
-    assert.equal(await svc.pspFor(input(await booking(true, true))), 'paga');
-    assert.equal(await svc.pspFor(input(await booking(true, null))), 'paga', 'no pro assigned yet');
-    assert.equal(await svc.pspFor(input(await booking(false, true))), 'bachs', 'real customer never reaches sandbox');
-    assert.equal(await svc.pspFor(input(await booking(true, false))), 'bachs', 'real pro never paid from sandbox');
-    assert.equal(await svc.pspFor({ ...input(await booking(true, true)), bookingId: 'wallet_topup' }), 'bachs');
+
+  it('the payment request allows partial and over payments and stays open for 48h by default', async () => {
+    const { f, calls } = stubFetch(() => ({ json: { referenceNumber: 'kb_w_1', statusCode: '0', totalPaymentAmount: 10, paymentMethods: [{ name: 'BANK_TRANSFER', properties: { bankName: 'Paga', AccountNumber: '1' } }] } }));
+    delete process.env.PAGA_PAYMENT_EXPIRY_HOURS;
+    await new PagaAdapter(new PagaClient(CFG, f)).createCheckout({ bookingId: 'b', amountKobo: 1000n, reference: 'kb_w_1', idempotencyKey: 'i' });
+    assert.equal(calls[0].body.isAllowPartialPayments, true);
+    assert.equal(calls[0].body.isAllowOverPayments, true);
+    const hours = (Date.parse(`${calls[0].body.expiryDateTimeUTC}Z`) - Date.now()) / 3600_000;
+    assert.ok(hours > 47.9 && hours <= 48.01, String(hours));
   });
 });

@@ -17,10 +17,10 @@ const schema = z.object({
   JWT_REFRESH_SECRET: z.string().default(''),
   MEDIA_SIGN_SECRET: z.string().default(''),
   STORAGE_DRIVER: z.string().default('local'),
-  BACHS_API_KEY: z.string().default(''),
-  BACHS_BASE_URL: z.string().default('https://sandbox-api.bachs.io'),
-  BACHS_WEBHOOK_SECRET: z.string().default(''),
-  BACHS_ACCOUNT_ID: z.string().default(''),
+  PAGA_PUBLIC_KEY: z.string().default(''),
+  PAGA_SECRET_KEY: z.string().default(''),
+  PAGA_HASH_KEY: z.string().default(''),
+  PAGA_ENV: z.string().default('sandbox'),
   SMTP_HOST: z.string().default(''),
   SMTP_FROM: z.string().default(''),
   SMTP_FROM_NAME: z.string().default('Kendibo'),
@@ -70,7 +70,7 @@ if (config.NODE_ENV === 'production') {
   if (weak.length > 0) console.warn(`[config] SECURITY: secrets shorter than 32 characters: ${weak.join(', ')} — rotate them`);
   if (config.JWT_ACCESS_SECRET === config.JWT_REFRESH_SECRET) console.warn('[config] SECURITY: JWT_ACCESS_SECRET and JWT_REFRESH_SECRET are identical — refresh tokens could pass as access tokens');
   if (config.ALLOW_OTP_DEBUG === 'true') throw new Error('REFUSED TO BOOT — ALLOW_OTP_DEBUG must never be true in production');
-  for (const [k, v] of [['BACHS_API_KEY', config.BACHS_API_KEY], ['SLING_API_TOKEN', config.SLING_API_TOKEN],
+  for (const [k, v] of [['PAGA_SECRET_KEY', config.PAGA_SECRET_KEY], ['SLING_API_TOKEN', config.SLING_API_TOKEN],
       ['SMTP_HOST', config.SMTP_HOST], ['WATCHUP_API_KEY', config.WATCHUP_API_KEY],
       ['PREMBLY_SECRET_KEY', config.PREMBLY_SECRET_KEY || config.PREMBLY_API_KEY]] as const) {
     if (!v) console.warn(`[config] production running without ${k} (related feature degrades safely)`);

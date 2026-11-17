@@ -399,7 +399,7 @@ export function registerVendorRoutes(app: FastifyInstance, h: Helpers) {
   });
 
   // "Pay securely" button of the vendor-accepted template: signed link → a
-  // fresh, idempotent Bachs checkout for this customer's own booking.
+  // fresh, idempotent Paga checkout for this customer's own booking.
   // ── Secure ID check from WhatsApp (NIN typed here, never in the chat) ────────
   const idAttempts = new Map<string, { day: string; n: number }>();
   app.get('/w/verify', async (req, reply) => {

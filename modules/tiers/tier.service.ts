@@ -39,7 +39,7 @@ export type TierPayment = { method: 'wallet'; paid: true } | { method: 'checkout
 
 /** What tier.service needs from PaymentService (passed in by the routes). */
 export interface CheckoutPort {
-  createCheckout(input: { bookingId: string; amountKobo: bigint; customerEmail?: string; customerName?: string; reference: string; idempotencyKey: string; metadata?: Record<string, string> }): Promise<{ checkoutUrl: string | null; reference: string }>;
+  createCheckout(input: { bookingId: string; amountKobo: bigint; purpose?: 'tier' | 'subscription'; userId?: string; customerEmail?: string; customerName?: string; reference?: string; idempotencyKey: string; metadata?: Record<string, string> }): Promise<{ checkoutUrl: string | null; reference: string }>;
 }
 
 export class TierError extends Error {
@@ -358,15 +358,18 @@ export const tierService = {
     let session: { checkoutUrl: string | null; reference: string };
     try {
       session = await payments.createCheckout({
-        bookingId: 'wallet_topup', amountKobo, reference, idempotencyKey: reference,
+        bookingId: 'wallet_topup', amountKobo, reference, idempotencyKey: reference, userId,
+        purpose: reference.startsWith(SUB_REF_PREFIX) ? 'subscription' : 'tier',
         ...(email ? { customerEmail: email } : {}), ...(name ? { customerName: name } : {}),
         metadata: { purpose: reference.startsWith(SUB_REF_PREFIX) ? 'pro_subscription' : 'tier_upgrade' },
       });
-    } catch {
-      throw new TierError('PSP_UNAVAILABLE', 'Payment is unavailable right now. Top up your wallet or try again shortly.', 502);
+    } catch (e) {
+      const notConfigured = (e as { code?: string }).code === 'PSP_UNAVAILABLE';
+      throw new TierError('PSP_UNAVAILABLE', 'Payment is unavailable right now. Top up your wallet or try again shortly.', notConfigured ? 503 : 502);
     }
     if (!session.checkoutUrl) throw new TierError('PSP_UNAVAILABLE', 'Payment is unavailable right now.', 502);
-    return { method: 'checkout', checkoutUrl: session.checkoutUrl, reference };
+    // The payment reference is minted by the payment service; the app polls it.
+    return { method: 'checkout', checkoutUrl: session.checkoutUrl, reference: session.reference };
   },
 
   /** POST /v1/provider/tier/apply */

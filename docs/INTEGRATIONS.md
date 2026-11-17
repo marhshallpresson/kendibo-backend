@@ -17,7 +17,7 @@ production.
 3. **Each environment has its own key set.** Production uses live keys only, staging and dev use
    sandbox keys. A test key in production is reported by the status endpoint.
 4. **Every webhook is signed and checked against the raw body:**
-   - Bachs: `X-Bachs-Signature`, with a 300 s window.
+   - Paga: `the hash in the callback body`, with a 300 s window.
    - Sling: `x-sling-signature` (HMAC) or the shared secret. Rejected in production if the secret is
      unset.
    - WhatsApp: `X-Hub-Signature-256`, keyed with the App Secret.
@@ -30,7 +30,7 @@ production.
 | Integration | Server (SECRET) | Server (CONFIG) | Client (PUBLIC) | Webhook URL to register |
 |---|---|---|---|---|
 | Core | `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`, `MEDIA_SIGN_SECRET`, `KYC_CACHE_SECRET`, `DATABASE_URL`, `REDIS_URL` | `CORS_ORIGINS`, `STOREFRONT_BASE_URL` | `EXPO_PUBLIC_API_URL`, `NEXT_PUBLIC_API_URL` | — |
-| Bachs.io | `BACHS_API_KEY`, `BACHS_WEBHOOK_SECRET` | `BACHS_ACCOUNT_ID`, `BACHS_BASE_URL` | — | `<API>/webhooks/payments/bachs` |
+| Paga | `PAGA_PUBLIC_KEY`, `PAGA_SECRET_KEY` | `PAGA_HASH_KEY`, `PAGA_ENV` | — | `<API>/webhooks/payments/paga` |
 | Prembly | `PREMBLY_SECRET_KEY` (sent as `x-api-key`), `PREMBLY_APP_ID` (sent as `app-id`) | `PREMBLY_ENVIRONMENT` (`sandbox`/`live`), `KYC_COST_*_KOBO`, `KYC_*_BUDGET_KOBO`, `KYC_MAX_ATTEMPTS_PER_DAY`, `KYC_CACHE_DAYS`, `KYC_FEE_PASSTHROUGH` | `PREMBLY_PUBLIC_KEY` (widget/SDK only; unused today) | — |
 | WhatsApp Cloud API | `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_VERIFY_TOKEN` | `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_BUSINESS_ACCOUNT_ID`, `WHATSAPP_GRAPH_VERSION` | — | `<API>/webhooks/whatsapp` (subscribe to `messages`, `message_template_status_update`, `message_template_quality_update`, `template_category_update`) |
 | Facebook Login (same Meta app) | `FACEBOOK_APP_SECRET` (optional, defaults to `WHATSAPP_APP_SECRET`) | `FACEBOOK_APP_ID` | `EXPO_PUBLIC_FACEBOOK_APP_ID` | Data deletion `<API>/v1/auth/facebook/data-deletion`, deauthorize `<API>/v1/auth/facebook/deauthorize` |

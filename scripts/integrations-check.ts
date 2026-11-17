@@ -40,15 +40,10 @@ const count = (j: Record<string, unknown>) => {
 };
 
 async function main() {
-  await check('Bachs (payments)', ['BACHS_API_KEY'], async () => {
-    const base = env('BACHS_BASE_URL') || 'https://sandbox-api.bachs.io';
-    const key = env('BACHS_API_KEY');
-    const j = await json(await fetch(`${base}/v1/reference/banks?country=NG`, {
-      headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' }, signal: timeout(),
-    }), 'bank list');
-    const host = base.includes('sandbox') ? 'sandbox host' : 'LIVE host';
-    const kind = key.startsWith('sk_live') ? 'live key' : key.startsWith('sk_sandbox') ? 'sandbox key' : 'unrecognised key prefix';
-    return `${host}, ${kind}; bank list: ${count(j)} banks${env('BACHS_ACCOUNT_ID') ? '' : '; BACHS_ACCOUNT_ID is not set'}${env('BACHS_WEBHOOK_SECRET') ? '' : '; BACHS_WEBHOOK_SECRET is not set'}`;
+  await check('Paga (payments)', ['PAGA_PUBLIC_KEY', 'PAGA_SECRET_KEY', 'PAGA_HASH_KEY'], async () => {
+    // Paga has no key-only ping (every call is hashed); presence and environment are what we can check offline.
+    const live = env('PAGA_ENV') === 'live';
+    return `${live ? 'LIVE' : 'sandbox'} environment; keys set${env('PAGA_CALLBACK_IPS') ? '; callback IP allowlist on' : '; PAGA_CALLBACK_IPS not set (callbacks not IP-filtered)'}`;
   });
 
   await check('Sling (SMS, notifications)', ['SLING_API_TOKEN'], async () => {

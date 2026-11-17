@@ -1,6 +1,6 @@
 // The whole WhatsApp journey with stubs (no real messages, emails or PSP calls):
 // first message -> consent -> name -> email (+ confirm link) -> request ->
-// location -> day/time -> vendor accepts -> pay (signed Bachs webhook) ->
+// location -> day/time -> vendor accepts -> pay (Paga callback) ->
 // receipt -> 24h reminder -> on the way + start code -> check-in -> completed ->
 // customer DONE -> settlement -> final invoice -> review.
 // Plus: invoice numbering and idempotency, the hosted invoice page, and the
@@ -14,29 +14,24 @@ import { signAccess } from '../packages/auth/auth.js';
 import { providerService } from '../modules/providers/provider.service.js';
 
 // ── Stubs ──────────────────────────────────────────────────────────────────
-// Bachs: webhooks are HMAC-signed with a test secret; the "PSP" answers verify
-// calls from the payment rows we recorded (so the amount check passes).
-const WEBHOOK_SECRET = 'test-bachs-webhook-secret';
+// Paga: the callback hash is faked with a shared test header; the "PSP" answers /status
+// from the payment rows we recorded and the callback carries the amount received.
+const CALLBACK_KEY = 'test-paga-callback-key';
 const fakePsp = {
-  name: 'bachs',
-  createCheckout: async (input: { reference: string }) => ({ psp: 'bachs', checkoutId: `chk_${input.reference}`, checkoutUrl: `https://pay.test/c/${input.reference}`, reference: input.reference, status: 'open' }),
-  getCheckout: async (checkoutId: string, reference: string) => ({ psp: 'bachs', checkoutId, checkoutUrl: `https://pay.test/c/${reference}`, reference, status: 'open' }),
+  name: 'paga',
+  createCheckout: async (input: { reference: string }) => ({ psp: 'paga', checkoutId: input.reference, checkoutUrl: `https://pay.test/c/${input.reference}`, reference: input.reference, status: 'open' }),
+  getCheckout: async (checkoutId: string, reference: string) => ({ psp: 'paga', checkoutId, checkoutUrl: `https://pay.test/c/${reference}`, reference, status: 'open' }),
   verifyByReference: async (reference: string) => verified(reference),
-  verifyByChargeId: async (chargeId: string) => verified(chargeId.replace(/^ch_/, '')),
+  verifyByChargeId: async (chargeId: string) => verified(chargeId),
   refund: async () => ({ refundId: 'rf_test', status: 'processing' }),
   createPayout: async () => ({ payoutId: 'pay_test', status: 'pending' }),
-  verifyWebhookSignature: (raw: Buffer, headers: Record<string, string | undefined>) => {
-    const ts = String(headers['x-bachs-timestamp'] ?? '');
-    const want = crypto.createHmac('sha256', WEBHOOK_SECRET).update(`${ts}.${raw.toString('utf8')}`).digest('hex');
-    const got = String(headers['x-bachs-signature'] ?? '');
-    return got.length === want.length && crypto.timingSafeEqual(Buffer.from(got), Buffer.from(want));
-  },
+  verifyWebhookSignature: (_raw: Buffer, headers: Record<string, string | undefined>) => headers['x-test-callback-key'] === CALLBACK_KEY,
 };
 async function verified(reference: string) {
   const r = await q<{ amount_kobo: string }>(`SELECT amount_kobo FROM payment.payment WHERE reference=$1`, [reference]);
-  return { psp: 'bachs', chargeId: `ch_${reference}`, reference, amountKobo: BigInt(String(r[0]?.amount_kobo ?? '0')), currency: 'NGN', status: r[0] ? 'successful' : 'failed' };
+  return { psp: 'paga', chargeId: reference, reference, amountKobo: BigInt(String(r[0]?.amount_kobo ?? '0')), currency: 'NGN', status: r[0] ? 'successful' : 'failed', code: r[0] ? '0' : '-2' };
 }
-(globalThis as Record<string, unknown>).__PSP__ = { bachs: fakePsp };
+(globalThis as Record<string, unknown>).__PSP__ = { paga: fakePsp };
 
 process.env.NODE_ENV = 'test';
 // This journey walks the full onboarding (consent, name, email); the default is the light one.
@@ -110,10 +105,9 @@ async function onlinePro(phone?: string) {
 }
 
 async function signedWebhook(reference: string): Promise<Res> {
-  const body = JSON.stringify({ id: `evt_${randomUUID()}`, type: 'payment.succeeded', data: { reference, payment_id: `ch_${reference}` } });
-  const ts = String(Math.floor(Date.now() / 1000));
-  const sig = crypto.createHmac('sha256', WEBHOOK_SECRET).update(`${ts}.${body}`).digest('hex');
-  return app.inject({ method: 'POST', url: '/webhooks/payments/bachs', headers: { 'content-type': 'application/json', 'x-bachs-timestamp': ts, 'x-bachs-signature': sig }, payload: body });
+  const amount = Number((await q<{ amount_kobo: string }>(`SELECT amount_kobo FROM payment.payment WHERE reference=$1`, [reference]))[0].amount_kobo) / 100;
+  const body = JSON.stringify({ notificationId: randomUUID(), statusCode: '0', externalReferenceNumber: reference, state: 'CONSUMED', outstandingBalance: 0, paymentAmount: amount, cumulativePaymentAmount: amount });
+  return app.inject({ method: 'POST', url: '/webhooks/payments/paga', headers: { 'content-type': 'application/json', 'x-test-callback-key': CALLBACK_KEY }, payload: body });
 }
 
 describe('WhatsApp journey, first message to final invoice', () => {
@@ -181,11 +175,14 @@ describe('WhatsApp journey, first message to final invoice', () => {
     assert.match(r, /accepted your job\. Pay ₦[\d,.]+ to confirm/);
     assert.ok(ctas.some((c) => c.to === w && /pay\.test/.test(c.url)), 'pay button sent');
 
-    // 5. Pay: the signed Bachs webhook -> receipt on WhatsApp (link) and by email.
-    const reference = `bk_${bookingId}_wa`;
-    const unsigned = await app.inject({ method: 'POST', url: '/webhooks/payments/bachs', headers: { 'content-type': 'application/json' }, payload: JSON.stringify({ id: 'x', data: { reference } }) });
-    assert.equal(unsigned.statusCode, 401, 'an unsigned webhook is refused');
-    r = await sent(w, async () => assert.equal((await signedWebhook(reference)).statusCode, 200));
+    // 5. Pay: the Paga callback -> receipt on WhatsApp (link) and by email.
+    const reference = String((await q<{ reference: string }>(`SELECT reference FROM payment.payment WHERE booking_id=$1`, [bookingId]))[0].reference);
+    assert.match(reference, /^kb_b_[0-9a-f]{24}$/, 'server-minted reference');
+    const unsigned = await app.inject({ method: 'POST', url: '/webhooks/paga-unused', headers: { 'content-type': 'application/json' }, payload: '{}' });
+    const forged = await app.inject({ method: 'POST', url: '/webhooks/payments/paga', headers: { 'content-type': 'application/json' }, payload: JSON.stringify({ notificationId: 'x', externalReferenceNumber: reference }) });
+    assert.equal(forged.statusCode, 401, 'an unsigned webhook is refused');
+    assert.equal(unsigned.statusCode, 404);
+    r = await sentSoon(w, async () => assert.equal((await signedWebhook(reference)).statusCode, 200), /Payment received/);
     assert.match(r, /Payment received: ₦[\d,.]+\. Kendibo holds it safely until you confirm the job is done\. Your receipt is KND-\d{4}-\d{6}/);
     assert.match(r, /View receipt/);
     const receiptCta = ctas.filter((c) => c.to === w && /\/w\/invoice\//.test(c.url));
@@ -198,7 +195,7 @@ describe('WhatsApp journey, first message to final invoice', () => {
     assert.match(receiptPage.body, /Payment receipt/);
     assert.match(receiptPage.body, /holds this payment until you confirm/);
     // A webhook replay sends nothing new.
-    assert.equal(await sent(w, () => signedWebhook(reference)), '');
+    assert.equal(await sent(w, async () => { await signedWebhook(reference); await new Promise((res) => setTimeout(res, 400)); }), '');
 
     // 6. 24h reminder (the sweeper with an advanced clock): date, window, address, prep, start code.
     const { reminderSweep } = await import('../modules/job-engine/journey.js');
@@ -293,7 +290,7 @@ async function paidBooking(opts: { phone?: string; proPhone?: string } = {}) {
   assert.equal(acc.statusCode, 200, acc.body);
   const bookingId = String(acc.json().data.bookingId);
   const price = (await q<{ p: string }>(`SELECT price_kobo AS p FROM booking.booking WHERE id=$1`, [bookingId]))[0].p;
-  await q(`INSERT INTO payment.payment (booking_id, psp, reference, amount_kobo, status) VALUES ($1,'bachs',$2,$3,'successful')`, [bookingId, `bk_${bookingId}_t`, String(price)]);
+  await q(`INSERT INTO payment.payment (booking_id, psp, reference, amount_kobo, status) VALUES ($1,'paga',$2,$3,'successful')`, [bookingId, `bk_${bookingId}_t`, String(price)]);
   return { bookingId, customerId: cust, token, pro };
 }
 
@@ -312,7 +309,7 @@ describe('invoices', () => {
     assert.equal(n(rb!.number), n(ra!.number) + 1, 'next number');
     // An approved extra (paid separately) shows on the final invoice; a declined one does not.
     await q(`INSERT INTO booking.change_order (job_id, reason, amount_kobo, status) VALUES ($1,'Replace drain pipe',500000,'approved'), ($1,'Gas top-up',900000,'declined')`, [a.bookingId]);
-    await q(`INSERT INTO payment.payment (booking_id, psp, reference, amount_kobo, status) VALUES ($1,'bachs',$2,500000,'successful')`, [a.bookingId, `co_${a.bookingId}_t`]);
+    await q(`INSERT INTO payment.payment (booking_id, psp, reference, amount_kobo, status) VALUES ($1,'paga',$2,500000,'successful')`, [a.bookingId, `co_${a.bookingId}_t`]);
     const fa = await issueInvoice(a.bookingId, 'final');
     assert.notEqual(fa!.id, ra!.id, 'final is its own document');
     const price = BigInt(fa!.data.lines[0].amountKobo);

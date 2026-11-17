@@ -151,7 +151,7 @@ export function renderTermsPage(nonce: string): string {
 }
 
 /**
- * Where Bachs sends the customer after checkout. WhatsApp payers go back to
+ * Where a checkout link sends the customer back. WhatsApp payers go back to
  * the chat; app payers are handed back to the app (the kendibo:// link closes
  * the in-app checkout browser; a web popup closes itself).
  */

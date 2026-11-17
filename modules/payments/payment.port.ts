@@ -1,9 +1,12 @@
 // PaymentPort — every PSP behind this interface. No business module imports an SDK.
-// PSPs: BachsAdapter (live today) and PagaAdapter (sandbox, test accounts only until
-// Paga live approval). Flutterwave removed Oct 2026. Paystack is NOT supported.
+// Paga is the only PSP. Historical rows written by a retired card PSP carry
+// psp='legacy_card' and are only ever read, never created.
 import type { Kobo } from './money.js';
 
-export type PSP = 'bachs' | 'paga';
+export type PSP = 'paga';
+
+/** What a checkout pays for. Decided by the server from our own records, never by the client. */
+export type CheckoutPurpose = 'booking' | 'topup' | 'tier' | 'subscription';
 
 export interface CreateCheckoutInput {
   bookingId: string;
@@ -11,17 +14,17 @@ export interface CreateCheckoutInput {
   currency?: 'NGN';
   customerEmail?: string;
   customerName?: string;
-  reference: string; // our idempotency reference, max 128 chars
+  reference: string; // minted by PaymentService (kb_<purpose>_<hash>), max 128 chars
   metadata?: Record<string, string>;
   idempotencyKey: string;
-  /** Paying user, stored on the payment row (wallet top-ups credit this user). */
+  /** Paying user, stored on the payment row; settlement always credits this user. */
   userId?: string;
 }
 
 export interface CheckoutSession {
   psp: PSP;
   checkoutId: string;
-  checkoutUrl: string | null; // hosted checkout (Bachs) or our pay page (Paga bank transfer)
+  checkoutUrl: string | null; // our signed pay page (Paga bank transfer)
   reference: string;
   status: 'open' | 'pending';
   /** PSP payment instructions to keep with the payment row (e.g. Paga account number). */
@@ -32,15 +35,22 @@ export interface VerifiedPayment {
   psp: PSP;
   chargeId: string;
   reference: string;
+  /** Amount of the payment request (what we asked for, not what was received). */
   amountKobo: Kobo;
   currency: 'NGN';
-  status: 'successful' | 'failed' | 'pending';
+  /**
+   * successful = paid; partial = Paga reports a partial payment (code 2);
+   * failed = terminal and unpaid (expired / cancelled); pending = anything else, including unknown codes.
+   */
+  status: 'successful' | 'partial' | 'failed' | 'pending';
+  /** Raw Paga status code, for diagnostics. */
+  code: string;
 }
 
 export interface RefundInput {
   chargeId: string;
   reference: string;
-  amountKobo?: Kobo; // omit = full refund (Bachs: one refund per charge)
+  amountKobo?: Kobo; // omit = full refund
   reason?: string;
   idempotencyKey: string;
 }

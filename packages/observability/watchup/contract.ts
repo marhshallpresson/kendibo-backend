@@ -1,5 +1,5 @@
 // WatchUp ingest contract — mirrored from the official SDK
-// (watchup 2.1.0, https://docs.bachs.io-style docs at watchup.site/docs).
+// (watchup 2.1.0, docs at watchup.site/docs).
 // Base: https://api.watchup.site | POST /api/v1/ingest/batch
 // Auth: Authorization: Bearer <key> + X-Api-Key: <key> + Idempotency-Key.
 // Kinds: errors | traces | events. Batched <=100 items, redaction +

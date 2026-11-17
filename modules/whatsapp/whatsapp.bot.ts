@@ -60,7 +60,7 @@ export interface InboundMessage {
 }
 
 interface Deps {
-  createCheckout: (input: { bookingId: string; amountKobo: bigint; customerEmail?: string; reference: string; idempotencyKey: string }) => Promise<{ checkoutUrl?: string | null; psp?: string }>;
+  createCheckout: (input: { bookingId: string; amountKobo: bigint; customerEmail?: string; purpose?: 'booking'; metadata?: Record<string, string>; idempotencyKey: string }) => Promise<{ checkoutUrl?: string | null; psp?: string }>;
 }
 let deps: Deps | null = null;
 export function configureWhatsappBot(d: Deps) { deps = d; }
@@ -842,7 +842,7 @@ export async function payLinkPreview(waId: string, bookingId: string): Promise<{
 }
 
 /**
- * Where the template's "Pay securely" button goes: a fresh (idempotent) Bachs
+ * Where the template's "Pay securely" button goes: a fresh (idempotent) Paga
  * checkout for this customer's own booking, or null if it is not payable.
  */
 export async function payLinkTarget(waId: string, bookingId: string): Promise<{ url: string } | { done: string }> {
@@ -858,7 +858,7 @@ export async function payLinkTarget(waId: string, bookingId: string): Promise<{ 
   const email = await q<{ email: string | null }>(`SELECT email FROM identity.users WHERE id=$1`, [b[0].user_id]);
   const session = await deps.createCheckout({
     bookingId, amountKobo: amount, ...(email[0]?.email ? { customerEmail: email[0].email } : {}),
-    reference: `bk_${bookingId}_wa`, idempotencyKey: `wa_accept_${bookingId}`,
+    purpose: 'booking', metadata: { source: 'whatsapp' }, idempotencyKey: `wa_accept_${bookingId}`,
   });
   return session.checkoutUrl ? { url: session.checkoutUrl } : { done: 'Open the Kendibo app to pay for this booking.' };
 }
@@ -1071,7 +1071,7 @@ export async function sweepInbound(now = Date.now()): Promise<number> {
 
 /**
  * A vendor accepted a request that came in over WhatsApp: tell the customer,
- * and send the secure Bachs checkout link when the job has a fixed price.
+ * and send the secure Paga checkout link when the job has a fixed price.
  * Quote-first jobs get a "they'll inspect and quote" note instead.
  */
 export async function notifyRequestAccepted(requestId: string, bookingId: string | null): Promise<void> {
@@ -1101,7 +1101,7 @@ export async function notifyRequestAccepted(requestId: string, bookingId: string
   }
   const session = await deps.createCheckout({
     bookingId, amountKobo: amount, ...(email[0]?.email ? { customerEmail: email[0].email } : {}),
-    reference: `bk_${bookingId}_wa`, idempotencyKey: `wa_accept_${bookingId}`,
+    purpose: 'booking', metadata: { source: 'whatsapp' }, idempotencyKey: `wa_accept_${bookingId}`,
   });
   if (!session.checkoutUrl) {
     await notifyCustomer(to, `${who} accepted your job. Open the Kendibo app to confirm and pay.`);

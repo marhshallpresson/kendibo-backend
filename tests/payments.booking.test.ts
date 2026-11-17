@@ -10,20 +10,21 @@ import { bookingService } from '../modules/bookings/booking.service.js';
 import { q } from '../packages/database/db.js';
 import { signAccess } from '../packages/auth/auth.js';
 
+type Verified = { psp: string; chargeId: string; reference: string; amountKobo: bigint; currency: string; status: string; code: string };
 const fakePsp = {
-  name: 'bachs',
+  name: 'paga',
   createCheckout: async (input: { reference: string }) => ({
-    psp: 'bachs', checkoutId: `chk_test_${input.reference}`,
+    psp: 'paga', checkoutId: `chk_test_${input.reference}`,
     checkoutUrl: 'https://pay.test/checkout', reference: input.reference, status: 'open',
   }),
-  getCheckout: async (checkoutId: string, reference: string) => ({ psp: 'bachs', checkoutId, checkoutUrl: 'https://pay.test/checkout', reference, status: 'open' }),
-  verifyByReference: async (reference: string) => ({ psp: 'bachs', chargeId: `ch_${reference}`, reference, amountKobo: 0n, currency: 'NGN', status: 'pending' }),
-  verifyByChargeId: async (chargeId: string) => ({ psp: 'bachs', chargeId, reference: chargeId, amountKobo: 0n, currency: 'NGN', status: 'pending' }),
+  getCheckout: async (checkoutId: string, reference: string) => ({ psp: 'paga', checkoutId, checkoutUrl: 'https://pay.test/checkout', reference, status: 'open' }),
+  verifyByReference: async (reference: string): Promise<Verified> => ({ psp: 'paga', chargeId: reference, reference, amountKobo: 0n, currency: 'NGN', status: 'pending', code: '1' }),
+  verifyByChargeId: async (chargeId: string): Promise<Verified> => ({ psp: 'paga', chargeId, reference: chargeId, amountKobo: 0n, currency: 'NGN', status: 'pending', code: '1' }),
   refund: async () => ({ refundId: 'rf_test', status: 'processing' }),
   createPayout: async () => ({ payoutId: 'pay_test', status: 'pending' }),
   verifyWebhookSignature: () => true,
 };
-(globalThis as Record<string, unknown>).__PSP__ = { bachs: fakePsp };
+(globalThis as Record<string, unknown>).__PSP__ = { paga: fakePsp };
 
 // Isolate BEFORE importing main.js (which loads dotenv + touches the DB).
 process.env.NODE_ENV = 'test';
@@ -62,22 +63,6 @@ async function createBooking(userId: string) {
 }
 
 describe('booking payments are server-priced', () => {
-  it('omits a fabricated customer from Bachs guest checkout', async () => {
-    const { BachsAdapter } = await import('../modules/payments/bachs.adapter.js');
-    const originalFetch = globalThis.fetch;
-    let sent: Record<string, unknown> | undefined;
-    try {
-      globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
-        sent = JSON.parse(String(init?.body));
-        return new Response(JSON.stringify({ checkout_id: 'chk_guest', checkout_url: 'https://pay.test/guest' }), { status: 200 });
-      }) as typeof fetch;
-      await new BachsAdapter().createCheckout({ bookingId: randomUUID(), amountKobo: 5000n, reference: 'guest_ref', idempotencyKey: 'guest_idem' });
-      assert.ok(sent);
-      assert.equal('customer' in sent, false);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
   it('creates a storefront WhatsApp link from a formatted business number', async () => {
     const { waConnect } = await import('../modules/storefront/storefront.service.js');
     const previous = process.env.WHATSAPP_BUSINESS_NUMBER;
@@ -91,26 +76,23 @@ describe('booking payments are server-priced', () => {
       else process.env.WHATSAPP_BUSINESS_NUMBER = previous;
     }
   });
-  it('does not accept a verified PSP payment that has no matching local payment', async () => {
+  it('does not settle a payment reference we never issued', async () => {
     const { PaymentService } = await import('../modules/payments/payment.service.js');
-    const ref = `unknown_${randomUUID()}`;
-    const adapter = { ...fakePsp, verifyByChargeId: async () => ({ psp: 'bachs', chargeId: 'ch_unknown', reference: ref, amountKobo: 100n, currency: 'NGN', status: 'successful' }) };
-    const service = new PaymentService({ bachs: adapter as never });
-    const result = await service.handleWebhook('bachs', Buffer.from(JSON.stringify({ id: randomUUID(), data: { payment_id: 'ch_unknown' } })), {});
-    assert.equal(result.notFound, true);
-    assert.equal(result.verified, undefined);
+    const { PaymentSettlement } = await import('../modules/payments/settlement.js');
+    const settlement = new PaymentSettlement(new PaymentService({ paga: fakePsp as never }), { confirm: async () => {}, notify: async () => {}, track: () => {} });
+    assert.equal((await settlement.settle(`kb_b_${randomUUID().replace(/-/g, '').slice(0, 24)}`)).status, 'not_found');
   });
   it('recovers a checkout on replay and rejects a changed amount', async () => {
     const { PaymentService } = await import('../modules/payments/payment.service.js');
-    const payments = new PaymentService({ bachs: fakePsp as never });
+    const payments = new PaymentService({ paga: fakePsp as never });
     const booking = await createBooking(await testUser());
-    const input = { bookingId: booking.id, amountKobo: BigInt(booking.priceKobo), reference: `replay_${randomUUID()}`, idempotencyKey: `idem_${randomUUID()}` };
+    const input = { bookingId: booking.id, amountKobo: BigInt(booking.priceKobo), idempotencyKey: `idem_${randomUUID()}` };
     const first = await payments.createCheckout(input);
     const replay = await payments.createCheckout(input);
     assert.equal(replay.checkoutUrl, first.checkoutUrl);
     assert.equal(replay.checkoutId, first.checkoutId);
     await assert.rejects(() => payments.createCheckout({ ...input, amountKobo: input.amountKobo + 1n }), /PAYMENT_REFERENCE_CONFLICT/);
-    const expired = new PaymentService({ bachs: { ...fakePsp, getCheckout: async () => { throw new Error('CHECKOUT_NOT_OPEN'); } } as never });
+    const expired = new PaymentService({ paga: { ...fakePsp, getCheckout: async () => { throw new Error('CHECKOUT_NOT_OPEN'); } } as never });
     await assert.rejects(() => expired.createCheckout(input), /CHECKOUT_NOT_OPEN/);
   });
   it('charges the server price even when the client sends its own total', async () => {
@@ -126,12 +108,14 @@ describe('booking payments are server-priced', () => {
       payload: { amountKobo: clientTotal, email: 'buyer@kendibo.test' },
     });
     assert.equal(res.statusCode, 200, 'a mismatched client total must not strand the payment');
-    assert.ok(res.json().data.checkoutUrl, 'hosted checkout url is returned');
+    assert.ok(res.json().data.checkoutUrl, 'pay page url is returned');
 
     // pg-mem misses indexed TEXT lookups; scan + filter in JS.
-    const rows = await q<Record<string, unknown>>(`SELECT reference, amount_kobo FROM payment.payment`);
-    const intent = rows.find((r) => String(r.reference).startsWith(`bk_${booking.id}_`));
+    const rows = await q<Record<string, unknown>>(`SELECT reference, amount_kobo, booking_id, user_id FROM payment.payment`);
+    const intent = rows.find((r) => String(r.booking_id) === String(booking.id));
     assert.ok(intent, 'a payment intent was recorded');
+    assert.match(String(intent!.reference), /^kb_b_[0-9a-f]{24}$/, 'server-minted reference');
+    assert.equal(String(intent!.user_id), owner, 'payer is read from our booking, not the client');
     assert.equal(
       String(intent!.amount_kobo),
       String(booking.priceKobo),
@@ -139,7 +123,7 @@ describe('booking payments are server-priced', () => {
     );
   });
 
-  it('accepts the server-priced amount and returns a Bachs checkout session', async () => {
+  it('accepts the server-priced amount and returns a Paga checkout session', async () => {
     const owner = await testUser();
     const booking = await createBooking(owner);
 
@@ -150,8 +134,8 @@ describe('booking payments are server-priced', () => {
       payload: { amountKobo: String(booking.priceKobo), email: 'buyer@kendibo.test' },
     });
     assert.equal(res.statusCode, 200);
-    assert.equal(res.json().data.psp, 'bachs');
-    assert.ok(res.json().data.checkoutUrl, 'hosted checkout url is returned');
+    assert.equal(res.json().data.psp, 'paga');
+    assert.ok(res.json().data.checkoutUrl, 'pay page url is returned');
   });
 
   it('confirms a paid checkout without the webhook, settles once, and returns the customer', async () => {
@@ -168,8 +152,19 @@ describe('booking payments are server-priced', () => {
     const recorded = await q<{ amount_kobo: string; status: string; psp: string }>(`SELECT amount_kobo, status, psp FROM payment.payment WHERE reference=$1`, [reference]);
     assert.equal(recorded[0]?.status, 'pending', `intent recorded as pending (${JSON.stringify(recorded[0])})`);
     const original = fakePsp.verifyByReference;
-    fakePsp.verifyByReference = async (ref: string) => ({ psp: 'bachs', chargeId: `ch_${ref}`, reference: ref, amountKobo: BigInt(String(recorded[0].amount_kobo)), currency: 'NGN', status: 'successful' });
+    fakePsp.verifyByReference = async (ref: string) => ({ psp: 'paga', chargeId: ref, reference: ref, amountKobo: BigInt(String(recorded[0].amount_kobo)), currency: 'NGN', status: 'successful', code: '0' });
     try {
+      // Paga's callback carries the amount; settle runs in the background after the 200.
+      const cb = await app.inject({ method: 'POST', url: '/webhooks/payments/paga', headers: { 'content-type': 'application/json' }, payload: {
+        notificationId: randomUUID(), statusCode: '0', externalReferenceNumber: reference, state: 'CONSUMED', outstandingBalance: 0,
+        paymentAmount: Number(recorded[0].amount_kobo) / 100, cumulativePaymentAmount: Number(recorded[0].amount_kobo) / 100, hash: 'x',
+      } });
+      assert.equal(cb.statusCode, 200);
+      assert.equal(cb.json().status, 'SUCCESS');
+      for (let i = 0; i < 40; i++) { // the settlement runs after the acknowledgement
+        if ((await q<{ status: string }>(`SELECT status FROM payment.payment WHERE reference=$1`, [reference]))[0]?.status === 'successful') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
       const page = await app.inject({ method: 'GET', url: `/w/payment-return?reference=${encodeURIComponent(reference)}` });
       assert.equal(page.statusCode, 200);
       assert.match((page as unknown as { body: string }).body, /Payment received/);
@@ -177,6 +172,7 @@ describe('booking payments are server-priced', () => {
 
       const status = await app.inject({ method: 'GET', url: `/v1/payments/${encodeURIComponent(reference)}`, headers: auth(owner) });
       assert.equal(status.json().data.status, 'successful');
+      assert.equal(status.json().data.receivedKobo, String(recorded[0].amount_kobo));
       const journals = await q(`SELECT 1 FROM ledger.journal WHERE reference=$1`, [reference]);
       assert.equal(journals.length, 1, 'collection is posted exactly once');
     } finally {

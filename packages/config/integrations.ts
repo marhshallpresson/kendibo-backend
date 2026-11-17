@@ -27,12 +27,12 @@ export const INTEGRATIONS: Integration[] = [
     ],
   },
   {
-    id: 'bachs', name: 'Bachs.io (payments)', purpose: 'Checkout, transfers to virtual accounts, verify, refunds, payouts, bank list', docs: 'https://docs.bachs.io',
+    id: 'paga', name: 'Paga (payments)', purpose: 'Bank-transfer checkout, payment status, refunds, payouts, bank list', docs: 'https://developer-docs.paga.com',
     keys: [
-      { env: 'BACHS_API_KEY', exposure: 'secret', requiredInProd: true, note: 'sk_live_… in prod, sk_sandbox_… elsewhere' },
-      { env: 'BACHS_WEBHOOK_SECRET', exposure: 'secret', requiredInProd: true, note: 'whsec_…; signs X-Bachs-Signature' },
-      { env: 'BACHS_ACCOUNT_ID', exposure: 'config', requiredInProd: true, note: 'acct_…' },
-      { env: 'BACHS_BASE_URL', exposure: 'config', requiredInProd: true, note: 'Live vs sandbox host — must match the key' },
+      { env: 'PAGA_PUBLIC_KEY', exposure: 'secret', requiredInProd: true, note: 'Collect/Business public key for the chosen PAGA_ENV' },
+      { env: 'PAGA_SECRET_KEY', exposure: 'secret', requiredInProd: true, note: 'Collect/Business secret key' },
+      { env: 'PAGA_HASH_KEY', exposure: 'secret', requiredInProd: true, note: 'Signs requests and callbacks (SHA-512)' },
+      { env: 'PAGA_ENV', exposure: 'config', requiredInProd: true, note: 'sandbox or live; must match the keys' },
     ],
   },
   {

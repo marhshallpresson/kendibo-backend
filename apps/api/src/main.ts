@@ -4,7 +4,7 @@ import Fastify, { FastifyReply } from 'fastify';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import { z } from 'zod';
-import { PaymentService } from '../../../modules/payments/payment.service.js';
+import { PaymentService, PspUnavailableError } from '../../../modules/payments/payment.service.js';
 import { postCollection, postSettlement, trialBalance, openPeriod, currentPeriod } from '../../../modules/ledger/ledger.service.js';
 import { transition, type JobStatus } from '../../../modules/job-engine/job.machine.js';
 import { whyNot, checkStartCode, ensureStartCode, afterTransition, confirmCompletion, startCompletionSweeper } from '../../../modules/job-engine/job-guard.js';
@@ -25,7 +25,8 @@ import { geoService } from '../../../modules/geo/geo.service.js';
 import { payoutService } from '../../../modules/payouts/payout.service.js';
 import { refundService } from '../../../modules/refunds/refund.service.js';
 import { walletService } from '../../../modules/wallet/wallet.service.js';
-import { settleWalletTopup, isWalletTopupRef } from '../../../modules/payments/wallet-topup.js';
+import { PaymentSettlement } from '../../../modules/payments/settlement.js';
+import { startPaymentReconciler } from '../../../modules/payments/reconciler.js';
 import { disputeService, reviewService } from '../../../modules/disputes/trust.service.js';
 import { messagingService } from '../../../modules/messaging/messaging.service.js';
 import { notificationService, TEMPLATES, type NotificationChannel } from '../../../modules/notifications/notification.service.js';
@@ -67,7 +68,7 @@ import { onEmit } from '../../../packages/observability/emit.js';
 import { registerAdminPasswordRoutes, ADMIN_PASSWORD_POLICY } from './admin-password.routes.js';
 import { registerTierRoutes, TIER_ROUTE_POLICY } from './tier.routes.js';
 import { registerPricingSettingsRoutes } from './pricing-settings.routes.js';
-import { tierService, TIER_REF_PREFIX, SUB_REF_PREFIX } from '../../../modules/tiers/tier.service.js';
+import { tierService } from '../../../modules/tiers/tier.service.js';
 import { registerAdminConsoleRoutes, ADMIN_CONSOLE_POLICY, accountGate, refreshGate, adminLogin, sendLocked, clientIp, auditQuerySchema } from './admin-console.routes.js';
 import { installAdminAlerts } from '../../../modules/notifications/admin-alerts.service.js';
 import { startLifecycleSweeper } from '../../../modules/notifications/lifecycle.service.js';
@@ -287,7 +288,6 @@ const ROUTE_POLICY: Record<string, RoutePolicy> = {
   'GET /v1/provider/:id/gallery': 'public',
   'GET /v1/banks': 'public',
   'GET /v1/media/:id/file': 'public', // HMAC-signed URL checked in the handler
-  'POST /webhooks/payments/bachs': 'public', // PSP signature checked in the handler
   'POST /webhooks/payments/paga': 'public', // Paga body hash checked in the handler
   'POST /webhooks/paga/transfer': 'public', // x-paga-hash checked in the handler
   'GET /w/paga/pay': 'public', // signed link (purpose 'paga'); shows pay instructions only
@@ -389,7 +389,7 @@ app.get('/health/ready', async (_req, reply) => {
 app.get('/health/dependencies', async () => {
   const w = watchupClient as unknown as { enabled: boolean; environment: string; release: string; queueDepth: number };
   return {
-    bachs: process.env.BACHS_BASE_URL?.includes('sandbox') ? 'sandbox' : 'live', maps: 'adapter', kyc: 'adapter',
+    paga: payments.isConfigured() ? (process.env.PAGA_ENV === 'live' ? 'live' : 'sandbox') : 'not-configured', maps: 'adapter', kyc: 'adapter',
     sms: 'sling', email: 'smtp', push: 'fcm', storage: objectStore.driver,
     sling: slingClient.isConfigured() ? 'live' : 'sandbox-sim',
     whatsapp: 'sling',
@@ -946,7 +946,13 @@ app.post('/v1/quotes/:bookingId/accept', async (req, reply) => {
   return { data: await quoteService.accept(bookingId, version) };
 });
 
-// ---------- payments (Bachs.io — single PSP) ----------
+// ---------- payments (Paga — single PSP) ----------
+/** Checkout could not start: 503 when Paga is not configured, 502 for any other PSP failure. Never another PSP. */
+function checkoutFailure(reply: Parameters<typeof fail>[0], e: unknown) {
+  if (e instanceof PspUnavailableError) return fail(reply, 'PSP_UNAVAILABLE', 'Payments are not available right now', 503, true);
+  observability.captureException(e);
+  return fail(reply, 'PSP_UNAVAILABLE', 'Provider unavailable', 502, true);
+}
 // Server-authoritative charge amount: the accepted quote total when one exists
 // (quote flow), otherwise the frozen booking price snapshot. The client amount
 // is advisory ONLY — a stale bundle may still send its own math, and charging
@@ -981,80 +987,80 @@ app.post('/v1/bookings/:id/payments', async (req, reply) => {
     observability.captureMessage?.(`payment.amount_mismatch booking=${bookingId} client=${sent} server=${expected}`);
   }
   try {
+    // The payer is the booking's own customer (read from our row); the reference is minted by the server.
     const session = await payments.createCheckout({
-      bookingId, amountKobo: expected,
-      customerEmail: parsed.data.email, reference: `bk_${bookingId}_${idem.slice(0, 24)}`, idempotencyKey: idem,
+      bookingId, purpose: 'booking', amountKobo: expected,
+      customerEmail: parsed.data.email, idempotencyKey: idem,
     });
     observability.track('booking.payment_initiated', { psp: session.psp });
     return { data: session };
-  } catch (e: unknown) { observability.captureException(e); return fail(reply, 'PSP_UNAVAILABLE', 'Provider unavailable', 502, true); }
+  } catch (e: unknown) { return checkoutFailure(reply, e); }
 });
 import fastifyRawBody from 'fastify-raw-body';
 void app.register(fastifyRawBody, { global: false });
 
-/**
- * A PSP charge just turned successful (webhook or pull-side reconcile; each
- * caller passes only the first transition, so this runs once per payment).
- */
-async function settleSuccessfulPayment(reference: string, amountKobo: bigint): Promise<void> {
-  if (isWalletTopupRef(reference)) {
-    await creditWalletTopup(reference, amountKobo);
-    return;
-  }
-  // Tier upgrade fee / Kendibo Pro subscription paid by checkout.
-  // TODO(ledger): post these platform fees to the ledger once a fee-income account exists.
-  if (reference.startsWith(TIER_REF_PREFIX) || reference.startsWith(SUB_REF_PREFIX)) {
-    try { await tierService.onCheckoutPaid(reference, amountKobo); } catch (e) { observability.captureException(e); }
-    return;
-  }
-  try { await postCollection(reference, amountKobo, currentPeriod()); } catch (e) { observability.captureException(e); }
-  observability.track('booking.payment_succeeded', { psp: 'bachs', reference });
-  // Receipt to the customer (WhatsApp link + verified email): paid, held until the job is done.
-  try {
-    const rows = await q<{ booking_id: string }>(`SELECT booking_id FROM payment.payment WHERE reference=$1`, [reference]);
-    if (rows[0]) {
-      const { onPaymentSucceeded } = await import('../../../modules/invoices/invoice.service.js');
-      await onPaymentSucceeded(String(rows[0].booking_id));
+// One settlement rule for every path (webhook, return/verify, background reconciler):
+// see modules/payments/settlement.ts. Hooks plug in what only the API knows how to do.
+const settlement = new PaymentSettlement(payments, {
+  async confirm(row) {
+    const amount = BigInt(String(row.amount_kobo));
+    // Tier upgrade fee / Kendibo Pro subscription paid by checkout.
+    // TODO(ledger): post these platform fees to the ledger once a fee-income account exists.
+    if (row.purpose === 'tier' || row.purpose === 'subscription') {
+      try { await tierService.onCheckoutPaid(String(row.subject_ref ?? ''), amount); } catch (e) { observability.captureException(e); }
+      return;
     }
-  } catch (e) { observability.captureException(e); }
-}
-/** Credit a successful wallet top-up (idempotent by payment reference; owner comes from the stored payment row). */
-async function creditWalletTopup(reference: string, verifiedAmountKobo?: bigint): Promise<void> {
-  try {
-    const r = await settleWalletTopup(reference, verifiedAmountKobo);
-    if (r.credited) observability.track('wallet.topup_succeeded', { psp: 'bachs', reference });
-    else if (r.reason === 'amount_mismatch' || r.reason === 'no_owner') observability.captureMessage?.(`wallet.topup_not_credited reason=${r.reason} reference=${reference}`);
-  } catch (e) { observability.captureException(e); }
-}
-/** Ask Bachs about a still-pending payment (at most every 5s per reference) and settle it if it went through. */
+    // Booking or product order: books the money, then sends the receipt (WhatsApp link + verified email).
+    try { await postCollection(row.reference, amount, currentPeriod()); } catch (e) { observability.captureException(e); }
+    try {
+      const { onPaymentSucceeded } = await import('../../../modules/invoices/invoice.service.js');
+      await onPaymentSucceeded(String(row.booking_id));
+    } catch (e) { observability.captureException(e); }
+  },
+  async notify(userId, title, body) {
+    await notificationService.sendOmnichannel({ recipientId: userId, channels: ['inapp', 'push'], template: 'payment_update', vars: { title, body }, category: 'order' });
+  },
+  track: (event, props) => {
+    observability.track(event, props);
+    if (event === 'payment.review_needed' || event === 'payment.no_owner') observability.captureMessage?.(`${event} reference=${String(props?.reference ?? '')}`);
+  },
+});
+
+/** Ask Paga about a still-open payment (at most every 5s per reference) and settle it. Returns the payment status. */
 const lastReconcile = new Map<string, number>();
 async function syncPendingPayment(reference: string): Promise<string | null> {
   const now = Date.now();
   if ((lastReconcile.get(reference) ?? 0) > now - 5000) return null;
   lastReconcile.set(reference, now);
   if (lastReconcile.size > 5000) lastReconcile.clear();
-  const r = await payments.reconcile(reference).catch((e) => { observability.captureException(e); return null; });
-  if (r?.transitioned && r.verified) await settleSuccessfulPayment(reference, r.verified.amountKobo);
-  else if (r?.status === 'successful' && isWalletTopupRef(reference)) await creditWalletTopup(reference); // heal a credit that failed after the status flip
-  return r?.status ?? null;
+  const r = await settlement.settle(reference).catch((e) => { observability.captureException(e); return null; });
+  return r && r.status !== 'busy' && r.status !== 'not_found' ? r.status : null;
 }
 
-// Bachs success/cancel return target. Checks with Bachs (the webhook may lag),
-// then hands the customer back to WhatsApp or the app.
+/** Record a processed webhook event. Done AFTER processing: a crash mid-way leaves it unrecorded so the retry re-processes. */
+async function recordWebhookEvent(eventId: string, raw: string): Promise<void> {
+  try { await q(`INSERT INTO payment.webhook_event (psp, event_id, raw) VALUES ('paga',$1,$2)`, [eventId, raw]); }
+  catch (e) { if ((e as { code?: string }).code !== '23505') throw e; }
+}
+
+// Return target of the old hosted checkout and of any link that still points at it.
+// Checks with Paga (the webhook may lag), then hands the customer back to WhatsApp or the app.
 app.get('/w/payment-return', async (req, reply) => {
   const { pageCsp, renderPaymentReturnPage } = await import('../../../modules/whatsapp/web-pages.js');
   const nonce = crypto.randomBytes(16).toString('base64');
   const reference = String((req.query as { reference?: string }).reference ?? '').slice(0, 120);
   let status = 'pending';
+  let fromWhatsapp = false;
   if (/^[\w-]+$/.test(reference)) {
-    const rows = await q<{ status: string }>(`SELECT status FROM payment.payment WHERE reference=$1`, [reference]).catch(() => []);
+    const rows = await q<{ status: string; psp_details: unknown }>(`SELECT status, psp_details FROM payment.payment WHERE reference=$1`, [reference]).catch(() => []);
     status = rows[0]?.status ?? 'pending';
-    if (status === 'pending') status = (await syncPendingPayment(reference)) ?? status;
-    else if (status === 'successful' && isWalletTopupRef(reference)) await creditWalletTopup(reference);
+    const d = (typeof rows[0]?.psp_details === 'string' ? JSON.parse(rows[0].psp_details as string) : rows[0]?.psp_details ?? {}) as Record<string, unknown>;
+    fromWhatsapp = d.source === 'whatsapp';
+    if (status === 'pending' || status === 'partial') status = (await syncPendingPayment(reference)) ?? status;
   }
   if (status !== 'successful' && status !== 'failed') status = 'pending';
   const page = renderPaymentReturnPage({
-    status, reference, nonce, fromWhatsapp: reference.endsWith('_wa'),
+    status, reference, nonce, fromWhatsapp,
     waNumber: process.env.WHATSAPP_BUSINESS_NUMBER || undefined,
     appWebBase: process.env.APP_WEB_URL || 'https://kendibo-app.pxxl.click',
   });
@@ -1062,28 +1068,55 @@ app.get('/w/payment-return', async (req, reply) => {
     .header('Referrer-Policy', 'no-referrer').type('text/html; charset=utf-8').send(page);
 });
 
-for (const psp of ['bachs', 'paga'] as const) {
-  app.post(`/webhooks/payments/${psp}`, { config: { rawBody: true } }, async (req, reply) => {
-    try {
-      const raw = Buffer.from((req as unknown as { rawBody?: string }).rawBody || JSON.stringify(req.body ?? {}));
-      const result = await payments.handleWebhook(psp, raw, req.headers as Record<string, string>);
-      if (!result.ok) return fail(reply, 'BAD_SIGNATURE', 'Invalid webhook signature', 401);
-      if (result.notFound) return fail(reply, 'UNKNOWN_CHARGE', 'Charge not found', 404);
-      if (result.amountMismatch) {
-        observability.captureMessage?.(`webhook.amount_mismatch psp=${psp}`);
-        return fail(reply, 'AMOUNT_MISMATCH', 'Amount does not match recorded payment', 409);
-      }
-      if (result.verified?.status === 'successful' && result.transitioned) await settleSuccessfulPayment(result.verified.reference, result.verified.amountKobo);
-      // Retry of an already-settled top-up whose credit may not have landed: idempotent by payment reference.
-      else if (result.verified?.status === 'successful' && isWalletTopupRef(result.verified.reference)) await creditWalletTopup(result.verified.reference, result.verified.amountKobo);
-      return { ok: true };
-    } catch (e) {
-      observability.captureException(e);
-      app.log.error({ err: e, psp }, 'webhook processing failed');
-      return fail(reply, 'WEBHOOK_ERROR', 'Webhook processing failed', 500);
+/** Settle after a callback was acknowledged. If another settle of the same payment is running, try again shortly (the reconciler is the backstop). */
+async function settleAfterCallback(reference: string): Promise<void> {
+  try {
+    for (const wait of [0, 200, 1000, 4000]) {
+      if (wait) await new Promise((r) => setTimeout(r, wait));
+      const r = await settlement.settle(reference);
+      if (r.status !== 'busy') return;
     }
-  });
+  } catch (e) { observability.captureException(e); }
 }
+
+/**
+ * Second layer for Paga callbacks (the body hash stays mandatory): only Paga's published
+ * source addresses (live 51.124.69.198, sandbox 51.136.123.148) when PAGA_CALLBACK_IPS is
+ * set (comma list). Unset = log only, so an unknown proxy can never lock us out of callbacks.
+ */
+function pagaCallbackIpAllowed(ip: string, route: string): boolean {
+  const allow = String(process.env.PAGA_CALLBACK_IPS ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+  const clean = ip.replace(/^::ffff:/, '');
+  if (!allow.length) { if (process.env.NODE_ENV !== 'test') app.log.info({ ip: clean, route }, 'paga callback source (PAGA_CALLBACK_IPS not set, not enforced)'); return true; }
+  return allow.includes(clean);
+}
+
+// Paga payment callback. Verified (hash, constant time) -> persisted on the payment row ->
+// acknowledged at once with 200 {"status":"SUCCESS"} (Paga wants an answer within 5s) ->
+// settled in the background. The body is only trusted for its hash-verified amount fields;
+// /status confirms the payment, and the reconciler finishes anything this process drops.
+// The notificationId is recorded after the callback is persisted (not before), so a crash
+// in between makes Paga's retry (same notificationId, up to 3x) store it again.
+app.post('/webhooks/payments/paga', { config: { rawBody: true } }, async (req, reply) => {
+  if (!pagaCallbackIpAllowed(String(req.ip ?? ''), 'payments')) return fail(reply, 'FORBIDDEN', 'Source not allowed', 403);
+  try {
+    const raw = Buffer.from((req as unknown as { rawBody?: string }).rawBody || JSON.stringify(req.body ?? {}));
+    const evt = payments.parseWebhook(raw, req.headers as Record<string, string>);
+    if (!evt.ok) return fail(reply, 'BAD_SIGNATURE', 'Invalid webhook signature', 401);
+    if ((await q(`SELECT 1 FROM payment.webhook_event WHERE event_id=$1`, [evt.eventId]))[0]) return { status: 'SUCCESS', ok: true }; // fully processed before
+    const reference = evt.reference;
+    if (reference) {
+      await settlement.recordCallback(reference, evt.callback);
+      setImmediate(() => { void settleAfterCallback(reference); });
+    }
+    await recordWebhookEvent(evt.eventId, evt.raw);
+    return { status: 'SUCCESS', ok: true };
+  } catch (e) {
+    observability.captureException(e);
+    app.log.error({ err: e }, 'webhook processing failed');
+    return fail(reply, 'WEBHOOK_ERROR', 'Webhook processing failed', 500);
+  }
+});
 
 // Paga bank-transfer pay page (signed link from the checkout): account number,
 // exact amount, expiry and live status. Pending payments are re-checked with Paga.
@@ -1117,6 +1150,7 @@ app.get('/w/paga/pay', async (req, reply) => {
 // Paga Business API money-transfer status (vendor payouts). Hash in x-paga-hash;
 // Paga retries until it gets 200 {"status":"SUCCESS"}. Recorded once per reference+outcome.
 app.post('/webhooks/paga/transfer', { config: { rawBody: true } }, async (req, reply) => {
+  if (!pagaCallbackIpAllowed(String(req.ip ?? ''), 'transfer')) return fail(reply, 'FORBIDDEN', 'Source not allowed', 403);
   const { PagaAdapter } = await import('../../../modules/payments/paga.adapter.js');
   const raw = Buffer.from((req as unknown as { rawBody?: string }).rawBody || JSON.stringify(req.body ?? {}));
   if (!new PagaAdapter().verifyTransferNotification(raw, req.headers as Record<string, string>)) {
@@ -1174,15 +1208,14 @@ app.post('/v1/wallet/topup', async (req, reply) => {
   if (!parsed.success) return fail(reply, 'BAD_AMOUNT', 'amountKobo must be an integer kobo amount between 100 and 50000000');
   
   const user = await identityService.me(a.sub);
-  const ref = `wt_${a.sub}_${idem.slice(0, 16)}`;
   try {
     const session = await payments.createCheckout({
-      bookingId: 'wallet_topup', amountKobo: BigInt(parsed.data.amountKobo),
-      ...(user?.email ? { customerEmail: user.email } : {}), reference: ref, idempotencyKey: idem, userId: a.sub,
+      bookingId: 'wallet_topup', purpose: 'topup', amountKobo: BigInt(parsed.data.amountKobo),
+      ...(user?.email ? { customerEmail: user.email } : {}), idempotencyKey: idem, userId: a.sub,
     });
     observability.track('wallet.topup_initiated', { psp: session.psp });
     return { data: session };
-  } catch (e: unknown) { observability.captureException(e); return fail(reply, 'PSP_UNAVAILABLE', 'Provider unavailable', 502, true); }
+  } catch (e: unknown) { return checkoutFailure(reply, e); }
 });
 
 // Pay a booking from the customer's own wallet balance. No PSP session: the
@@ -1243,10 +1276,10 @@ app.post('/v1/bookings/:id/pay-with-wallet', async (req, reply) => {
       // charged-but-unpaid job.
       try { await postCollection(ref, expected, currentPeriod()); } catch (e) { observability.captureException(e); }
       await q(
-        `INSERT INTO payment.payment (booking_id, psp, reference, charge_id, amount_kobo, status)
-         VALUES ($1, 'wallet', $2, $2, $3, 'successful')
+        `INSERT INTO payment.payment (booking_id, psp, reference, charge_id, amount_kobo, status, user_id, purpose, subject_ref, received_kobo, settled_at, confirmed_at)
+         VALUES ($1, 'wallet', $2, $2, $3, 'successful', $4, 'booking', $5, $3, now(), now())
          ON CONFLICT DO NOTHING`,
-        [bookingId, ref, amountKobo],
+        [bookingId, ref, amountKobo, a.sub, bookingId],
       );
       await q(`UPDATE payment.payment SET status='successful' WHERE reference=$1 AND status<>'successful'`, [ref]);
     }
@@ -2521,7 +2554,8 @@ app.post('/v1/change-orders/:id/approve', async (req, reply) => {
 // A payment row belongs to the booking's customer; wallet top-ups (wt_<userId>_…)
 // to the user that minted them. Admins with payment:view may read any.
 async function paymentVisible(p: Record<string, unknown>, sub: string): Promise<boolean> {
-  if (String(p.reference).startsWith(`wt_${sub}_`)) return true;
+  if (p.user_id && String(p.user_id) === sub) return true; // owner stored on our row at checkout time
+  if (String(p.reference).startsWith(`wt_${sub}_`)) return true; // rows from before owners were stored
   // Tier upgrade fee / Kendibo Pro checkouts live in payment.payment with no booking: they belong to the provider's user.
   if (/^(tier_|sub_)/.test(String(p.reference)) && (await tierService.checkoutOwner(String(p.reference))) === sub) return true;
   const b = p.booking_id ? await bookingService.getRaw(String(p.booking_id)) : null;
@@ -2531,16 +2565,20 @@ async function paymentVisible(p: Record<string, unknown>, sub: string): Promise<
 }
 app.get('/v1/payments/:reference', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
-  // The checkout return page may carry Bachs' checkout id instead of our reference.
+  // The return page may carry the checkout id instead of our reference.
   const key = (req.params as { reference: string }).reference;
   const rows = await q<Record<string, unknown>>(`SELECT * FROM payment.payment WHERE reference=$1 OR charge_id=$1 LIMIT 1`, [key]);
   const p = rows[0];
   if (!p || !(await paymentVisible(p, a.sub))) return fail(reply, 'NOT_FOUND', 'Payment not found', 404);
-  // Webhook late or missing: ask Bachs directly so the app never waits forever.
+  // Webhook late or missing: ask Paga directly so the app never waits forever.
   let status = String(p.status);
-  if (status === 'pending') status = (await syncPendingPayment(String(p.reference))) ?? status;
-  else if (status === 'successful' && isWalletTopupRef(String(p.reference))) await creditWalletTopup(String(p.reference));
-  return { data: { reference: String(p.reference), psp: String(p.psp), amountKobo: String(p.amount_kobo), currency: 'NGN', status } };
+  let received = String(p.received_kobo ?? 0);
+  if (String(p.psp) === 'paga' && (status === 'pending' || status === 'partial')) {
+    status = (await syncPendingPayment(String(p.reference))) ?? status;
+    const again = await q<{ received_kobo: string }>(`SELECT received_kobo FROM payment.payment WHERE reference=$1`, [String(p.reference)]).catch(() => []);
+    received = String(again[0]?.received_kobo ?? received);
+  }
+  return { data: { reference: String(p.reference), psp: String(p.psp), purpose: String(p.purpose ?? 'booking'), amountKobo: String(p.amount_kobo), receivedKobo: received, currency: 'NGN', status } };
 });
 app.post('/v1/payments/:reference/verify', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
@@ -2549,8 +2587,10 @@ app.post('/v1/payments/:reference/verify', async (req, reply) => {
   const p = rows[0];
   if (!p || !(await paymentVisible(p, a.sub))) return fail(reply, 'NOT_FOUND', 'Payment not found', 404);
   try {
-    const v = await payments.verify(String(p.psp) as never, String(p.charge_id || ref));
-    return { data: { ...v, amountKobo: String(v.amountKobo) } };
+    const v = await payments.verify(String(p.psp), String(p.charge_id || ref));
+    const settled = await settlement.settle(ref); // same rule as the webhook and the reconciler
+    const after = (await q<{ received_kobo: string }>(`SELECT received_kobo FROM payment.payment WHERE reference=$1`, [ref]).catch(() => []))[0];
+    return { data: { ...v, amountKobo: String(v.amountKobo), receivedKobo: String(after?.received_kobo ?? 0), status: settled.status === 'busy' ? String(p.status) : settled.status } };
   } catch (e: unknown) { return fail(reply, 'VERIFY_FAILED', (e as Error).message, 502, true); }
 });
 app.post('/v1/payments/:reference/refund', async (req, reply) => {
@@ -3464,7 +3504,8 @@ if (process.env.VITEST !== 'true' && process.env.NODE_ENV !== 'test') {
   sweepTimer.unref?.();
   app.listen({ port, host: '0.0.0.0' }).then(() => {
     const w = watchupClient as unknown as { enabled: boolean; environment: string; release: string };
-    app.log.info(`kendibo-api :${port} (payments: bachs)`);
+    app.log.info(`kendibo-api :${port} (payments: paga ${payments.isConfigured() ? (process.env.PAGA_ENV === 'live' ? 'live' : 'sandbox') : 'NOT CONFIGURED'})`);
+    startPaymentReconciler(settlement, { enabled: payments.isConfigured() });
     app.log.info(`watchup: ${w.enabled ? `enabled env=${w.environment} release=${w.release}` : 'disabled (no WATCHUP_API_KEY)'}`);
     if (w.enabled) observability.track('deploy.boot', { port, env: w.environment, release: w.release });
   });

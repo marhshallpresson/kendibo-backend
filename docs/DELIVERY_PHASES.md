@@ -14,7 +14,7 @@ flowchart LR
   WA --> API[(Kendibo API)]
   APP --> API
   OPS[Ops team] --> ADM[Admin console] --> API
-  API --> BACHS[Bachs payments]
+  API --> PAGA[Paga payments]
   API --> PREMBLY[Prembly KYC]
   API --> META[WhatsApp Cloud API]
   API --> CLAUDE[Claude]
@@ -27,7 +27,7 @@ flowchart LR
 - Ownership checks on bookings, payments, refunds, chat, quotes and B2B.
 - One-time login codes (OTPs) are hashed and rate-limited.
 - Reuse of a refresh token is detected and blocked.
-- Webhooks from Bachs, Sling and WhatsApp are signature-checked.
+- Webhooks from Paga, Sling and WhatsApp are signature-checked.
 - Payouts are capped at the vendor's available balance.
 - Bank-account verification can no longer invent a "verified" account name in production.
 
@@ -36,7 +36,7 @@ flowchart LR
 ## Phase 2: Customer and vendor flows ✅
 
 **Built**
-- Customers can book a fixed-price or quote-based job and pay through Bachs only.
+- Customers can book a fixed-price or quote-based job and pay through Paga only.
 - Jobs are dispatched to vendors with a response deadline (SLA), then tracked through to settlement.
 - Vendors are vetted per trade: each trade can require an identity level, a licence, a selfie match and a cap on concurrent jobs.
 - A vendor can propose a missing trade; AI drafts it and ops approve or reject it.
@@ -51,7 +51,7 @@ flowchart LR
 - Photo and budget capture in the chat.
 - A Google Maps location picker and a matched-vendors page, opened from WhatsApp.
 - Accept and decline buttons for vendors on job offers.
-- A Bachs payment link sent to the customer when a vendor accepts.
+- A Paga payment link sent to the customer when a vendor accepts.
 - Hand-off to a human, with the menu bot as a fallback.
 
 **Verified:** `whatsapp-ai` tests (scripted model, signed links, webhook signature, coverage area, the full map-pin-to-submit flow).
@@ -92,7 +92,7 @@ flowchart LR
 
 1. Redeploy the API on Pxxl. `api-kendibo.pxxlspace.cv` currently shows "Domain not connected".
 2. Set the server environment variables in the Pxxl dashboard (the local `.env` doesn't deploy). See `docs/INTEGRATIONS.md`.
-3. `BACHS_ACCOUNT_ID`; `PREMBLY_SECRET_KEY` and `PREMBLY_APP_ID` (plus `PREMBLY_ENVIRONMENT=live` once Prembly approves live keys), then set `KYC_PROVIDER=prembly`; `SLING_API_TOKEN` and `SLING_WEBHOOK_SECRET`.
+3. `PAGA_HASH_KEY`; `PREMBLY_SECRET_KEY` and `PREMBLY_APP_ID` (plus `PREMBLY_ENVIRONMENT=live` once Prembly approves live keys), then set `KYC_PROVIDER=prembly`; `SLING_API_TOKEN` and `SLING_WEBHOOK_SECRET`.
 4. Give the mobile app its own ingest-only WatchUp key; it currently ships the server key.
 5. Switch media storage to FTPS or S3 (`FTP_SECURE=false` sends credentials in plain text).
 6. Run migrations 027 and 028 against production after reviewing them.

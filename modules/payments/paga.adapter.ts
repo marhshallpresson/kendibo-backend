@@ -17,12 +17,40 @@ export interface PagaPaymentDetails {
   expiresAt: string | null;
 }
 
-/** Paga's payment status codes (Collect): 0 paid, 1 in process, 2 partial, negatives/114+ failed or expired. */
-function statusFrom(code: string | number | undefined): VerifiedPayment['status'] {
-  const c = String(code ?? '');
+/**
+ * Paga Collect payment status codes: 0 paid, 1 in process, 2 partial payment,
+ * -2 request expired, -3 request cancelled (121 = not found is raised as a 404 by verifyByReference).
+ * Only the documented terminal codes fail a payment; any code we do not know stays pending
+ * so a new Paga code can never turn a payment that may be paid into a failed one.
+ */
+export function statusFrom(code: string | number | undefined): VerifiedPayment['status'] {
+  const c = String(code ?? '').trim();
   if (c === '0') return 'successful';
-  if (c === '1' || c === '2' || c === '') return 'pending';
-  return 'failed';
+  if (c === '2') return 'partial';
+  if (c === '-2' || c === '-3') return 'failed';
+  return 'pending';
+}
+
+/** Hours a payment request (and its pay link) stays open. Kendibo expires unpaid rows after the same time. */
+export const paymentExpiryHours = (): number => {
+  const h = Number(process.env.PAGA_PAYMENT_EXPIRY_HOURS);
+  return Number.isFinite(h) && h >= 1 && h <= 168 ? h : 48;
+};
+/** 2348012345678 / +234 801 234 5678 -> 08012345678 (Paga's examples use the local form). */
+const localPhone = (p: string) => { const d = String(p).replace(/\D/g, ''); return d.startsWith('234') && d.length === 13 ? `0${d.slice(3)}` : d; };
+
+/**
+ * Cumulative amount Paga says it received. Only an explicit "paid so far" field
+ * can report a short or excess payment; without one, a fully paid request (code 0)
+ * counts as exactly the requested amount and anything else as nothing received.
+ * The customer's collection-fee share is 0, so paid amount and price are comparable.
+ */
+function receivedFrom(d: Record<string, unknown>, status: VerifiedPayment['status'], requested: bigint): bigint {
+  for (const k of ['cumulativePaymentAmount', 'amountPaid', 'paidAmount', 'totalAmountPaid']) {
+    const v = d[k];
+    if (v !== undefined && v !== null && v !== '' && Number.isFinite(Number(v)) && Number(v) >= 0) return nairaToKobo(Number(v));
+  }
+  return status === 'successful' ? requested : 0n;
 }
 
 const callbackUrl = () =>
@@ -37,9 +65,10 @@ export class PagaAdapter implements PaymentPort {
   async createCheckout(input: CreateCheckoutInput): Promise<CheckoutSession> {
     const amount = koboToNaira(input.amountKobo);
     const currency = input.currency ?? 'NGN';
-    const phone = (input.metadata?.phone ?? '').replace(/\D/g, '') || '08000000000';
+    const phone = localPhone(input.metadata?.phone ?? '') || '08000000000'; // placeholder only when the customer has no phone on file
     const email = input.customerEmail ?? '';
-    const expiry = new Date(Date.now() + 24 * 3600_000).toISOString().slice(0, 19);
+    // Same UTC format as the sandbox-proven request (no trailing Z).
+    const expiry = new Date(Date.now() + paymentExpiryHours() * 3600_000).toISOString().slice(0, 19);
     const json = await this.client.collect('/paymentRequest', {
       referenceNumber: input.reference,
       amount,
@@ -51,8 +80,10 @@ export class PagaAdapter implements PaymentPort {
       // Kendibo absorbs Paga's collection fee: the customer pays exactly the quoted price.
       payerCollectionFeeShare: 0,
       payeeCollectionFeeShare: 1,
-      isAllowPartialPayments: false,
-      isAllowOverPayments: false,
+      // Bank transfers often arrive for a different amount. Paga accepts them and reports
+      // the cumulative amount received; the settlement rules decide what each case means.
+      isAllowPartialPayments: true,
+      isAllowOverPayments: true,
       callBackUrl: callbackUrl(),
       paymentMethods: ['BANK_TRANSFER'],
     }, [input.reference, amount, currency, phone, email]);
@@ -83,10 +114,10 @@ export class PagaAdapter implements PaymentPort {
       psp: 'paga',
       chargeId: reference,
       reference: String(d.referenceNumber ?? reference),
-      // requestAmount is what we asked for; the customer's fee share is 0, so it equals what they paid.
       amountKobo: nairaToKobo(d.requestAmount ?? 0),
       currency: 'NGN',
       status: statusFrom(d.statusCode),
+      code: String(d.statusCode ?? ''),
     };
   }
 
@@ -169,9 +200,12 @@ export class PagaAdapter implements PaymentPort {
     let e: any;
     try { e = JSON.parse(String(rawBody)); } catch { return false; }
     if (!e?.hash || !e?.notificationId) return false;
-    const balance = e.outstandingBalance === null || e.outstandingBalance === undefined ? '' : Number(e.outstandingBalance).toFixed(2);
-    const expected = this.client.hash([e.notificationId, e.statusCode, e.externalReferenceNumber, e.state, balance]);
-    return sameHash(expected, String(e.hash));
+    // outstandingBalance is hashed with two decimals ("0.00") and left out when null; Paga's own
+    // sample code passes the number as sent ("0"), so both spellings are accepted.
+    const raw = e.outstandingBalance;
+    const spellings = raw === null || raw === undefined ? [''] : [Number(raw).toFixed(2), String(raw)];
+    return spellings.some((balance) =>
+      sameHash(this.client.hash([e.notificationId, e.statusCode, e.externalReferenceNumber, e.state, balance]), String(e.hash)));
   }
 
   /** Business money-transfer notification: x-paga-hash over referenceNumber + transactionDate + transactionId + amount + sessionId. */

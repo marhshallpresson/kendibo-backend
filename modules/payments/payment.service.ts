@@ -1,33 +1,70 @@
-// PaymentService — Bachs.io is the live PSP; Paga runs in sandbox for test accounts.
+// PaymentService — Paga is the only payment provider.
 // Rules: server owns money; webhook != truth until verified; every mutation idempotent.
 // Transient PSP failures (timeouts, 429/5xx) get one quick retry with the SAME
-// reference/idempotency key — safe, because the PSP dedupes on it — before the
-// caller sees PSP_UNAVAILABLE.
+// reference — safe, because Paga dedupes on it — before the caller sees PSP_UNAVAILABLE.
 //
-// Routing (PAGA_MODE):
-//   off (default)   every payment uses Bachs.
-//   test-accounts   Paga sandbox only when the customer AND the assigned pro (if any)
-//                   are flagged identity.users.is_test. Real customers never touch
-//                   sandbox money; test accounts never touch live rails.
-//   all             every booking payment goes to Paga — only with PAGA_ENV=live
-//                   (on the sandbox it behaves like test-accounts). Card top-ups
-//                   stay on Bachs; customers fund the wallet by bank transfer to
-//                   their own Paga account number instead.
-import type { PaymentPort, PSP, CreateCheckoutInput, CheckoutSession, VerifiedPayment } from './payment.port.js';
-import { BachsAdapter } from './bachs.adapter.js';
-import { PagaAdapter } from './paga.adapter.js';
+// Paga is always on when its keys are set (PAGA_PUBLIC_KEY, PAGA_SECRET_KEY, PAGA_HASH_KEY);
+// PAGA_ENV (sandbox|live) only picks the environment. Without keys checkout fails with
+// PspUnavailableError (HTTP 503 PSP_UNAVAILABLE) — it never falls back to another PSP.
+//
+// One reference format for every checkout (booking, wallet top-up, tier fee, Kendibo Pro):
+//   kb_<p>_<24 hex>   p = b booking | w top-up | t tier | s subscription
+// minted here from (purpose, owner, subject, idempotency key). The owner of a payment is
+// always the user_id stored on our row, never parsed from the reference or taken from
+// client input; for bookings it is the booking's own customer.
+import { createHash } from 'node:crypto';
+import type { PaymentPort, PSP, CheckoutPurpose, CreateCheckoutInput, CheckoutSession, VerifiedPayment } from './payment.port.js';
+import { PagaAdapter, paymentExpiryHours } from './paga.adapter.js';
 import { PagaClient, pagaConfigured } from './paga/client.js';
 import { q } from '../../packages/database/db.js';
 
+export const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
+export const REFERENCE_PREFIX = 'kb_';
+const PURPOSE_LETTER: Record<CheckoutPurpose, string> = { booking: 'b', topup: 'w', tier: 't', subscription: 's' };
+
+/** Paga is not configured (or unreachable for good): checkout answers 503 PSP_UNAVAILABLE. */
+export class PspUnavailableError extends Error {
+  readonly code = 'PSP_UNAVAILABLE';
+  constructor(message = 'Paga is not configured') { super(`PSP_UNAVAILABLE: ${message}`); }
+}
+
+/** What a caller asks for. `reference` is accepted only as a legacy subject for tier/subscription rows. */
+export interface CheckoutRequest {
+  bookingId: string; // a booking id, or 'wallet_topup' for every non-booking purpose
+  amountKobo: bigint;
+  purpose?: CheckoutPurpose;
+  customerEmail?: string;
+  customerName?: string;
+  reference?: string;
+  idempotencyKey: string;
+  metadata?: Record<string, string>;
+  /** Payer for top-ups / tier / subscription. Bookings ignore it: the booking's own customer pays. */
+  userId?: string;
+}
+
+/** The hash-verified fields of a Paga Collect callback that decide how much money arrived. */
+export interface PagaCallback {
+  notificationId: string | null; state: string | null; statusCode: string | null;
+  paymentKobo: bigint | null; cumulativeKobo: bigint | null; outstandingKobo: bigint | null;
+}
+
+export interface PaymentRow {
+  reference: string; psp: string; status: string; purpose: string; booking_id: string;
+  amount_kobo: string | number; received_kobo: string | number; user_id: string | null; subject_ref: string | null;
+  charge_id: string | null; settled_at: string | null; confirmed_at: string | null; created_at: string; psp_details: unknown;
+  callback_state: string | null; callback_cumulative_kobo: string | number | null; review_flag: string | null;
+}
+
 const transient = (e: unknown) => {
   const m = String((e as Error)?.message ?? '');
-  return /BACHS_(429|5\d\d)|PAGA_HTTP_5\d\d|timeout|aborted|ECONNRESET|ETIMEDOUT|fetch failed/i.test(m);
+  return /PAGA_HTTP_5\d\d|PAGA_TIMEOUT|PAGA_RATE_LIMITED|timeout|aborted|ECONNRESET|ETIMEDOUT|fetch failed/i.test(m);
 };
 
 /** Signed page where a Paga bank-transfer payer sees the account number and amount. */
 async function pagaPayPage(reference: string): Promise<string> {
   const { signLink, webBase } = await import('../whatsapp/links.js');
-  return `${webBase()}/w/paga/pay?t=${encodeURIComponent(signLink({ w: 'paga', d: reference, p: 'paga' }, 24 * 3600))}`;
+  // Link lives as long as the payment request itself.
+  return `${webBase()}/w/paga/pay?t=${encodeURIComponent(signLink({ w: 'paga', d: reference, p: 'paga' }, paymentExpiryHours() * 3600))}`;
 }
 async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
   try { return await fn(); }
@@ -38,204 +75,160 @@ async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+/** Deterministic server-minted reference: the same (purpose, owner, subject, key) always maps to the same one. */
+export function mintReference(purpose: CheckoutPurpose, userId: string, subject: string, idempotencyKey: string): string {
+  const h = createHash('sha256').update([purpose, userId, subject, idempotencyKey].join('|')).digest('hex').slice(0, 24);
+  return `${REFERENCE_PREFIX}${PURPOSE_LETTER[purpose]}_${h}`;
+}
+
 export class PaymentService {
-  private adapters: Record<PSP, PaymentPort>;
+  private paga: PaymentPort;
   /** A test passed its own Paga adapter, so Paga counts as configured. */
-  private readonly pagaInjected: boolean;
+  private readonly injected: boolean;
 
   /** Pass a fake adapter in tests to avoid PSP network calls. */
   constructor(adapters?: Partial<Record<PSP, PaymentPort>>) {
-    this.pagaInjected = Boolean(adapters?.paga);
-    this.adapters = {
-      bachs: adapters?.bachs ?? new BachsAdapter(),
-      paga: adapters?.paga ?? new PagaAdapter(new PagaClient(), () => ''),
-    };
+    this.injected = Boolean(adapters?.paga);
+    this.paga = adapters?.paga ?? new PagaAdapter(new PagaClient(), () => '');
   }
 
-  /** Which PSP a new payment goes to (see PAGA_MODE above). */
-  async pspFor(input: CreateCheckoutInput): Promise<PSP> {
-    const mode = process.env.PAGA_MODE === 'all' ? 'all' : process.env.PAGA_MODE === 'test-accounts' ? 'test-accounts' : 'off';
-    if (mode === 'off') return 'bachs';
-    if (!this.pagaInjected && !pagaConfigured()) return 'bachs';
-    if (input.bookingId === 'wallet_topup') return 'bachs';
-    if (mode === 'all' && process.env.PAGA_ENV === 'live') return 'paga';
-    const customer = await q<{ is_test: boolean }>(
-      `SELECT u.is_test FROM booking.booking b JOIN identity.users u ON u.id = b.user_id WHERE b.id = $1`, [input.bookingId],
-    ).catch(() => []);
-    if (!customer[0]?.is_test) return 'bachs';
-    const pros = await q<{ is_test: boolean }>(
-      `SELECT u.is_test FROM dispatch.assignment a
-         JOIN provider.provider p ON p.id = a.provider_id
-         JOIN identity.users u ON u.id = p.user_id
-        WHERE a.job_id = $1 AND a.status = 'accepted'`, [input.bookingId],
-    ).catch(() => []);
-    return pros.every((p) => p.is_test) ? 'paga' : 'bachs';
+  isConfigured(): boolean { return this.injected || pagaConfigured(); }
+  private requireConfigured() { if (!this.isConfigured()) throw new PspUnavailableError(); }
+
+  /** Work out purpose, owner and subject from our own records. */
+  private async resolve(input: CheckoutRequest): Promise<{ purpose: CheckoutPurpose; userId: string; subject: string; bookingId: string }> {
+    if (input.bookingId !== 'wallet_topup') {
+      const rows = await q<{ user_id: string }>(`SELECT user_id FROM booking.booking WHERE id = $1`, [input.bookingId]);
+      if (!rows[0]) throw new Error('BOOKING_NOT_FOUND');
+      return { purpose: 'booking', userId: String(rows[0].user_id), subject: input.bookingId, bookingId: input.bookingId };
+    }
+    const legacy = input.reference ?? '';
+    const purpose: CheckoutPurpose = input.purpose
+      ?? (legacy.startsWith('tier_') ? 'tier' : legacy.startsWith('sub_') ? 'subscription' : 'topup');
+    if (purpose === 'booking') throw new Error('CHECKOUT_PURPOSE_INVALID');
+    if (!input.userId) throw new Error('CHECKOUT_OWNER_REQUIRED');
+    return { purpose, userId: input.userId, subject: purpose === 'topup' ? '' : legacy, bookingId: ZERO_UUID };
   }
 
-
-  private async recordIntent(psp: PSP, checkoutId: string, checkoutUrl: string | null, input: CreateCheckoutInput, details?: Record<string, unknown>): Promise<boolean> {
-    const bookingId = input.bookingId === 'wallet_topup' ? '00000000-0000-0000-0000-000000000000' : input.bookingId;
+  private async recordIntent(
+    r: { purpose: CheckoutPurpose; userId: string; subject: string; bookingId: string },
+    reference: string, checkoutId: string, checkoutUrl: string | null, amountKobo: bigint, details: Record<string, unknown>,
+  ): Promise<boolean> {
     try {
       await q(
-        `INSERT INTO payment.payment (booking_id, psp, reference, charge_id, amount_kobo, status, checkout_url, psp_details, user_id)
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7::jsonb, $8)`,
-        [bookingId, psp, input.reference, checkoutId, Number(input.amountKobo), checkoutUrl, JSON.stringify(details ?? {}), input.bookingId === 'wallet_topup' ? (input.userId ?? null) : null],
+        `INSERT INTO payment.payment (booking_id, psp, reference, charge_id, amount_kobo, status, checkout_url, psp_details, user_id, purpose, subject_ref, next_check_at)
+         VALUES ($1, 'paga', $2, $3, $4, 'pending', $5, $6::jsonb, $7, $8, $9, $10)`,
+        [r.bookingId, reference, checkoutId, Number(amountKobo), checkoutUrl, JSON.stringify(details), r.userId, r.purpose,
+          r.subject || null, new Date(Date.now() + 60_000).toISOString()],
       );
       return true;
     } catch (error) {
       if ((error as { code?: string }).code !== '23505') throw error;
-      const existing = await q<{ booking_id: string; amount_kobo: string; psp: string }>(
-        `SELECT booking_id, amount_kobo, psp FROM payment.payment WHERE reference=$1`, [input.reference],
+      const existing = await q<{ booking_id: string; amount_kobo: string; psp: string; user_id: string | null }>(
+        `SELECT booking_id, amount_kobo, psp, user_id FROM payment.payment WHERE reference=$1`, [reference],
       );
-      if (!existing[0] || String(existing[0].booking_id) !== bookingId || BigInt(String(existing[0].amount_kobo)) !== input.amountKobo || existing[0].psp !== psp) throw new Error('PAYMENT_REFERENCE_CONFLICT');
+      if (!existing[0] || String(existing[0].booking_id) !== r.bookingId || BigInt(String(existing[0].amount_kobo)) !== amountKobo || existing[0].psp !== 'paga' || String(existing[0].user_id ?? '') !== r.userId) throw new Error('PAYMENT_REFERENCE_CONFLICT');
       return false;
     }
   }
 
-  async createCheckout(input: CreateCheckoutInput, preferredPsp?: PSP): Promise<CheckoutSession> {
-    const preferred: PSP = preferredPsp ?? (await this.pspFor(input));
-    // Check postgres for idempotency
-    const existing = await q<{ psp: PSP; charge_id: string; booking_id: string; amount_kobo: string; status: string; checkout_url: string | null }>(
-      `SELECT psp, charge_id, booking_id, amount_kobo, status, checkout_url FROM payment.payment WHERE reference=$1 LIMIT 1`,
-      [input.reference]
+  async createCheckout(input: CheckoutRequest): Promise<CheckoutSession> {
+    this.requireConfigured();
+    if (input.amountKobo <= 0n) throw new Error('BAD_AMOUNT');
+    const resolved = await this.resolve(input);
+    const reference = mintReference(resolved.purpose, resolved.userId, resolved.subject, input.idempotencyKey);
+
+    const existing = await q<{ psp: string; charge_id: string; booking_id: string; amount_kobo: string; status: string; checkout_url: string | null; user_id: string | null }>(
+      `SELECT psp, charge_id, booking_id, amount_kobo, status, checkout_url, user_id FROM payment.payment WHERE reference=$1 LIMIT 1`, [reference],
     );
     if (existing[0]) {
-      const bookingId = input.bookingId === 'wallet_topup' ? '00000000-0000-0000-0000-000000000000' : input.bookingId;
-      if (String(existing[0].booking_id) !== bookingId || BigInt(String(existing[0].amount_kobo)) !== input.amountKobo || existing[0].psp !== preferred) throw new Error('PAYMENT_REFERENCE_CONFLICT');
+      if (String(existing[0].booking_id) !== resolved.bookingId || BigInt(String(existing[0].amount_kobo)) !== input.amountKobo || existing[0].psp !== 'paga' || String(existing[0].user_id ?? '') !== resolved.userId) throw new Error('PAYMENT_REFERENCE_CONFLICT');
       if (existing[0].status !== 'pending' || !existing[0].charge_id || !existing[0].checkout_url) throw new Error('CHECKOUT_NOT_OPEN');
-      const getCheckout = this.adapters[preferred].getCheckout;
+      const getCheckout = this.paga.getCheckout;
       if (!getCheckout) throw new Error('CHECKOUT_RECOVERY_UNAVAILABLE');
-      const session = await withRetry(() => getCheckout.call(this.adapters[preferred], existing[0].charge_id, input.reference));
+      const session = await withRetry(() => getCheckout.call(this.paga, existing[0].charge_id, reference));
       return { ...session, checkoutUrl: existing[0].checkout_url };
     }
 
-    const s = await withRetry(() => this.adapters[preferred].createCheckout(input));
+    // Payer details come from the owner's own profile (they go into the Paga request and its hash).
+    const payer = (await q<{ name: string | null; phone: string | null; email: string | null }>(
+      `SELECT name, phone, email FROM identity.users WHERE id::text = $1`, [resolved.userId],
+    ).catch(() => []))[0];
+    const customerName = input.customerName || payer?.name || undefined;
+    const customerEmail = input.customerEmail || payer?.email || undefined;
+    const adapterInput: CreateCheckoutInput = {
+      bookingId: resolved.bookingId, amountKobo: input.amountKobo, reference, idempotencyKey: input.idempotencyKey, userId: resolved.userId,
+      ...(customerEmail ? { customerEmail } : {}),
+      ...(customerName ? { customerName } : {}),
+      metadata: { ...(input.metadata ?? {}), ...(payer?.phone ? { phone: payer.phone } : {}) },
+    };
+    const s = await withRetry(() => this.paga.createCheckout(adapterInput));
     // Paga bank transfers have no hosted page: the customer gets our signed pay page.
-    if (s.psp === 'paga' && !s.checkoutUrl) s.checkoutUrl = await pagaPayPage(input.reference);
+    if (!s.checkoutUrl) s.checkoutUrl = await pagaPayPage(reference);
     if (!s.checkoutId || !s.checkoutUrl) throw new Error('CHECKOUT_UNAVAILABLE');
-    return await this.recordIntent(s.psp, s.checkoutId, s.checkoutUrl, input, s.details) ? s : this.createCheckout(input, preferred);
+    const details = { ...(s.details ?? {}), ...(input.metadata?.source ? { source: input.metadata.source } : {}) };
+    return await this.recordIntent(resolved, reference, s.checkoutId, s.checkoutUrl, input.amountKobo, details) ? s : this.createCheckout(input);
   }
 
-  /** Server-side verify of a charge (webhook is never trusted alone). */
-  async verify(psp: PSP, chargeId: string): Promise<VerifiedPayment> {
-    const adapter = this.adapters[psp] ?? this.adapters.bachs; // legacy rows may carry a retired PSP name
-    return withRetry(() => adapter.verifyByChargeId(chargeId));
+  /** Server-side status of a payment at Paga (webhooks and clients are never trusted for amounts). */
+  async verifyReference(reference: string): Promise<VerifiedPayment> {
+    this.requireConfigured();
+    return withRetry(() => this.paga.verifyByReference(reference));
   }
 
-  /** PSP refund for a verified charge (policy decision happens in refundService first). */
+  /** Server-side verify of a stored payment (admin/client verify endpoint). Legacy rows have no live PSP to ask. */
+  async verify(psp: string, chargeId: string): Promise<VerifiedPayment> {
+    if (psp !== 'paga') throw new Error('VERIFY_RETIRED_PSP');
+    return withRetry(() => this.paga.verifyByChargeId(chargeId));
+  }
+
+  /** Paga refund for a verified charge (policy decision happens in refundService first). */
   async refund(reference: string, amountKobo?: bigint, reason?: string): Promise<{ refundId: string; status: string }> {
-    const rows = await q<{ charge_id: string; psp: PSP }>(
-      `SELECT charge_id, psp FROM payment.payment WHERE reference=$1`, [reference],
-    );
+    const rows = await q<{ charge_id: string; psp: string }>(`SELECT charge_id, psp FROM payment.payment WHERE reference=$1`, [reference]);
     const row = rows[0];
     if (!row?.charge_id) throw new Error('CHARGE_NOT_SETTLED');
-    if (row.psp !== 'bachs' && row.psp !== 'paga') throw new Error('REFUND_RETIRED_PSP'); // pre-Oct-2026 Flutterwave charges: refund in its dashboard
-    return this.adapters[row.psp].refund({
+    if (row.psp !== 'paga') throw new Error('REFUND_RETIRED_PSP'); // pre-Paga charges: refund in that provider's dashboard
+    this.requireConfigured();
+    return this.paga.refund({
       chargeId: row.charge_id, reference: `rf_${reference}`,
       ...(amountKobo !== undefined ? { amountKobo } : {}),
       reason, idempotencyKey: `rf_${reference}`,
     });
   }
 
-  async createVirtualAccount(userId: string, email: string, name: string, preferred: PSP = 'bachs') {
-    return this.adapters[preferred].createVirtualAccount({ userId, email, name });
+  async createVirtualAccount(userId: string, email: string, name: string) {
+    this.requireConfigured();
+    return this.paga.createVirtualAccount({ userId, email, name });
   }
 
-  async verifyBankAccount(accountNumber: string, bankCode: string, preferred: PSP = 'bachs') {
-    return this.adapters[preferred].verifyBankAccount({ accountNumber, bankCode });
+  async verifyBankAccount(accountNumber: string, bankCode: string) {
+    this.requireConfigured();
+    return this.paga.verifyBankAccount({ accountNumber, bankCode });
   }
 
   /** Supported payout banks for a country (PSP reference data). */
-  async listBanks(country = 'NG', preferred: PSP = 'bachs') {
-    const adapter = this.adapters[preferred];
-    if (!adapter.listBanks) throw new Error('BANKS_UNSUPPORTED');
-    return adapter.listBanks(country);
+  async listBanks(country = 'NG') {
+    this.requireConfigured();
+    if (!this.paga.listBanks) throw new Error('BANKS_UNSUPPORTED');
+    return this.paga.listBanks(country);
   }
 
-  /** Webhook handler core: persist raw event, verify signature, then server-side verify before ledger. */
-  async handleWebhook(psp: PSP, rawBody: Buffer, headers: Record<string, string | undefined>): Promise<{ ok: boolean; verified?: VerifiedPayment; notFound?: boolean; amountMismatch?: boolean; transitioned?: boolean }> {
-    const adapter = this.adapters[psp];
+  /** Signature check + parse of a Paga payment callback. The body is only a pointer to a reference: amounts always come from /status. */
+  parseWebhook(rawBody: Buffer, headers: Record<string, string | undefined>): { ok: false } | { ok: true; eventId: string; reference: string | null; raw: string; callback: PagaCallback } {
+    if (!this.paga.verifyWebhookSignature(rawBody, headers)) return { ok: false };
     const raw = rawBody.toString('utf-8');
-    if (!adapter.verifyWebhookSignature(rawBody, headers)) return { ok: false };
-
-    const event = JSON.parse(raw) as any;
-    // Paga retries reuse notificationId; Bachs sends id/event_id.
-    const eventId = event.id ?? event.event_id ?? (event.notificationId ? `paga:${event.notificationId}` : `${psp}:${Date.now()}`);
-    
-    // Dedupe on the raw event BEFORE any PSP verify call — replays short-circuit here.
-    try {
-      await q(`INSERT INTO payment.webhook_event (psp, event_id, raw) VALUES ($1,$2,$3)`, [psp, eventId, raw]);
-    } catch {
-      // UNIQUE violation = already processed this webhook event (idempotent replay).
-      return { ok: true, verified: undefined };
-    }
-    
-    const reference =
-      event.data?.tx_ref ?? event.data?.reference ?? event.data?.checkout_id ?? event.txRef ?? event.externalReferenceNumber;
-    const chargeId = event.data?.charge_id ?? event.data?.payment_id ?? event.data?.id;
-
-    let verified: VerifiedPayment;
-    try {
-      verified = chargeId
-        ? await adapter.verifyByChargeId(String(chargeId))
-        : await adapter.verifyByReference(String(reference));
-    } catch (e) {
-      // Unknown charge at the PSP (deleted/never existed) — 404 semantics, not a crash.
-      if ((e as Error).message?.includes('404')) return { ok: true, notFound: true };
-      throw e;
-    }
-
-    if (verified.status === 'successful') {
-      // Amount cross-check: the PSP-verified amount must match what we recorded.
-      // A mismatch means tampering or a stale reference — never mark paid.
-      const rows = await q<{ amount_kobo: string | number; status: string }>(
-        `SELECT amount_kobo, status FROM payment.payment WHERE reference=$1`, [verified.reference],
-      );
-      const local = rows[0];
-      if (!local) return { ok: true, notFound: true };
-      if (BigInt(String(local.amount_kobo)) !== verified.amountKobo) {
-        return { ok: true, amountMismatch: true };
-      }
-      const changed = await q(
-        `UPDATE payment.payment SET status='successful', charge_id=$1 WHERE reference=$2 AND status<>'successful' RETURNING reference`,
-        [verified.chargeId || String(chargeId ?? ''), verified.reference],
-      );
-      return { ok: true, verified, transitioned: changed.length > 0 };
-    }
-
-    // Only `successful` + amount match may credit the ledger (caller checks expected amount).
-    return { ok: true, verified };
-  }
-
-  /**
-   * Pull-side sync for when the webhook is late or never arrives: ask the PSP
-   * about a pending payment and mark it paid if it settled with the recorded
-   * amount. `transitioned` is true only the first time, so callers settle once.
-   */
-  async reconcile(reference: string): Promise<{ status: string; transitioned: boolean; verified?: VerifiedPayment }> {
-    const rows = await q<{ psp: PSP; charge_id: string | null; amount_kobo: string; status: string }>(
-      `SELECT psp, charge_id, amount_kobo, status FROM payment.payment WHERE reference=$1`, [reference],
-    );
-    const local = rows[0];
-    if (!local) return { status: 'not_found', transitioned: false };
-    if (local.status !== 'pending' || (local.psp !== 'bachs' && local.psp !== 'paga')) return { status: local.status, transitioned: false };
-    const adapter = this.adapters[local.psp];
-    let verified: VerifiedPayment;
-    try {
-      verified = await adapter.verifyByReference(reference);
-    } catch {
-      return { status: 'pending', transitioned: false };
-    }
-    if (verified.status === 'failed') {
-      await q(`UPDATE payment.payment SET status='failed' WHERE reference=$1 AND status='pending'`, [reference]);
-      return { status: 'failed', transitioned: false, verified };
-    }
-    if (verified.status !== 'successful' || verified.reference !== reference) return { status: 'pending', transitioned: false };
-    if (BigInt(String(local.amount_kobo)) !== verified.amountKobo) return { status: 'pending', transitioned: false };
-    const changed = await q(
-      `UPDATE payment.payment SET status='successful', charge_id=COALESCE($1, charge_id) WHERE reference=$2 AND status<>'successful' RETURNING reference`,
-      [verified.chargeId || null, reference],
-    );
-    return { status: 'successful', transitioned: changed.length > 0, verified };
+    const event = JSON.parse(raw) as Record<string, unknown>;
+    const ref = event.externalReferenceNumber ?? event.referenceNumber;
+    const kobo = (v: unknown): bigint | null => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) || Number(v) < 0 ? null : BigInt(Math.round(Number(v) * 100)));
+    const notificationId = event.notificationId ? String(event.notificationId) : null;
+    return {
+      ok: true, raw,
+      eventId: notificationId ? `paga:${notificationId}` : `paga:${createHash('sha256').update(raw).digest('hex').slice(0, 32)}`,
+      reference: ref ? String(ref) : null,
+      callback: {
+        notificationId, state: event.state ? String(event.state).toUpperCase() : null, statusCode: event.statusCode === undefined ? null : String(event.statusCode),
+        paymentKobo: kobo(event.paymentAmount), cumulativeKobo: kobo(event.cumulativePaymentAmount), outstandingKobo: kobo(event.outstandingBalance),
+      },
+    };
   }
 }

@@ -133,7 +133,7 @@ describe('product vendors', () => {
     assert.equal(String(b[0].price_kobo), '135000000', 'booked at unit x quantity');
 
     // Paid (escrow) -> the final invoice shows the quantity line; totals unchanged.
-    await q(`INSERT INTO payment.payment (booking_id, psp, reference, charge_id, amount_kobo, status) VALUES ($1,'bachs',$2,$2,135000000,'successful')`, [bookingId, `bk_${bookingId}_t`]);
+    await q(`INSERT INTO payment.payment (booking_id, psp, reference, charge_id, amount_kobo, status) VALUES ($1,'paga',$2,$2,135000000,'successful')`, [bookingId, `bk_${bookingId}_t`]);
     const { issueInvoice } = await import('../modules/invoices/invoice.service.js');
     const inv = await issueInvoice(bookingId, 'final');
     assert.ok(inv, 'final invoice issued');
@@ -164,7 +164,7 @@ describe('product vendors', () => {
     const acc = await app.inject({ method: 'POST', url: `/v1/provider/requests/${r.json().data.offerId}/respond`, headers: bearer(v.token), payload: { accept: true } });
     assert.equal(acc.statusCode, 200, acc.body);
     const bookingId = String(acc.json().data.bookingId);
-    await q(`INSERT INTO payment.payment (booking_id, psp, reference, charge_id, amount_kobo, status) VALUES ($1,'bachs',$2,$2,2000000,'successful')`, [bookingId, `bk_${bookingId}_t`]);
+    await q(`INSERT INTO payment.payment (booking_id, psp, reference, charge_id, amount_kobo, status) VALUES ($1,'paga',$2,$2,2000000,'successful')`, [bookingId, `bk_${bookingId}_t`]);
     const { issueInvoice } = await import('../modules/invoices/invoice.service.js');
     const inv = await issueInvoice(bookingId, 'final');
     assert.doesNotMatch(inv!.data.lines[0].label, /×/, 'service line has no quantity');

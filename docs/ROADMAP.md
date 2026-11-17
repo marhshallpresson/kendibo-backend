@@ -11,7 +11,7 @@ teaser that asks people to join. The catalogue (trades and services) stays publi
 | 1 | Redeploy the API on Pxxl (`api-kendibo.pxxlspace.cv` returns 404) and set the server variables there | Nothing works for real users; Meta can't verify the webhook |
 | 2 | Permanent WhatsApp System User token, `WHATSAPP_BUSINESS_ACCOUNT_ID`, `FACEBOOK_APP_ID` | The current WhatsApp token expired on 31 Oct; templates and Facebook Login need the IDs |
 | 3 | `PREMBLY_APP_ID`, live Prembly keys, then `KYC_PROVIDER=prembly` | Identity checks are simulated today, so nobody is really verified |
-| 4 | `BACHS_ACCOUNT_ID`, `BACHS_WEBHOOK_SECRET`, `SLING_WEBHOOK_SECRET` | Payments can't be confirmed; delivery receipts are refused |
+| 4 | `PAGA_HASH_KEY`, `PAGA_SECRET_KEY`, `SLING_WEBHOOK_SECRET` | Payments can't be confirmed; delivery receipts are refused |
 | 5 | Media storage on FTPS or S3 (`FTP_SECURE=false` sends the password in clear) | Security |
 | 6 | Run migrations 027–030 on production after review | New tables for the WhatsApp assistant, templates, Facebook Login |
 | 7 | Submit the three WhatsApp templates (admin → WhatsApp assistant) and get them approved | Job offers and payment links outside the 24-hour window go by SMS until then |
@@ -42,7 +42,7 @@ Pidgin options on the key screens, say why before asking for anything sensitive,
 - **Members only:** browse and book after sign-up (app or WhatsApp).
 - **Commission per trade** (Trade rules page): cleaning and fumigation 15%, repairs 12%, big jobs 8% with a cap.
 - **Onboarding / verification fee** per trade, deducted from the vendor's first earnings (KYC spend is tracked per vendor).
-- **Escrow:** customers pay through Bachs. Kendibo holds the money until the customer confirms the job is done, then pays the vendor their net earnings. Payouts are capped at the available balance.
+- **Escrow:** customers pay through Paga. Kendibo holds the money until the customer confirms the job is done, then pays the vendor their net earnings. Payouts are capped at the available balance.
 - **Call-out fee** credited to the job; cancellation rules by stage.
 - **Retainers:** recurring cleaning and maintenance plans (AI-assisted reminders through Sling).
 - **Marketing** only with consent (STOP/START), never to numbers without an account.
@@ -69,7 +69,7 @@ Next:
 
 | When | Item |
 |---|---|
-| Launch | WhatsApp templates approved; Facebook Login live after App Review; Prembly live; Bachs live with webhooks |
+| Launch | WhatsApp templates approved; Facebook Login live after App Review; Prembly live; Paga live with webhooks |
 | +2 weeks | WhatsApp authentication template for OTP (cheaper than SMS); WhatsApp Flows for the intake form |
 | +1 month | Retrain the intent model on about 300 labelled customer lines; retrain the matching model after about 200 completed jobs |
 | +2 months | Queue (Redis/BullMQ) to replace the in-process WhatsApp serialisation before running more than one API instance |

@@ -560,7 +560,7 @@ function EXTRA(): [string, Intent, Trade?][] {
     ['pay small small', 'payment'],
     ['do una collect cash', 'payment'],
     ['can I transfer to the vendor', 'payment'],
-    ['what is Bachs', 'payment'],
+    ['what is Paga', 'payment'],
     ['when will the vendor get paid', 'payment'],
     ['payment', 'payment'],
     ['how to pay', 'payment'],
