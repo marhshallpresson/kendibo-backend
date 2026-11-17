@@ -123,6 +123,19 @@ export async function insertOutbox(client: { query: (t: string, p: unknown[]) =>
  * { acquired: false } without running `fn` when another process/call holds it.
  */
 export async function withAdvisoryLock<T>(key: string, fn: () => Promise<T>): Promise<{ acquired: boolean; value?: T }> {
+  // Each lock holds one pooled connection while fn() needs others; cap holders so a burst
+  // of settles cannot take the whole pool (max 10) and starve the queries inside them.
+  if (lockHolders >= LOCK_HOLDERS_MAX) await new Promise<void>((r) => lockWaiters.push(r));
+  lockHolders++;
+  try { return await advisoryLockInner(key, fn); }
+  finally { lockHolders--; lockWaiters.shift()?.(); }
+}
+
+const LOCK_HOLDERS_MAX = 5;
+let lockHolders = 0;
+const lockWaiters: Array<() => void> = [];
+
+async function advisoryLockInner<T>(key: string, fn: () => Promise<T>): Promise<{ acquired: boolean; value?: T }> {
   const { createHash } = await import('node:crypto');
   const id = Number(BigInt('0x' + createHash('sha256').update(key).digest('hex').slice(0, 12))); // 48-bit, exact as a JS number
   const base = db() as PgPool & { connect?: () => Promise<{ query: PgPool['query']; release: () => void }> };
