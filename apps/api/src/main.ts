@@ -25,6 +25,7 @@ import { geoService } from '../../../modules/geo/geo.service.js';
 import { payoutService } from '../../../modules/payouts/payout.service.js';
 import { refundService } from '../../../modules/refunds/refund.service.js';
 import { walletService } from '../../../modules/wallet/wallet.service.js';
+import { settleWalletTopup, isWalletTopupRef } from '../../../modules/payments/wallet-topup.js';
 import { disputeService, reviewService } from '../../../modules/disputes/trust.service.js';
 import { messagingService } from '../../../modules/messaging/messaging.service.js';
 import { notificationService, TEMPLATES, type NotificationChannel } from '../../../modules/notifications/notification.service.js';
@@ -996,10 +997,8 @@ void app.register(fastifyRawBody, { global: false });
  * caller passes only the first transition, so this runs once per payment).
  */
 async function settleSuccessfulPayment(reference: string, amountKobo: bigint): Promise<void> {
-  if (reference.startsWith('wt_')) {
-    const userId = reference.split('_')[1];
-    try { await walletService.credit(userId, Number(amountKobo), reference, 'topup'); } catch (e) { observability.captureException(e); }
-    observability.track('wallet.topup_succeeded', { psp: 'bachs', reference });
+  if (isWalletTopupRef(reference)) {
+    await creditWalletTopup(reference, amountKobo);
     return;
   }
   // Tier upgrade fee / Kendibo Pro subscription paid by checkout.
@@ -1019,6 +1018,14 @@ async function settleSuccessfulPayment(reference: string, amountKobo: bigint): P
     }
   } catch (e) { observability.captureException(e); }
 }
+/** Credit a successful wallet top-up (idempotent by payment reference; owner comes from the stored payment row). */
+async function creditWalletTopup(reference: string, verifiedAmountKobo?: bigint): Promise<void> {
+  try {
+    const r = await settleWalletTopup(reference, verifiedAmountKobo);
+    if (r.credited) observability.track('wallet.topup_succeeded', { psp: 'bachs', reference });
+    else if (r.reason === 'amount_mismatch' || r.reason === 'no_owner') observability.captureMessage?.(`wallet.topup_not_credited reason=${r.reason} reference=${reference}`);
+  } catch (e) { observability.captureException(e); }
+}
 /** Ask Bachs about a still-pending payment (at most every 5s per reference) and settle it if it went through. */
 const lastReconcile = new Map<string, number>();
 async function syncPendingPayment(reference: string): Promise<string | null> {
@@ -1028,6 +1035,7 @@ async function syncPendingPayment(reference: string): Promise<string | null> {
   if (lastReconcile.size > 5000) lastReconcile.clear();
   const r = await payments.reconcile(reference).catch((e) => { observability.captureException(e); return null; });
   if (r?.transitioned && r.verified) await settleSuccessfulPayment(reference, r.verified.amountKobo);
+  else if (r?.status === 'successful' && isWalletTopupRef(reference)) await creditWalletTopup(reference); // heal a credit that failed after the status flip
   return r?.status ?? null;
 }
 
@@ -1042,6 +1050,7 @@ app.get('/w/payment-return', async (req, reply) => {
     const rows = await q<{ status: string }>(`SELECT status FROM payment.payment WHERE reference=$1`, [reference]).catch(() => []);
     status = rows[0]?.status ?? 'pending';
     if (status === 'pending') status = (await syncPendingPayment(reference)) ?? status;
+    else if (status === 'successful' && isWalletTopupRef(reference)) await creditWalletTopup(reference);
   }
   if (status !== 'successful' && status !== 'failed') status = 'pending';
   const page = renderPaymentReturnPage({
@@ -1065,6 +1074,8 @@ for (const psp of ['bachs', 'paga'] as const) {
         return fail(reply, 'AMOUNT_MISMATCH', 'Amount does not match recorded payment', 409);
       }
       if (result.verified?.status === 'successful' && result.transitioned) await settleSuccessfulPayment(result.verified.reference, result.verified.amountKobo);
+      // Retry of an already-settled top-up whose credit may not have landed: idempotent by payment reference.
+      else if (result.verified?.status === 'successful' && isWalletTopupRef(result.verified.reference)) await creditWalletTopup(result.verified.reference, result.verified.amountKobo);
       return { ok: true };
     } catch (e) {
       observability.captureException(e);
@@ -1157,9 +1168,6 @@ app.get('/v1/wallet', async (req, reply) => {
 });
 app.post('/v1/wallet/topup', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
-  // Checkout callbacks are not yet reconciled into wallet credits. Do not
-  // collect real money until that flow is implemented and verified.
-  if (process.env.NODE_ENV === 'production') return fail(reply, 'WALLET_TOPUP_UNAVAILABLE', 'Wallet top-ups are temporarily unavailable', 503);
   const idem = req.headers['idempotency-key'];
   if (typeof idem !== 'string') return fail(reply, 'IDEMPOTENCY_REQUIRED', 'Idempotency-Key header required');
   const parsed = z.object({ amountKobo: z.number().int().min(100).max(50000000) }).safeParse(req.body);
@@ -1170,7 +1178,7 @@ app.post('/v1/wallet/topup', async (req, reply) => {
   try {
     const session = await payments.createCheckout({
       bookingId: 'wallet_topup', amountKobo: BigInt(parsed.data.amountKobo),
-      ...(user?.email ? { customerEmail: user.email } : {}), reference: ref, idempotencyKey: idem,
+      ...(user?.email ? { customerEmail: user.email } : {}), reference: ref, idempotencyKey: idem, userId: a.sub,
     });
     observability.track('wallet.topup_initiated', { psp: session.psp });
     return { data: session };
@@ -2531,6 +2539,7 @@ app.get('/v1/payments/:reference', async (req, reply) => {
   // Webhook late or missing: ask Bachs directly so the app never waits forever.
   let status = String(p.status);
   if (status === 'pending') status = (await syncPendingPayment(String(p.reference))) ?? status;
+  else if (status === 'successful' && isWalletTopupRef(String(p.reference))) await creditWalletTopup(String(p.reference));
   return { data: { reference: String(p.reference), psp: String(p.psp), amountKobo: String(p.amount_kobo), currency: 'NGN', status } };
 });
 app.post('/v1/payments/:reference/verify', async (req, reply) => {

@@ -14,6 +14,8 @@ export interface CreateCheckoutInput {
   reference: string; // our idempotency reference, max 128 chars
   metadata?: Record<string, string>;
   idempotencyKey: string;
+  /** Paying user, stored on the payment row (wallet top-ups credit this user). */
+  userId?: string;
 }
 
 export interface CheckoutSession {

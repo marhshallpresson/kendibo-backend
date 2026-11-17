@@ -77,9 +77,9 @@ export class PaymentService {
     const bookingId = input.bookingId === 'wallet_topup' ? '00000000-0000-0000-0000-000000000000' : input.bookingId;
     try {
       await q(
-        `INSERT INTO payment.payment (booking_id, psp, reference, charge_id, amount_kobo, status, checkout_url, psp_details)
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7::jsonb)`,
-        [bookingId, psp, input.reference, checkoutId, Number(input.amountKobo), checkoutUrl, JSON.stringify(details ?? {})],
+        `INSERT INTO payment.payment (booking_id, psp, reference, charge_id, amount_kobo, status, checkout_url, psp_details, user_id)
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7::jsonb, $8)`,
+        [bookingId, psp, input.reference, checkoutId, Number(input.amountKobo), checkoutUrl, JSON.stringify(details ?? {}), input.bookingId === 'wallet_topup' ? (input.userId ?? null) : null],
       );
       return true;
     } catch (error) {
