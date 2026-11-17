@@ -12,15 +12,15 @@ import { walletService } from '../modules/wallet/wallet.service.js';
 import { signAccess } from '../packages/auth/auth.js';
 
 const fakePsp = {
-  name: 'bachs',
-  createCheckout: async (input: { reference: string }) => ({ psp: 'bachs', checkoutId: `chk_test_${input.reference}`, checkoutUrl: 'https://pay.test/checkout', reference: input.reference, status: 'open' }),
-  verifyByReference: async (reference: string) => ({ psp: 'bachs', chargeId: `ch_${reference}`, reference, amountKobo: 0n, currency: 'NGN', status: 'pending' }),
-  verifyByChargeId: async (chargeId: string) => ({ psp: 'bachs', chargeId, reference: chargeId, amountKobo: 0n, currency: 'NGN', status: 'pending' }),
+  name: 'paga',
+  createCheckout: async (input: { reference: string }) => ({ psp: 'paga', checkoutId: `chk_test_${input.reference}`, checkoutUrl: 'https://pay.test/checkout', reference: input.reference, status: 'open' }),
+  verifyByReference: async (reference: string) => ({ psp: 'paga', chargeId: `ch_${reference}`, reference, amountKobo: 0n, currency: 'NGN', status: 'pending' }),
+  verifyByChargeId: async (chargeId: string) => ({ psp: 'paga', chargeId, reference: chargeId, amountKobo: 0n, currency: 'NGN', status: 'pending' }),
   refund: async () => ({ refundId: 'rf_test', status: 'processing' }),
   createPayout: async () => ({ payoutId: 'pay_test', status: 'pending' }),
   verifyWebhookSignature: () => true,
 };
-(globalThis as Record<string, unknown>).__PSP__ = { bachs: fakePsp };
+(globalThis as Record<string, unknown>).__PSP__ = { paga: fakePsp };
 
 let app: { inject: (opts: unknown) => Promise<{ statusCode: number; json: () => Record<string, any> }>; close?: () => Promise<void> };
 before(async () => {
@@ -94,7 +94,7 @@ describe('wallet routes', () => {
     try {
       const response = await app.inject({ method: 'POST', url: '/v1/wallet/topup', headers: { ...auth(u), ...idem() }, payload: { amountKobo: 5000 } });
       assert.equal(response.statusCode, 200);
-      assert.equal(response.json().data.psp, 'bachs');
+      assert.equal(response.json().data.psp, 'paga');
     } finally {
       process.env.NODE_ENV = previous;
     }
@@ -116,7 +116,7 @@ describe('wallet routes', () => {
       payload: { amountKobo: 5000 },
     });
     assert.equal(top.statusCode, 200);
-    assert.equal(top.json().data.psp, 'bachs');
+    assert.equal(top.json().data.psp, 'paga');
     const w = await app.inject({ method: 'GET', url: '/v1/wallet', headers: auth(u) });
     assert.equal(w.statusCode, 200);
     assert.equal(w.json().data.balanceKobo, 0); // nothing credited until webhook verifies

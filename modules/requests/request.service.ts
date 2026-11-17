@@ -419,7 +419,7 @@ export const requestService = {
   },
 };
 
-/** Tell a WhatsApp-sourced customer their vendor accepted (with the Bachs pay
+/** Tell a WhatsApp-sourced customer their vendor accepted (with the Paga pay
  *  link when the job has a fixed price). Never throws into the accept path. */
 async function notifyWhatsappCustomer(requestId: string, bookingId: string | null): Promise<void> {
   try {

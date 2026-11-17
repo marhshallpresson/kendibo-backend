@@ -9,7 +9,7 @@
 | 3 | **WhatsApp utility templates**: job offer for vendors (1 variable + Accept/Decline quick replies) and "vendor accepted + pay" (vendor, amount, link) | Messages outside the 24-hour customer-service window. Until they are approved and named in `WHATSAPP_TEMPLATE_JOB_OFFER` / `WHATSAPP_TEMPLATE_VENDOR_ACCEPTED`, those messages go by SMS through Sling. | WhatsApp Manager → Message templates |
 | 4 | **Anthropic API** (console.anthropic.com), optional | `ANTHROPIC_API_KEY` | Only used for messages the classifier is unsure about, capped by `WHATSAPP_AI_DAILY_TURNS` (per customer) and `WHATSAPP_AI_GLOBAL_DAILY_TURNS`. Set a monthly spend limit. `WHATSAPP_AI_MODEL`: `claude-opus-5-5` (default) or `claude-haiku-5-5` (fastest and cheapest) |
 | 5 | **Google Cloud**: Maps JavaScript API, Places API (New), Geocoding API | `GOOGLE_MAPS_BROWSER_KEY`, restricted to the referrer `<API>/w/*` | Without it the page still works with GPS and a typed address |
-| 6 | **Bachs.io live keys** | `BACHS_*` | The only payment provider. Flutterwave has been removed. |
+| 6 | **Paga live keys** | `PAGA_*` | The only payment provider. Flutterwave has been removed. |
 | 7 | Set `WHATSAPP_BUSINESS_NUMBER`, `WHATSAPP_LINK_SECRET` and `WHATSAPP_WEB_BASE_URL` | | `.env` |
 
 Check `GET /v1/admin/integrations` (it shows which keys are set, never their values).
@@ -20,7 +20,7 @@ The assistant was rebuilt (Nov 2026) as a deterministic flow with an in-process 
 
 1. **Understanding** (`modules/whatsapp/nlu`). Every text is read by our own intent and scope classifier (character n-grams + logistic regression, trained in-process on ~540 starter lines in Nigerian English and Pidgin plus every line ops label). Deterministic extractors read the trade ("my AC dey leak"), the budget ("15k", "₦20,000", "twenty thousand"), the day ("next tomorrow", "Saturday", "5 Nov") and the time ("by 4", "morning"). Explicit dates use chrono-node, the one open-source library added.
 2. **Booking flow** (`flow.ts`). One message per step, with buttons or lists: what needs doing → trade → photo (optional) → budget (optional) → location (our map page or a shared WhatsApp location) → day → time → summary with **Find vendors** / **Change something**. Anything the customer already said is filled in and skipped, so "my AC dey leak water, budget 15k, tomorrow morning" goes straight to the photo, then the location, then the summary.
-3. **Matched vendors**. Confirming creates the request, ranks vendors with the matching model, and sends **See vendors**. The vendor gets Accept / Decline; when they accept, the customer gets a Bachs payment link (or a "they'll quote first" note).
+3. **Matched vendors**. Confirming creates the request, ranks vendors with the matching model, and sends **See vendors**. The vendor gets Accept / Decline; when they accept, the customer gets a Paga payment link (or a "they'll quote first" note).
 4. **Questions** about payments, refunds, prices (from the catalogue), coverage, safety, warranty or joining as a vendor get the official answers in `facts.ts`, then the open step again. **Off-topic** requests are declined without any AI call.
 5. **A person**: "agent", complaints, damage, refunds and safety go to the support inbox; the bot stays quiet until the customer types `bot` (or 12 hours of quiet).
 6. **AI fallback**: only messages the classifier is unsure about go to Claude (tools only, scope-restricted prompt, daily caps). Without a key they get a clarifying question.
@@ -53,7 +53,7 @@ These are from desk research in October 2026 and are indicative; run a quick 10�
   - Small generator service: ₦12k
   - Lagos and Abuja: +25–35%
 - **Customer service fee:** none at the Uyo launch. Add ₦300–500 flat in Lagos and Abuja later.
-- **Deposits:** take a 30–50% deposit through Bachs, held by Kendibo until the job is done, on jobs over ₦50k (so vendors can buy materials).
+- **Deposits:** take a 30–50% deposit through Paga, held by Kendibo until the job is done, on jobs over ₦50k (so vendors can buy materials).
 - **Payment options:** make bank transfer the default. Allow cash only for repeat customers. Offer the guarantee only when payment goes through the app.
 - **Recurring plans:** recurring cleaning at 10–15% off, and AC/generator maintenance plans. Avoid "fix anything" annual plans.
 - **Vendor earnings:** a vendor's net pay for a typical day should be at least the local day rate (Uyo ₦10–15k, Lagos ₦15–25k).

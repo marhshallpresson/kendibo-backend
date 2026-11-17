@@ -4,7 +4,7 @@
 // Production: set DATABASE_URL to RDS and this module is bypassed.
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { newDb, type IMemoryDb } from 'pg-mem';
+import { newDb, DataType, type IMemoryDb } from 'pg-mem';
 
 let mem: IMemoryDb | null = null;
 
@@ -24,6 +24,16 @@ export function localDb(): IMemoryDb {
         const r = (Math.random() * 16) | 0;
         return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
       }),
+  } as never);
+  // pg-mem has no advisory locks: emulate them process-wide so the same SQL runs locally.
+  const heldLocks = new Set<number>();
+  mem.public.registerFunction({
+    name: 'pg_try_advisory_lock', args: [DataType.bigint], returns: DataType.bool, impure: true,
+    implementation: (k: number) => { if (heldLocks.has(Number(k))) return false; heldLocks.add(Number(k)); return true; },
+  } as never);
+  mem.public.registerFunction({
+    name: 'pg_advisory_unlock', args: [DataType.bigint], returns: DataType.bool, impure: true,
+    implementation: (k: number) => heldLocks.delete(Number(k)),
   } as never);
   const run = (f: string) => {
     try {
@@ -139,6 +149,7 @@ export function localDb(): IMemoryDb {
   run('061_tier_perf_indexes.sql');
   run('062_pricing_config_seed.sql');
   run('064_payment_owner_user.sql');
+  run('065_paga_only_settlement.sql');
   run('043_invoices_schedule_updates.sql');
   run('040_whatsapp_sessions_recovery.sql');
   console.log('[localdb] pg-mem ready (001-019, 021-032)');

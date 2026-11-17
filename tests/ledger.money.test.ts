@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { koboToBachsDecimal, bachsDecimalToKobo } from '../modules/payments/money.js';
+import { koboToDecimal, decimalToKobo } from '../modules/payments/money.js';
 import { postCollection, postSettlement, trialBalance, openPeriod, reverseJournal } from '../modules/ledger/ledger.service.js';
 import { transition } from '../modules/job-engine/job.machine.js';
 
@@ -8,9 +8,9 @@ import { transition } from '../modules/job-engine/job.machine.js';
 // @ts-ignore
 if (typeof globalThis.Kendibo_TEST_ISOLATION === 'undefined') { (globalThis as any).Kendibo_TEST_ISOLATION = true; delete process.env.DATABASE_URL; delete process.env.REDIS_URL; }
 describe('money boundaries', () => {
-  it('kobo <-> bachs decimal', () => {
-    assert.equal(koboToBachsDecimal(700000n), '7000.00');
-    assert.equal(bachsDecimalToKobo('7000.00'), 700000n);
+  it('kobo <-> decimal string', () => {
+    assert.equal(koboToDecimal(700000n), '7000.00');
+    assert.equal(decimalToKobo('7000.00'), 700000n);
   });
 });
 

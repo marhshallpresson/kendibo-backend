@@ -1,6 +1,6 @@
 // Money: internal authority is integer kobo (bigint). No floats.
 // NGN 25,000 == 2_500_000n kobo. Adapters convert at the boundary:
-// - Bachs.io wants decimal strings ("7000.00") + ISO currency — never minor units.
+// - decimal-string PSP APIs ("7000.00") are converted at the adapter boundary, never minor units.
 
 export type Kobo = bigint;
 export const CURRENCY = 'NGN' as const;
@@ -13,16 +13,16 @@ export function nairaToKobo(naira: number | string): Kobo {
   return v;
 }
 
-/** kobo -> Bachs decimal string e.g. 700000n -> "7000.00" */
-export function koboToBachsDecimal(kobo: Kobo): string {
+/** kobo -> decimal string e.g. 700000n -> "7000.00" */
+export function koboToDecimal(kobo: Kobo): string {
   if (kobo <= 0n) throw new Error('AMOUNT_MUST_BE_POSITIVE');
   const naira = kobo / 100n;
   const rem = kobo % 100n;
   return `${naira.toString()}.${rem.toString().padStart(2, '0')}`;
 }
 
-/** Bachs decimal string -> kobo e.g. "7000.00" -> 700000n */
-export function bachsDecimalToKobo(decimal: string): Kobo {
+/** decimal string -> kobo e.g. "7000.00" -> 700000n */
+export function decimalToKobo(decimal: string): Kobo {
   return nairaToKobo(decimal);
 }
 

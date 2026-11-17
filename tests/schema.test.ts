@@ -20,16 +20,16 @@ describe('schema (PRD Appendix B, local pg-mem)', () => {
     const db = localDb();
     const bad = () =>
       db.public.query(
-        `INSERT INTO payment.payment (booking_id, psp, reference, amount_kobo) VALUES (gen_random_uuid(),'bachs','dup-ref-test',0)`,
+        `INSERT INTO payment.payment (booking_id, psp, reference, amount_kobo) VALUES (gen_random_uuid(),'paga','dup-ref-test',0)`,
       );
     assert.throws(bad, /check constraint/i);
     db.public.query(
-      `INSERT INTO payment.payment (booking_id, psp, reference, amount_kobo) VALUES (gen_random_uuid(),'bachs','dup-ref-test',100000)`,
+      `INSERT INTO payment.payment (booking_id, psp, reference, amount_kobo) VALUES (gen_random_uuid(),'paga','dup-ref-test',100000)`,
     );
     assert.throws(
       () =>
         db.public.query(
-          `INSERT INTO payment.payment (booking_id, psp, reference, amount_kobo) VALUES (gen_random_uuid(),'bachs','dup-ref-test',100000)`,
+          `INSERT INTO payment.payment (booking_id, psp, reference, amount_kobo) VALUES (gen_random_uuid(),'paga','dup-ref-test',100000)`,
         ),
       /duplicate/i,
     );

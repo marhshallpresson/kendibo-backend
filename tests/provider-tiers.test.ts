@@ -10,18 +10,18 @@ import { signAccess } from '../packages/auth/auth.js';
 import { walletService } from '../modules/wallet/wallet.service.js';
 
 const fakePsp = {
-  name: 'bachs',
+  name: 'paga',
   createCheckout: async (input: { reference: string }) => ({
-    psp: 'bachs', checkoutId: `chk_${input.reference}`, checkoutUrl: `https://pay.test/c/${input.reference}`, reference: input.reference, status: 'open',
+    psp: 'paga', checkoutId: `chk_${input.reference}`, checkoutUrl: `https://pay.test/c/${input.reference}`, reference: input.reference, status: 'open',
   }),
-  getCheckout: async (checkoutId: string, reference: string) => ({ psp: 'bachs', checkoutId, checkoutUrl: `https://pay.test/c/${reference}`, reference, status: 'open' }),
-  verifyByReference: async (reference: string) => ({ psp: 'bachs', chargeId: `ch_${reference}`, reference, amountKobo: 0n, currency: 'NGN', status: 'pending' }),
-  verifyByChargeId: async (chargeId: string) => ({ psp: 'bachs', chargeId, reference: chargeId, amountKobo: 0n, currency: 'NGN', status: 'pending' }),
+  getCheckout: async (checkoutId: string, reference: string) => ({ psp: 'paga', checkoutId, checkoutUrl: `https://pay.test/c/${reference}`, reference, status: 'open' }),
+  verifyByReference: async (reference: string) => ({ psp: 'paga', chargeId: `ch_${reference}`, reference, amountKobo: 0n, currency: 'NGN', status: 'pending' }),
+  verifyByChargeId: async (chargeId: string) => ({ psp: 'paga', chargeId, reference: chargeId, amountKobo: 0n, currency: 'NGN', status: 'pending' }),
   refund: async () => ({ refundId: 'rf_test', status: 'processing' }),
   createPayout: async () => ({ payoutId: 'pay_test', status: 'pending' }),
   verifyWebhookSignature: () => true,
 };
-(globalThis as Record<string, unknown>).__PSP__ = { bachs: fakePsp };
+(globalThis as Record<string, unknown>).__PSP__ = { paga: fakePsp };
 
 process.env.NODE_ENV = 'test';
 // Tier limits are enforced together with vendor eligibility.
@@ -211,12 +211,15 @@ describe('upgrade applications', () => {
     assert.equal(d.status, 'pending_payment');
     assert.equal(d.payment.method, 'checkout');
     assert.ok(String(d.payment.checkoutUrl).startsWith('https://pay.test/'));
-    assert.ok(String(d.payment.reference).startsWith('tier_'));
+    assert.ok(String(d.payment.reference).startsWith('kb_t_'), 'server-minted Paga reference');
+    assert.ok(String(d.payment.reference).length <= 50);
     const pay = await q<{ amount_kobo: string }>(`SELECT amount_kobo FROM payment.payment WHERE reference=$1`, [d.payment.reference]);
     assert.equal(Number(pay[0].amount_kobo), 250_000, 'server-set amount');
 
-    assert.equal(await tierService.onCheckoutPaid(d.payment.reference, 1n), false, 'wrong amount never marks it paid');
-    assert.equal(await tierService.onCheckoutPaid(d.payment.reference, 250_000n), true);
+    const subject = String((await q<{ subject_ref: string }>(`SELECT subject_ref FROM payment.payment WHERE reference=$1`, [d.payment.reference]))[0].subject_ref);
+    assert.ok(subject.startsWith('tier_'), 'row remembers the tier application it pays for');
+    assert.equal(await tierService.onCheckoutPaid(subject, 1n), false, 'wrong amount never marks it paid');
+    assert.equal(await tierService.onCheckoutPaid(subject, 250_000n), true);
     const view = (await call('GET', '/v1/provider/tier', uid)).json().data;
     assert.equal(view.application.status, 'under_review');
 
@@ -578,7 +581,7 @@ describe('tier/sub checkout status for the provider', () => {
     const ap = await call('POST', '/v1/provider/tier/apply', uid, { targetTier: 2 }); // empty wallet -> checkout
     assert.equal(ap.statusCode, 200, ap.body);
     const reference = ap.json().data.payment.reference;
-    assert.match(reference, /^tier_/);
+    assert.match(reference, /^kb_t_/);
     const mine = await call('GET', `/v1/payments/${reference}`, uid);
     assert.equal(mine.statusCode, 200, mine.body);
     assert.equal(mine.json().data.reference, reference);

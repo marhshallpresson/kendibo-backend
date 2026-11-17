@@ -2,7 +2,7 @@
 // production values, and dotenv never overrides a variable that is already set,
 // so everything below wins: the local API gets an in-memory database, its own
 // signing secrets (a token minted here must never work against production), and
-// no outbound SMS / email / WhatsApp / push / live Bachs checkouts. Read-only
+// no outbound SMS / email / WhatsApp / push / live Paga checkouts. Read-only
 // provider checks live in `npm run integrations:check`.
 import crypto from 'node:crypto';
 
@@ -32,7 +32,7 @@ Object.assign(process.env, {
   SMTP_HOST: '', SMTP_USER: '', SMTP_PASS: '',
   WHATSAPP_ACCESS_TOKEN: '', WHATSAPP_APP_SECRET: '',
   FIREBASE_SERVICE_ACCOUNT_JSON: '', FCM_SERVER_KEY: '',
-  BACHS_API_KEY: '', BACHS_WEBHOOK_SECRET: '',
+  PAGA_PUBLIC_KEY: '', PAGA_SECRET_KEY: '', PAGA_HASH_KEY: '',
   WATCHUP_API_KEY: '',
   FTP_PASS: '', STORAGE_ACCESS_KEY: '', STORAGE_SECRET_KEY: '',
 });

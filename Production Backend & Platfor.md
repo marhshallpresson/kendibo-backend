@@ -113,7 +113,7 @@ The supplied plan already defines this correctly: Kendibo is fundamentally a **t
 | CDN                 | CloudFront                                    |
 | Authentication      | JWT + rotating refresh tokens                 |
 | OTP                 | SMS provider                                  |
-| Payments            | Bachs.io + Flutterwave adapter                |
+| Payments            | Paga adapter                |
 | KYC                 | KycPort adapter                               |
 | Maps                | MapsPort adapter                              |
 | Push                | Firebase Cloud Messaging                      |
@@ -194,7 +194,7 @@ External integrations:
        │               │                │
     Payments          KYC             Maps
        │               │                │
- Bachs.io/FW      Dojah/etc       Google/Mapbox
+ Paga            Dojah/etc       Google/Mapbox
        │
        ├── SMS
        ├── WhatsApp
@@ -215,7 +215,7 @@ booking.service.ts
 to directly import:
 
 ```ts
-Bachs.io.sdk
+Paga sdk
 ```
 
 Instead:
@@ -223,7 +223,7 @@ Instead:
 ```ts
 PaymentPort
    ↑
-   ├── Bachs.ioAdapter
+   ├── PagaAdapter
    └── FlutterwaveAdapter
 ```
 
@@ -1181,7 +1181,7 @@ Payment architecture:
 ```text
 PaymentPort
 │
-├── Bachs.ioAdapter
+├── PagaAdapter
 └── FlutterwaveAdapter
 ```
 
@@ -1198,7 +1198,7 @@ POST /payments/:id/refund
 Webhook:
 
 ```http
-POST /webhooks/payments/Bachs.io
+POST /webhooks/payments/paga
 POST /webhooks/payments/flutterwave
 ```
 
@@ -2369,7 +2369,7 @@ Reports:
 ```text
 Postgres
 Redis
-Bachs.io
+Paga
 Maps
 KYC
 SMS
@@ -2564,7 +2564,7 @@ KYC sandbox
 ## Contract
 
 ```text
-Bachs.io
+Paga
 Flutterwave
 KYC
 SMS
@@ -3101,7 +3101,7 @@ The platform should ultimately look like this:
           │           │           │
           └───────────┼───────────┘
                       │
-              Bachs.io / Flutterwave
+              Paga
                       
                       
               OBSERVABILITY PLANE

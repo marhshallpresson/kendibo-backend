@@ -115,3 +115,23 @@ export async function q<T = Record<string, unknown>>(text: string, params: unkno
 export async function insertOutbox(client: { query: (t: string, p: unknown[]) => Promise<unknown> }, topic: string, payload: unknown) {
   await client.query('INSERT INTO outbox_event(topic, payload) VALUES ($1, $2)', [topic, JSON.stringify(payload)]);
 }
+
+/**
+ * Run `fn` only if a Postgres advisory lock for `key` is free (pg_try_advisory_lock).
+ * The lock is session-level, so it is taken, used and released on ONE dedicated
+ * connection; if the process dies Postgres drops it with the connection. Returns
+ * { acquired: false } without running `fn` when another process/call holds it.
+ */
+export async function withAdvisoryLock<T>(key: string, fn: () => Promise<T>): Promise<{ acquired: boolean; value?: T }> {
+  const { createHash } = await import('node:crypto');
+  const id = Number(BigInt('0x' + createHash('sha256').update(key).digest('hex').slice(0, 12))); // 48-bit, exact as a JS number
+  const base = db() as PgPool & { connect?: () => Promise<{ query: PgPool['query']; release: () => void }> };
+  const client = typeof base.connect === 'function' ? await base.connect() : null;
+  const run = (text: string) => (client ?? base).query(text, [id]);
+  try {
+    const got = await run('SELECT pg_try_advisory_lock($1) AS ok');
+    if (!(got.rows[0] as { ok?: boolean } | undefined)?.ok) return { acquired: false };
+    try { return { acquired: true, value: await fn() }; }
+    finally { await run('SELECT pg_advisory_unlock($1) AS ok').catch(() => {}); }
+  } finally { client?.release(); }
+}
