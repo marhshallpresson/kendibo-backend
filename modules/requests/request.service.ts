@@ -108,11 +108,21 @@ export const requestService = {
         if (addr[0].lng != null) lng = Number(addr[0].lng);
       }
     }
+    // service_id is a FK to catalog.service: a stale or wrong id (e.g. a category id) must
+    // never fail the request, so drop it to null when it does not exist.
+    let serviceId = input.serviceId ?? null;
+    if (serviceId) {
+      const known = await q(`SELECT 1 FROM catalog.service WHERE id=$1`, [serviceId]);
+      if (!known[0]) {
+        emit('request.unknown_service_id_dropped', { userId, serviceId });
+        serviceId = null;
+      }
+    }
     const rows = await q<Record<string, unknown>>(
       `INSERT INTO booking.service_request
         (user_id, service_id, category_id, title, details, urgency, address_id, lat, lng, contact_name, contact_phone, contact_email, notes, sms_updates, scheduled_date, time_window, idempotency_key, preferred_provider_id, source)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
-      [userId, input.serviceId ?? null, input.categoryId ?? null, input.title, input.details ?? '', input.urgency ?? 'this_week',
+      [userId, serviceId, input.categoryId ?? null, input.title, input.details ?? '', input.urgency ?? 'this_week',
        input.addressId ?? null, lat, lng,
        input.contactName ?? null, input.contactPhone ?? null, input.contactEmail ?? null,
        input.notes ?? null, input.smsUpdates ?? true, input.scheduledDate ?? null, input.timeWindow ?? null,
