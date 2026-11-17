@@ -8,6 +8,23 @@
 --    wallet) and 'expired' (never paid within 48h) join pending/successful/failed.
 ALTER TABLE payment.payment DROP CONSTRAINT IF EXISTS payment_constraint_1;
 ALTER TABLE payment.payment DROP CONSTRAINT IF EXISTS payment_payment_psp_check;
+-- Some databases carry the psp/status checks under other names (e.g. payment_psp_check):
+-- drop every CHECK on these columns whatever it is called; the psp check is re-added below.
+DO $$
+DECLARE c record;
+BEGIN
+  FOR c IN
+    SELECT con.conname, rel.relname
+      FROM pg_constraint con
+      JOIN pg_class rel ON rel.oid = con.conrelid
+      JOIN pg_namespace ns ON ns.oid = rel.relnamespace
+     WHERE ns.nspname = 'payment' AND rel.relname IN ('payment', 'webhook_event') AND con.contype = 'c'
+       AND (pg_get_constraintdef(con.oid) ILIKE '%psp%'
+         OR (rel.relname = 'payment' AND pg_get_constraintdef(con.oid) ILIKE '%status%'))
+  LOOP
+    EXECUTE format('ALTER TABLE payment.%I DROP CONSTRAINT %I', c.relname, c.conname);
+  END LOOP;
+END $$;
 UPDATE payment.payment SET psp = 'legacy_card' WHERE psp = 'b' || 'achs';
 UPDATE payment.webhook_event SET psp = 'legacy_card' WHERE psp = 'b' || 'achs';
 ALTER TABLE payment.payment ADD CONSTRAINT payment_constraint_1
