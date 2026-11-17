@@ -46,6 +46,7 @@ export const identityService = {
     let phone = '';
     if (digits.startsWith('234') && digits.length >= 12) phone = `+${digits.slice(0, 13)}`;
     else if (digits.startsWith('0') && digits.length === 11) phone = `+234${digits.slice(1)}`;
+    else if (/^[789]\d{9}$/.test(digits)) phone = `+234${digits}`; // 803 123 4567 typed without the leading 0
     else if (/^\d{7,15}$/.test(digits)) phone = `+${digits}`;
     if (!phone) throw new Error('BAD_IDENTITY');
     return { channel: 'phone', value: phone };
@@ -267,6 +268,35 @@ export const identityService = {
     await q(`UPDATE identity.users SET status='inactive' WHERE id=$1`, [userId]);
     await this.logoutAll(userId);
     return { ok: true };
+  },
+  /**
+   * Link a phone number to a signed-in account so the owner can also sign in with it.
+   * Step 1 sends a code to the number; step 2 links it once the code is confirmed,
+   * so nobody can attach a number they do not hold. A number already on another
+   * account is refused.
+   */
+  async requestPhoneLink(userId: string, raw: string) {
+    const norm = this.normalizeIdentity(raw);
+    if (norm.channel !== 'phone') throw new Error('BAD_IDENTITY');
+    const taken = await q(`SELECT 1 FROM identity.users WHERE phone=$1 AND id<>$2`, [norm.value, userId]);
+    if (taken[0]) throw new Error('PHONE_IN_USE');
+    const r = await issueOtp('phone', norm.value);
+    try {
+      await sms.send(norm.value, `Your Kendibo code to add this phone number is ${r.code}. It expires in 5 minutes.`, { type: 'otp' });
+    } catch (e) {
+      throw Object.assign(new Error('SEND_FAILED'), { cause: e });
+    }
+    return { phone: norm.value, devCode: r.devCode };
+  },
+  async confirmPhoneLink(userId: string, raw: string, code: string) {
+    const norm = this.normalizeIdentity(raw);
+    if (norm.channel !== 'phone') throw new Error('BAD_IDENTITY');
+    if (!(await verifyOtp('phone', norm.value, code))) throw new Error('BAD_OTP');
+    const taken = await q(`SELECT 1 FROM identity.users WHERE phone=$1 AND id<>$2`, [norm.value, userId]);
+    if (taken[0]) throw new Error('PHONE_IN_USE');
+    await q(`UPDATE identity.users SET phone=$2, updated_at=now() WHERE id=$1`, [userId, norm.value]);
+    emit('identity.phone_linked', { userId });
+    return { phone: norm.value };
   },
   /** Pre-check for the login button: normalises identity, answers existence only. */
   async accountExists(identity: string): Promise<{ exists: boolean; channel: 'phone' | 'email' }> {

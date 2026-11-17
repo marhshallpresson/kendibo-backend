@@ -169,12 +169,15 @@ export class PagaAdapter implements PaymentPort {
 
   async verifyBankAccount(input: { accountNumber: string; bankCode: string }): Promise<{ accountName: string; valid: boolean }> {
     const reference = `vb_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const amount = '100.00';
+    // Name enquiry only (nothing is sent). Paga still checks the business wallet covers
+    // amount + fee, so ask about the smallest amount: N1 needs about N55 in the wallet.
+    const amount = '1.00';
     try {
       const json = await this.client.business('validateDepositToBank', {
         referenceNumber: reference, amount, currency: 'NGN',
         destinationBankUUID: input.bankCode, destinationBankAccountNumber: input.accountNumber,
       }, [reference, amount, input.bankCode, input.accountNumber]);
+      if (Number(json.responseCode) === 139) throw new PagaError('INSUFFICIENT_BALANCE', 'Paga business balance is too low to look up account names', undefined, json);
       const ok = Number(json.responseCode) === 0 && Boolean(json.destinationAccountHolderNameAtBank);
       return { accountName: ok ? String(json.destinationAccountHolderNameAtBank) : '', valid: ok };
     } catch (e) {

@@ -2311,7 +2311,16 @@ app.post('/v1/payouts/resolve-account', async (req, reply) => {
   const userProfile = await identityService.me(a.sub).catch(() => null);
   const provProfile = await providerService.byUserId(a.sub).catch(() => null);
 
-  let r = await payments.verifyBankAccount(accountNumber, bankCode).catch(() => ({ valid: false, accountName: undefined }));
+  let lookupDown = false;
+  let r = await payments.verifyBankAccount(accountNumber, bankCode).catch((e: unknown) => {
+    if ((e as { code?: string }).code === 'INSUFFICIENT_BALANCE') {
+      lookupDown = true;
+      observability.captureException(e); // ops: fund the Paga business wallet
+      app.log.error({ code: 'PAGA_BUSINESS_BALANCE_LOW' }, 'account name lookup blocked: Paga business balance too low');
+    }
+    return { valid: false, accountName: undefined };
+  });
+  if (lookupDown) return fail(reply, 'NAME_CHECK_UNAVAILABLE', "We can't confirm account names right now. Please try again in a few minutes.", 503, true);
   // Sandbox-only: invent a name so the onboarding flow can be demoed without a
   // live PSP. NEVER in production — a made-up name always "aligns" with the
   // vendor's own profile, which would let any account receive payouts.
@@ -2446,6 +2455,31 @@ app.patch('/v1/me', async (req, reply) => {
     }).parse(req.body);
     return { data: await identityService.updateProfile(a.sub, patch) };
   } catch (e: unknown) { return fail(reply, 'BAD_PROFILE', (e as Error).message); }
+});
+// Link a phone number to the signed-in account (code sent to it first), so the
+// owner can sign in with that number too.
+const phoneLinkError = (reply: FastifyReply, e: unknown) => {
+  const m = (e as Error).message;
+  if (e instanceof z.ZodError || m === 'BAD_IDENTITY') return fail(reply, 'BAD_IDENTITY', 'Enter a valid phone number.', 400);
+  if (m === 'PHONE_IN_USE') return fail(reply, 'PHONE_IN_USE', 'This phone number is already on another Kendibo account.', 409);
+  if (m === 'BAD_OTP') return fail(reply, 'BAD_OTP', 'Invalid or expired code', 400);
+  if (m === 'SEND_FAILED') return fail(reply, 'SEND_FAILED', 'Could not deliver the code. Try again.', 502, true);
+  throw e;
+};
+app.post('/v1/me/phone/request', OTP_LIMIT, async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  try {
+    const { phone } = z.object({ phone: z.string().min(7).max(20) }).parse(req.body);
+    const r = await identityService.requestPhoneLink(a.sub, phone);
+    return { data: { sent: true, phone: r.phone, devCode: r.devCode } };
+  } catch (e) { return phoneLinkError(reply, e); }
+});
+app.post('/v1/me/phone/verify', { config: { rateLimit: { max: 10, timeWindow: '10 minutes' } } }, async (req, reply) => {
+  const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
+  try {
+    const { phone, code } = z.object({ phone: z.string().min(7).max(20), code: z.string().min(4).max(8) }).parse(req.body);
+    return { data: await identityService.confirmPhoneLink(a.sub, phone, code) };
+  } catch (e) { return phoneLinkError(reply, e); }
 });
 // Account deletion (NDPA s.34; Google Play): erases personal details. Refused
 // while a job is still open or money is in the wallet, so nobody loses either.

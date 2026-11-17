@@ -76,6 +76,11 @@ export function localDb(): IMemoryDb {
           .filter((l) => !/submission_document_kind_check/i.test(l))
           .join('\n');
       }
+      if (f === '065_paga_only_settlement.sql') {
+        // pg-mem has no DO blocks (used to drop differently named CHECKs in real
+        // databases); the named DROP CONSTRAINT lines cover the local schema.
+        sql = sql.replace(/DO \$\$[\s\S]*?END \$\$;/, '');
+      }
       if (f === '046_kyc_reviewed_by_text.sql') {
         // pg-mem can't parse ALTER COLUMN ... TYPE ... USING; the columns hold
         // no rows yet at this point locally, so recreate them as TEXT. Real
