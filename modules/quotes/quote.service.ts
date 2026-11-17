@@ -1,6 +1,12 @@
 // Quotes — Postgres-backed immutable revisions + change orders + lock.
-import { q } from '../../packages/database/db.js';
+import { q, withTx } from '../../packages/database/db.js';
 import { emit } from '../../packages/observability/emit.js';
+
+/** A quote rule was broken. statusCode lets the API's error handler answer 409 / 400 instead of 500. */
+export class QuoteError extends Error {
+  constructor(readonly code: string, readonly statusCode: number, message: string) { super(`${code}: ${message}`); }
+}
+const isUuid = (s: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
 
 export interface Quote {
   id: string; bookingId: string; providerId: string; version: number;
@@ -34,6 +40,11 @@ export const quoteService = {
     validDays?: number; warrantyDays?: number; assumptions?: string[]; exclusions?: string[];
     attachments?: string[]; providerNotes?: string; estimatedCompletion?: string;
   }): Promise<Quote> {
+    // Once money has been received the agreed price is final: no new revision may reopen it.
+    if (isUuid(bookingId)) {
+      const paid = await q(`SELECT 1 FROM payment.payment WHERE booking_id=$1 AND status='successful' LIMIT 1`, [bookingId]);
+      if (paid.length) throw new QuoteError('CONFLICT', 409, 'This booking is already paid; it cannot be re-quoted');
+    }
     const prior = await q<{ version: number }>(`SELECT version FROM booking.quote WHERE job_id=$1 ORDER BY version DESC LIMIT 1`, [bookingId]);
     const version = (prior[0]?.version ?? 0) + 1;
     const labour = input.labourKobo ?? 0n, parts = input.partsKobo ?? 0n;
@@ -57,21 +68,43 @@ export const quoteService = {
     return rows.map(toQuote);
   },
   async accept(bookingId: string, version: number): Promise<Quote> {
-    const rows = await q<Record<string, unknown>>(`SELECT * FROM booking.quote WHERE job_id=$1 AND version=$2`, [bookingId, version]);
-    const value = rows[0];
-    if (!value || String(value.status) !== 'proposed') throw new Error('QUOTE_GONE');
-    if (new Date(String(value.valid_until)).getTime() < Date.now()) {
-      await q(`UPDATE booking.quote SET status='expired' WHERE id=$1`, [String(value.id)]);
-      throw new Error('QUOTE_EXPIRED');
-    }
-    await q(`UPDATE booking.quote SET status='accepted', locked=TRUE WHERE id=$1`, [String(value.id)]);
-    await q(`UPDATE booking.quote SET status='rejected' WHERE job_id=$1 AND version!=$2 AND status='proposed'`, [bookingId, version]);
-    const upd = await q<Record<string, unknown>>(`SELECT * FROM booking.quote WHERE id=$1`, [String(value.id)]);
-    const accepted = toQuote(upd[0]);
+    // One transaction: the quote flips to accepted AND the booking's price becomes the accepted
+    // total, so the booking and its accepted quote can never disagree about what is owed.
+    const outcome = await withTx(async (c) => {
+      const rows = (await c.query(`SELECT * FROM booking.quote WHERE job_id=$1 AND version=$2`, [bookingId, version])).rows as Record<string, unknown>[];
+      const value = rows[0];
+      if (!value || String(value.status) !== 'proposed') throw new Error('QUOTE_GONE');
+      if (new Date(String(value.valid_until)).getTime() < Date.now()) {
+        await c.query(`UPDATE booking.quote SET status='expired' WHERE id=$1`, [String(value.id)]);
+        return { expired: true as const };
+      }
+      const total = BigInt(String(value.total_kobo).split('.')[0] || '0');
+      if (total <= 0n) throw new QuoteError('QUOTE_AMOUNT_INVALID', 400, 'A quote must be for more than zero to be accepted');
+      if (isUuid(bookingId)) {
+        const booked = (await c.query(`SELECT id FROM booking.booking WHERE id=$1 FOR UPDATE`, [bookingId])).rows;
+        if (booked.length) {
+          const paid = (await c.query(`SELECT 1 FROM payment.payment WHERE booking_id=$1 AND status='successful' LIMIT 1`, [bookingId])).rows;
+          if (paid.length) throw new QuoteError('CONFLICT', 409, 'This booking is already paid; its price can no longer change');
+          await c.query(`UPDATE booking.booking SET price_kobo=$2 WHERE id=$1`, [bookingId, String(total)]);
+          // An open Paga request for any other amount must never settle this booking.
+          await c.query(
+            `UPDATE payment.payment SET status='superseded', next_check_at=NULL
+              WHERE booking_id=$1 AND psp='paga' AND purpose='booking' AND status='pending' AND amount_kobo <> $2`,
+            [bookingId, Number(total)],
+          );
+        }
+      }
+      await c.query(`UPDATE booking.quote SET status='accepted', locked=TRUE WHERE id=$1`, [String(value.id)]);
+      await c.query(`UPDATE booking.quote SET status='rejected' WHERE job_id=$1 AND version!=$2 AND status='proposed'`, [bookingId, version]);
+      const upd = (await c.query(`SELECT * FROM booking.quote WHERE id=$1`, [String(value.id)])).rows as Record<string, unknown>[];
+      return { expired: false as const, quote: toQuote(upd[0]) };
+    });
+    if (outcome.expired) throw new Error('QUOTE_EXPIRED');
     emit('quote.accepted', { bookingId, version });
-    return accepted;
+    return outcome.quote;
   },
   async requestChange(bookingId: string, quoteId: string, reason: string, amountKobo: bigint, evidence: string[] = []): Promise<ChangeOrder> {
+    await assertQuoteBelongsToBooking(bookingId, quoteId);
     const rows = await q<Record<string, unknown>>(
       `INSERT INTO booking.change_order (job_id, quote_id, reason, amount_kobo, evidence) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
       [bookingId, quoteId, reason, String(amountKobo), JSON.stringify(evidence)],
@@ -81,6 +114,7 @@ export const quoteService = {
   async decideChange(id: string, approve: boolean, approver: string): Promise<ChangeOrder> {
     const rows = await q<Record<string, unknown>>(`SELECT * FROM booking.change_order WHERE id=$1`, [id]);
     if (!rows[0] || String(rows[0].status) !== 'requested') throw new Error('CHANGE_GONE');
+    if (approve) await assertQuoteBelongsToBooking(String(rows[0].job_id), String(rows[0].quote_id)); // never approve money against another booking's quote
     const upd = await q<Record<string, unknown>>(
       `UPDATE booking.change_order SET status=$2, approved_by=$3, approved_at=now() WHERE id=$1 RETURNING *`,
       [id, approve ? 'approved' : 'rejected', approver],
@@ -92,6 +126,12 @@ export const quoteService = {
     return rows.map(toChange);
   },
 };
+/** A change order may only reference a quote of its own booking. */
+async function assertQuoteBelongsToBooking(bookingId: string, quoteId: string): Promise<void> {
+  if (!isUuid(quoteId)) throw new QuoteError('QUOTE_MISMATCH', 400, 'This change order does not reference a quote of this booking');
+  const rows = await q(`SELECT 1 FROM booking.quote WHERE id=$1 AND job_id=$2`, [quoteId, bookingId]);
+  if (!rows.length) throw new QuoteError('QUOTE_MISMATCH', 400, 'This change order does not reference a quote of this booking');
+}
 function toChange(r: Record<string, unknown>): ChangeOrder {
   return {
     id: String(r.id), bookingId: String(r.job_id), quoteId: String(r.quote_id), reason: String(r.reason),

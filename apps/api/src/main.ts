@@ -26,6 +26,7 @@ import { payoutService } from '../../../modules/payouts/payout.service.js';
 import { refundService } from '../../../modules/refunds/refund.service.js';
 import { walletService } from '../../../modules/wallet/wallet.service.js';
 import { PaymentSettlement } from '../../../modules/payments/settlement.js';
+import { expectedChargeKobo, bookingHasSuccessfulPayment, supersedeStalePending } from '../../../modules/payments/expected-charge.js';
 import { startPaymentReconciler } from '../../../modules/payments/reconciler.js';
 import { disputeService, reviewService } from '../../../modules/disputes/trust.service.js';
 import { messagingService } from '../../../modules/messaging/messaging.service.js';
@@ -950,25 +951,15 @@ app.post('/v1/quotes/:bookingId/accept', async (req, reply) => {
 /** Checkout could not start: 503 when Paga is not configured, 502 for any other PSP failure. Never another PSP. */
 function checkoutFailure(reply: Parameters<typeof fail>[0], e: unknown) {
   if (e instanceof PspUnavailableError) return fail(reply, 'PSP_UNAVAILABLE', 'Payments are not available right now', 503, true);
+  // The reference (or its request) already exists for a different booking, amount or payer: a client conflict, not a PSP failure.
+  if (/PAYMENT_REFERENCE_CONFLICT/.test(String((e as Error)?.message ?? ''))) return fail(reply, 'PAYMENT_REFERENCE_CONFLICT', 'This payment reference is already in use for a different payment', 409);
   observability.captureException(e);
   return fail(reply, 'PSP_UNAVAILABLE', 'Provider unavailable', 502, true);
 }
-// Server-authoritative charge amount: the accepted quote total when one exists
-// (quote flow), otherwise the frozen booking price snapshot. The client amount
-// is advisory ONLY — a stale bundle may still send its own math, and charging
-// whatever it asked for would let the amount drift from booking.price_kobo.
-// Mismatches are charged at the server price and logged, never rejected: a
+// Server-authoritative charge amount (modules/payments/expected-charge.ts): the accepted
+// quote total when one exists, otherwise the frozen booking price. The client amount is
+// advisory ONLY. Mismatches are charged at the server price and logged, never rejected: a
 // rejected payment strands customers on older app bundles that cannot deploy.
-async function expectedChargeKobo(bookingId: string, booking: { priceKobo: string }): Promise<bigint> {
-  try {
-    const rows = await q<Record<string, unknown>>(
-      `SELECT total_kobo FROM booking.quote WHERE job_id=$1 AND status='accepted' ORDER BY version DESC LIMIT 1`,
-      [bookingId],
-    );
-    if (rows[0]) return BigInt(String(rows[0].total_kobo));
-  } catch (e: unknown) { observability.captureException(e); }
-  return BigInt(booking.priceKobo);
-}
 
 app.post('/v1/bookings/:id/payments', async (req, reply) => {
   const a = authed(req as never); if (!a) return fail(reply, 'UNAUTHENTICATED', 'Login required', 401);
@@ -980,13 +971,19 @@ app.post('/v1/bookings/:id/payments', async (req, reply) => {
   const booking = await bookingService.getRaw(bookingId);
   if (!booking) return fail(reply, 'BOOKING_NOT_FOUND', 'Booking not found', 404);
   if (booking.userId !== a.sub) return fail(reply, 'FORBIDDEN', 'Not your booking', 403);
-  const expected = await expectedChargeKobo(bookingId, booking);
+  // The agreed price is final once paid: a second checkout (new key, double tap, stale screen) must not charge again.
+  if (await bookingHasSuccessfulPayment(bookingId)) return fail(reply, 'ALREADY_PAID', 'This booking is already paid', 409);
+  const expected = await expectedChargeKobo(bookingId, booking.priceKobo);
+  if (expected <= 0n) return fail(reply, 'BAD_AMOUNT', 'This booking has no payable amount yet', 400);
   let sent: bigint | null = null;
   try { sent = BigInt(parsed.data.amountKobo); } catch { sent = null; }
   if (sent !== null && sent !== expected) {
     observability.captureMessage?.(`payment.amount_mismatch booking=${bookingId} client=${sent} server=${expected}`);
   }
   try {
+    // Open requests raised for another amount (the price changed since) can never settle this booking.
+    const stale = await supersedeStalePending(bookingId, expected);
+    if (stale.length) observability.track('booking.payment_superseded', { bookingId, count: stale.length });
     // The payer is the booking's own customer (read from our row); the reference is minted by the server.
     const session = await payments.createCheckout({
       bookingId, purpose: 'booking', amountKobo: expected,
@@ -998,6 +995,22 @@ app.post('/v1/bookings/:id/payments', async (req, reply) => {
 });
 import fastifyRawBody from 'fastify-raw-body';
 void app.register(fastifyRawBody, { global: false });
+
+/**
+ * A booking is paid: move it to CONFIRMED ("paid and booked") so the vendor sees it as paid.
+ * Uses the booking state machine through bookingService.setStatus; only pre-payment states move
+ * (REQUESTED -> PAYMENT_PENDING -> CONFIRMED, or PAYMENT_PENDING / QUOTE_PENDING -> CONFIRMED).
+ * A booking already matched, under way, completed or cancelled is left exactly as it is. Idempotent.
+ */
+async function markBookingPaid(bookingId: string): Promise<void> {
+  try {
+    const b = await bookingService.getRaw(bookingId);
+    if (!b) return;
+    if (b.status === 'REQUESTED') await bookingService.setStatus(bookingId, 'PAYMENT_PENDING', 'system');
+    const cur = await bookingService.getRaw(bookingId);
+    if (cur && (cur.status === 'PAYMENT_PENDING' || cur.status === 'QUOTE_PENDING')) await bookingService.setStatus(bookingId, 'CONFIRMED', 'system');
+  } catch (e) { observability.captureException(e); }
+}
 
 // One settlement rule for every path (webhook, return/verify, background reconciler):
 // see modules/payments/settlement.ts. Hooks plug in what only the API knows how to do.
@@ -1012,6 +1025,7 @@ const settlement = new PaymentSettlement(payments, {
     }
     // Booking or product order: books the money, then sends the receipt (WhatsApp link + verified email).
     try { await postCollection(row.reference, amount, currentPeriod()); } catch (e) { observability.captureException(e); }
+    await markBookingPaid(String(row.booking_id));
     try {
       const { onPaymentSucceeded } = await import('../../../modules/invoices/invoice.service.js');
       await onPaymentSucceeded(String(row.booking_id));
@@ -1251,7 +1265,7 @@ app.post('/v1/bookings/:id/pay-with-wallet', async (req, reply) => {
   if (!booking) return fail(reply, 'BOOKING_NOT_FOUND', 'Booking not found', 404);
   if (booking.userId !== a.sub) return fail(reply, 'FORBIDDEN', 'Not your booking', 403);
 
-  const expected = await expectedChargeKobo(bookingId, booking);
+  const expected = await expectedChargeKobo(bookingId, booking.priceKobo);
   const amountKobo = Number(expected);
   if (!Number.isSafeInteger(amountKobo) || amountKobo <= 0) {
     return fail(reply, 'BAD_AMOUNT', 'This booking has no payable amount yet', 400);

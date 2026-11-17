@@ -136,13 +136,21 @@ export class PaymentService {
     this.requireConfigured();
     if (input.amountKobo <= 0n) throw new Error('BAD_AMOUNT');
     const resolved = await this.resolve(input);
-    const reference = mintReference(resolved.purpose, resolved.userId, resolved.subject, input.idempotencyKey);
+    // A booking checkout's reference also depends on the amount: when the agreed price changes, the same
+    // idempotency key mints a NEW reference, so a request raised for the old price is never reused.
+    const subject = resolved.purpose === 'booking' ? `${resolved.subject}:${input.amountKobo}` : resolved.subject;
+    const reference = mintReference(resolved.purpose, resolved.userId, subject, input.idempotencyKey);
 
-    const existing = await q<{ psp: string; charge_id: string; booking_id: string; amount_kobo: string; status: string; checkout_url: string | null; user_id: string | null }>(
-      `SELECT psp, charge_id, booking_id, amount_kobo, status, checkout_url, user_id FROM payment.payment WHERE reference=$1 LIMIT 1`, [reference],
+    const existing = await q<{ psp: string; charge_id: string; booking_id: string; amount_kobo: string; status: string; checkout_url: string | null; user_id: string | null; received_kobo: string | number | null }>(
+      `SELECT psp, charge_id, booking_id, amount_kobo, status, checkout_url, user_id, received_kobo FROM payment.payment WHERE reference=$1 LIMIT 1`, [reference],
     );
     if (existing[0]) {
       if (String(existing[0].booking_id) !== resolved.bookingId || BigInt(String(existing[0].amount_kobo)) !== input.amountKobo || existing[0].psp !== 'paga' || String(existing[0].user_id ?? '') !== resolved.userId) throw new Error('PAYMENT_REFERENCE_CONFLICT');
+      // The price went A -> B -> A: this untouched request (no money seen) is the right one again.
+      if (existing[0].status === 'superseded' && BigInt(String(existing[0].received_kobo ?? 0)) === 0n) {
+        const reopened = await q(`UPDATE payment.payment SET status='pending', next_check_at=$2 WHERE reference=$1 AND status='superseded' AND received_kobo=0 RETURNING reference`, [reference, new Date(Date.now() + 60_000).toISOString()]);
+        if (reopened.length) existing[0].status = 'pending';
+      }
       if (existing[0].status !== 'pending' || !existing[0].charge_id || !existing[0].checkout_url) throw new Error('CHECKOUT_NOT_OPEN');
       const getCheckout = this.paga.getCheckout;
       if (!getCheckout) throw new Error('CHECKOUT_RECOVERY_UNAVAILABLE');

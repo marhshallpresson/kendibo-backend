@@ -76,6 +76,15 @@ export function localDb(): IMemoryDb {
           .filter((l) => !/submission_document_kind_check/i.test(l))
           .join('\n');
       }
+      if (f === '064_payment_owner_user.sql' || f === '065_paga_only_settlement.sql') {
+        // pg-mem has no left() and no plpgsql DO blocks, so these files stopped at the first such
+        // statement and the payment columns after it (purpose, received_kobo, ...) never existed
+        // locally. The tables are empty here: drop the data backfills and the constraint-sweeping
+        // DO block (real Postgres applies both files untouched).
+        sql = sql
+          .replace(/DO \$\$[\s\S]*?END \$\$;/i, '')
+          .replace(/^UPDATE [^;]*;/gim, '');
+      }
       if (f === '046_kyc_reviewed_by_text.sql') {
         // pg-mem can't parse ALTER COLUMN ... TYPE ... USING; the columns hold
         // no rows yet at this point locally, so recreate them as TEXT. Real

@@ -82,7 +82,7 @@ describe('booking payments are server-priced', () => {
     const settlement = new PaymentSettlement(new PaymentService({ paga: fakePsp as never }), { confirm: async () => {}, notify: async () => {}, track: () => {} });
     assert.equal((await settlement.settle(`kb_b_${randomUUID().replace(/-/g, '').slice(0, 24)}`)).status, 'not_found');
   });
-  it('recovers a checkout on replay and rejects a changed amount', async () => {
+  it('recovers a checkout on replay and mints a new reference for a changed amount', async () => {
     const { PaymentService } = await import('../modules/payments/payment.service.js');
     const payments = new PaymentService({ paga: fakePsp as never });
     const booking = await createBooking(await testUser());
@@ -91,7 +91,9 @@ describe('booking payments are server-priced', () => {
     const replay = await payments.createCheckout(input);
     assert.equal(replay.checkoutUrl, first.checkoutUrl);
     assert.equal(replay.checkoutId, first.checkoutId);
-    await assert.rejects(() => payments.createCheckout({ ...input, amountKobo: input.amountKobo + 1n }), /PAYMENT_REFERENCE_CONFLICT/);
+    // The amount is part of the reference: a price change with the same key is a new request, never a clash with the old one.
+    const repriced = await payments.createCheckout({ ...input, amountKobo: input.amountKobo + 1n });
+    assert.notEqual(repriced.checkoutId, first.checkoutId);
     const expired = new PaymentService({ paga: { ...fakePsp, getCheckout: async () => { throw new Error('CHECKOUT_NOT_OPEN'); } } as never });
     await assert.rejects(() => expired.createCheckout(input), /CHECKOUT_NOT_OPEN/);
   });

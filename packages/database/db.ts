@@ -111,6 +111,25 @@ export async function q<T = Record<string, unknown>>(text: string, params: unkno
   }
 }
 
+/**
+ * Run `fn` inside one database transaction on one dedicated connection: COMMIT when it
+ * resolves, ROLLBACK when it throws. `fn` must use the client it is given (not q()).
+ */
+export async function withTx<T>(fn: (client: { query: (text: string, params?: unknown[]) => Promise<{ rows: unknown[] }> }) => Promise<T>): Promise<T> {
+  const base = db() as PgPool & { connect?: () => Promise<{ query: PgPool['query']; release: () => void }> };
+  if (typeof base.connect !== 'function') return fn(base);
+  const client = await base.connect();
+  try {
+    await client.query('BEGIN');
+    const value = await fn(client);
+    await client.query('COMMIT');
+    return value;
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally { client.release(); }
+}
+
 /** Transactional outbox insert — same DB txn as domain write in production. */
 export async function insertOutbox(client: { query: (t: string, p: unknown[]) => Promise<unknown> }, topic: string, payload: unknown) {
   await client.query('INSERT INTO outbox_event(topic, payload) VALUES ($1, $2)', [topic, JSON.stringify(payload)]);

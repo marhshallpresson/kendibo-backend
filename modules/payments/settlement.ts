@@ -17,6 +17,11 @@
 //                          from the wallet (the existing pay-with-wallet path finishes it).
 //   wallet top-up          exactly the received amount is credited (<ref>:topup); a short
 //                          payment keeps the row 'partial' (still watched) until Paga closes it.
+//   superseded             the agreed price changed after this request was raised (see
+//                          expected-charge.ts). It never confirms the booking; whatever Paga
+//                          received is credited to the payer's wallet (<ref>:superseded) and
+//                          the row stays 'superseded'. The reconciler does not watch these rows;
+//                          a callback for one still settles through settle().
 //
 // Safety: every status change is a guarded UPDATE (WHERE status = <what we read>) so a
 // concurrent path cannot settle twice; every wallet credit is keyed by a deterministic
@@ -149,7 +154,10 @@ export class PaymentSettlement {
 
     const received = cb > prev ? cb : prev; // never move backwards
     const full = received >= expected;
-    const next = row.status === 'partial' && !(row.purpose === 'topup' && full) ? 'partial' : full ? 'successful' : 'partial';
+    // A superseded request (the agreed price changed after it was raised) never confirms anything:
+    // whatever Paga received for it goes to the payer's wallet and the status stays 'superseded'.
+    const next = row.status === 'superseded' ? 'superseded'
+      : row.status === 'partial' && !(row.purpose === 'topup' && full) ? 'partial' : full ? 'successful' : 'partial';
     if (next === row.status && received === prev) {
       await this.finish(row, false); // nothing new; complete anything left over
       return { status: row.status, transitioned: false, receivedKobo: received, pspFinal };
@@ -165,6 +173,7 @@ export class PaymentSettlement {
 
     const fresh = (await this.load(reference)) as PaymentRow;
     await this.finish(fresh, true);
+    if (next === 'superseded') return { status: next, transitioned: false, receivedKobo: received, pspFinal };
     const kind = row.purpose === 'topup' ? 'topup' : next === 'partial' ? 'underpaid' : received > expected ? 'overpaid' : 'exact';
     if (next === 'partial' && pspFinal) await q(`UPDATE payment.payment SET next_check_at=NULL WHERE reference=$1`, [reference]).catch(() => {});
     return { status: next, transitioned: next !== row.status, kind, receivedKobo: received, pspFinal };
@@ -188,7 +197,8 @@ export class PaymentSettlement {
     const paid = row.status === 'successful';
 
     const target = topup ? received : paid ? (received > expected ? received - expected : 0n) : received;
-    const label = topup ? 'topup' : paid ? 'excess' : 'partial';
+    const superseded = row.status === 'superseded';
+    const label = topup ? 'topup' : paid ? 'excess' : superseded ? 'superseded' : 'partial';
     const have = await this.credited(row.reference);
     const missing = target - have;
     if (missing > 0n) {
@@ -210,7 +220,10 @@ export class PaymentSettlement {
     }
 
     if (missing > 0n && row.user_id) {
-      if (!paid && !topup) {
+      if (superseded) {
+        await this.hooks.notify(String(row.user_id), 'Payment received for an old price',
+          `We received ${formatNaira(received)} for a payment request that no longer matches your booking price. It is in your wallet; pay from your wallet to confirm the booking.`).catch(() => {});
+      } else if (!paid && !topup) {
         await this.hooks.notify(String(row.user_id), 'Payment received, not complete',
           `You paid ${formatNaira(received)} of ${formatNaira(expected)}; ${formatNaira(received)} is in your wallet. Pay the rest from your wallet to confirm.`).catch(() => {});
       } else if (paid && !topup) {
@@ -222,6 +235,7 @@ export class PaymentSettlement {
     if (transitioned) {
       const common = { purpose: row.purpose, reference: row.reference };
       if (topup) this.hooks.track('wallet.topup_succeeded', { psp: 'paga', ...common });
+      else if (superseded) this.hooks.track('payment.superseded_received', { ...common, receivedKobo: String(received), expectedKobo: String(expected) });
       else if (!paid) this.hooks.track('payment.partial', { ...common, receivedKobo: String(received), expectedKobo: String(expected) });
       else {
         this.hooks.track(row.purpose === 'booking' ? 'booking.payment_succeeded' : 'payment.settled', { psp: 'paga', ...common });
