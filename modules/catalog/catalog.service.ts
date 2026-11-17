@@ -63,7 +63,20 @@ async function offeringListings(f: { category?: string; id?: string }): Promise<
   const reviews = new Map<string, number>();
   for (const r of await q<{ provider_id: string; n: string }>(`SELECT provider_id, COUNT(*) AS n FROM provider.earning GROUP BY provider_id`).catch(() => [])) jobs.set(String(r.provider_id), Number(r.n));
   for (const r of await q<{ provider_id: string; n: string }>(`SELECT provider_id, COUNT(*) AS n FROM payment.review GROUP BY provider_id`).catch(() => [])) reviews.set(String(r.provider_id), Number(r.n));
-  const out = rows.map((r) => {
+  // Only vendors booking would accept: the same gate offeringService.book applies (vendorEligibilityService.allowed).
+  const { vendorEligibilityService, eligibilityEnforced } = await import('../vendors/eligibility.service.js');
+  const gate = new Map<string, boolean>();
+  const eligible: Record<string, unknown>[] = [];
+  for (const r of rows) {
+    if (eligibilityEnforced()) {
+      const key = `${r.provider_id}|${r.category_id}|${r.price_kobo}`;
+      if (!gate.has(key)) gate.set(key, await vendorEligibilityService.canWork(String(r.provider_id), String(r.category_id), { amountKobo: BigInt(String(r.price_kobo)) }).catch(() => false));
+      if (!gate.get(key)) continue;
+    }
+    eligible.push(r);
+  }
+  if (!eligible.length) return [];
+  const out = eligible.map((r) => {
     const pid = String(r.provider_id);
     return {
       svc: {

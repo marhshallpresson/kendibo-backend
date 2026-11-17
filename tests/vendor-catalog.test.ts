@@ -83,3 +83,21 @@ describe('catalog built from verified vendor offerings', () => {
     assert.ok(!(await names('definitely-not-a-category')).includes('pop-low'));
   });
 });
+
+describe('catalog respects the booking eligibility gate', () => {
+  it('lists only vendors cleared for the trade when eligibility is enforced', async () => {
+    const prev = process.env.VENDOR_ELIGIBILITY_ENFORCED;
+    process.env.VENDOR_ELIGIBILITY_ENFORCED = 'true';
+    try {
+      const ok = await vendor(); const no = await vendor();
+      await q(`UPDATE provider.provider SET face_verified=true, tier=1 WHERE id=$1`, [ok.pid]);
+      await q(`UPDATE provider.provider SET face_verified=false, tier=1 WHERE id=$1`, [no.pid]);
+      await offer(ok.pid, 'cleared vendor offer'); await offer(no.pid, 'uncleared vendor offer');
+      const listed = await names(CAT);
+      assert.ok(listed.includes('cleared vendor offer'));
+      assert.ok(!listed.includes('uncleared vendor offer'));
+      process.env.VENDOR_ELIGIBILITY_ENFORCED = 'false';
+      assert.ok((await names(CAT)).includes('uncleared vendor offer'), 'not enforced: no extra filter');
+    } finally { process.env.VENDOR_ELIGIBILITY_ENFORCED = prev; }
+  });
+});
