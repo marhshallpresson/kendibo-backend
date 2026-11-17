@@ -54,9 +54,8 @@ function receivedFrom(d: Record<string, unknown>, status: VerifiedPayment['statu
 }
 
 const callbackUrl = () =>
-  `${(process.env.PUBLIC_API_URL || process.env.WHATSAPP_WEB_BASE_URL || 'https://api.kendibo.ng').replace(/\/+$/, '')}/webhooks/payments/paga`;
-const transferCallbackUrl = () =>
-  `${(process.env.PUBLIC_API_URL || process.env.WHATSAPP_WEB_BASE_URL || 'https://api.kendibo.ng').replace(/\/+$/, '')}/webhooks/paga/transfer`;
+  `${(process.env.PUBLIC_API_URL || process.env.WHATSAPP_WEB_BASE_URL || 'https://api.kendibo.ng').replace(/\/+$/, '')}/webhooks/paga/subsidiary`; // Paga has one callback URL; the route hands each notification to its handler
+const transferCallbackUrl = callbackUrl;
 
 export class PagaAdapter implements PaymentPort {
   readonly name = 'paga' as const;

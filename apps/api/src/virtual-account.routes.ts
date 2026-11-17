@@ -5,8 +5,9 @@
 //   GET  /v1/wallet/virtual-account/fundings transfers received, with who sent them
 //   GET  /v1/admin/virtual-accounts?filter=  who has a number, who has paid in, who has not (payment:view)
 //   POST /v1/admin/virtual-accounts/backfill  { limit? } give numbers to verified users without one (configuration:edit)
-//   POST /webhooks/paga/subsidiary           Paga funding / charge / top-up / transfer notifications (public; verified inside)
-import type { FastifyInstance, FastifyReply } from 'fastify';
+//   POST /webhooks/paga/subsidiary           The one Paga callback URL: account funding / charge / top-up notifications here;
+//                                            checkout and payout notifications are handed to main.ts (routeOther)
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import {
   accountView, rotate, fundingsFor, adminList, handleSubsidiaryNotification, VaError, backfillVirtualAccounts,
@@ -16,6 +17,8 @@ import { observability } from '../../../packages/observability/watchup.adapter.j
 interface Helpers {
   authed: (req: never) => { sub: string } | null;
   fail: (reply: FastifyReply, code: string, message: string, status?: number, retryable?: boolean) => unknown;
+  /** Checkout / payout notifications arriving on the one Paga URL. Returns undefined when the body is not theirs. */
+  routeOther?: (req: FastifyRequest, reply: FastifyReply) => Promise<unknown | undefined>;
 }
 
 export const VIRTUAL_ACCOUNT_ROUTE_POLICY = {
@@ -68,7 +71,9 @@ export function registerVirtualAccountRoutes(app: FastifyInstance, h: Helpers) {
     return { data: await backfillVirtualAccounts(limit ?? 50) };
   });
 
-  app.post('/webhooks/paga/subsidiary', { config: { rawBody: true } }, async (req) => {
+  app.post('/webhooks/paga/subsidiary', { config: { rawBody: true } }, async (req, reply) => {
+    const other = h.routeOther ? await h.routeOther(req, reply) : undefined;
+    if (other !== undefined) return other;
     const raw = String((req as unknown as { rawBody?: string }).rawBody || JSON.stringify(req.body ?? {}));
     try {
       await handleSubsidiaryNotification(raw, req.headers as Record<string, string | string[] | undefined>);

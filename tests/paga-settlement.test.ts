@@ -84,10 +84,10 @@ async function startTopup(owner: string, amountKobo: number) {
   return String(res.json().data.reference);
 }
 /** Paga's /status says "paid" and its (hash-verified) callback reports the cumulative amount received. */
-function callback(reference: string, cumulativeKobo: number, opts: { notificationId?: string; state?: string; status?: 'successful' | 'partial'; paymentKobo?: number } = {}) {
+function callback(reference: string, cumulativeKobo: number, opts: { notificationId?: string; state?: string; status?: 'successful' | 'partial'; paymentKobo?: number; url?: string } = {}) {
   pagaSays.set(reference, opts.status === 'partial' ? { status: 'partial', code: '2' } : { status: 'successful', code: '0' });
   return app.inject({
-    method: 'POST', url: '/webhooks/payments/paga', headers: { 'content-type': 'application/json' },
+    method: 'POST', url: opts.url ?? '/webhooks/payments/paga', headers: { 'content-type': 'application/json' },
     payload: {
       notificationId: opts.notificationId ?? randomUUID(), statusCode: '0', externalReferenceNumber: reference, state: opts.state ?? 'CONSUMED',
       outstandingBalance: 0, paymentAmount: naira(opts.paymentKobo ?? cumulativeKobo), cumulativePaymentAmount: naira(cumulativeKobo), hash: 'fake',
@@ -204,6 +204,17 @@ describe('booking settlement rules', () => {
     assert.ok(await waitFor(async () => (await rowOf(ref)).settled_at !== null));
     assert.equal(await journals(ref), 1);
     assert.equal(await walletService.getBalance(owner), 0);
+  });
+
+  it('the one dashboard callback URL (/webhooks/paga/subsidiary) settles a checkout payment too', async () => {
+    const owner = await testUser();
+    const booking = await newBooking(owner);
+    const price = Number(booking.priceKobo);
+    const ref = await startBookingPayment(owner, String(booking.id), String(price));
+    assert.equal((await callback(ref, price, { url: '/webhooks/paga/subsidiary' })).statusCode, 200);
+    assert.ok(await settled(ref));
+    assert.ok(await waitFor(async () => (await rowOf(ref)).settled_at !== null));
+    assert.equal(await journals(ref), 1);
   });
 
   it('underpaid: not confirmed, the received amount lands in the payer wallet, then the wallet finishes it', async () => {

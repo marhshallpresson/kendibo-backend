@@ -1,6 +1,6 @@
 import 'dotenv/config'; // must stay first: loads .env (gitignored) before any env read
 import { config as appConfig } from '../../../packages/config/env.js'; // validates; refuses prod boot on missing secrets
-import Fastify, { FastifyReply } from 'fastify';
+import Fastify, { FastifyReply, FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import { z } from 'zod';
@@ -1097,7 +1097,9 @@ function pagaCallbackIpAllowed(ip: string, route: string): boolean {
 // /status confirms the payment, and the reconciler finishes anything this process drops.
 // The notificationId is recorded after the callback is persisted (not before), so a crash
 // in between makes Paga's retry (same notificationId, up to 3x) store it again.
-app.post('/webhooks/payments/paga', { config: { rawBody: true } }, async (req, reply) => {
+app.post('/webhooks/payments/paga', { config: { rawBody: true } }, (req, reply) => handlePagaCheckoutCallback(req, reply));
+
+async function handlePagaCheckoutCallback(req: FastifyRequest, reply: FastifyReply) {
   if (!pagaCallbackIpAllowed(String(req.ip ?? ''), 'payments')) return fail(reply, 'FORBIDDEN', 'Source not allowed', 403);
   try {
     const raw = Buffer.from((req as unknown as { rawBody?: string }).rawBody || JSON.stringify(req.body ?? {}));
@@ -1116,7 +1118,7 @@ app.post('/webhooks/payments/paga', { config: { rawBody: true } }, async (req, r
     app.log.error({ err: e }, 'webhook processing failed');
     return fail(reply, 'WEBHOOK_ERROR', 'Webhook processing failed', 500);
   }
-});
+}
 
 // Paga bank-transfer pay page (signed link from the checkout): account number,
 // exact amount, expiry and live status. Pending payments are re-checked with Paga.
@@ -1149,7 +1151,9 @@ app.get('/w/paga/pay', async (req, reply) => {
 
 // Paga Business API money-transfer status (vendor payouts). Hash in x-paga-hash;
 // Paga retries until it gets 200 {"status":"SUCCESS"}. Recorded once per reference+outcome.
-app.post('/webhooks/paga/transfer', { config: { rawBody: true } }, async (req, reply) => {
+app.post('/webhooks/paga/transfer', { config: { rawBody: true } }, (req, reply) => handlePagaTransferCallback(req, reply));
+
+async function handlePagaTransferCallback(req: FastifyRequest, reply: FastifyReply) {
   if (!pagaCallbackIpAllowed(String(req.ip ?? ''), 'transfer')) return fail(reply, 'FORBIDDEN', 'Source not allowed', 403);
   const { PagaAdapter } = await import('../../../modules/payments/paga.adapter.js');
   const raw = Buffer.from((req as unknown as { rawBody?: string }).rawBody || JSON.stringify(req.body ?? {}));
@@ -1170,7 +1174,22 @@ app.post('/webhooks/paga/transfer', { config: { rawBody: true } }, async (req, r
     ).catch((err) => observability.captureException(err));
   }
   return { status: 'SUCCESS' };
-});
+}
+
+// Paga's dashboard has ONE callback URL (/webhooks/paga/subsidiary), so every request we send
+// Paga names it, and this decides which handler a notification belongs to:
+//   payout status       referenceNumber + responseCode           -> transfer handler
+//   checkout payment    externalReferenceNumber of a Paga payment -> checkout handler
+//   anything else       persistent (subsidiary) account events    -> virtual-account handler
+async function routePagaCallback(req: FastifyRequest, reply: FastifyReply): Promise<unknown | undefined> {
+  let body: Record<string, unknown>;
+  try { body = JSON.parse(String((req as unknown as { rawBody?: string }).rawBody || JSON.stringify(req.body ?? {}))); } catch { return undefined; }
+  if (!body || typeof body !== 'object' || body.event || body.accountNumber) return undefined;
+  if (body.referenceNumber !== undefined && body.responseCode !== undefined) return handlePagaTransferCallback(req, reply);
+  const ext = body.externalReferenceNumber ? String(body.externalReferenceNumber) : '';
+  if (ext && (await q(`SELECT 1 FROM payment.payment WHERE reference=$1 AND psp='paga'`, [ext]))[0]) return handlePagaCheckoutCallback(req, reply);
+  return undefined;
+}
 
 app.post('/v1/refunds', async (req, reply) => {
   const { bookingId, amountKobo, reason } = z.object({ bookingId: z.string(), amountKobo: z.string().regex(/^\d+$/), reason: z.string().max(1000) }).parse(req.body);
@@ -3486,7 +3505,7 @@ registerEvidenceRoutes(app, { fail: fail as never, bookingParty: bookingParty as
 registerEmailRoutes(app, { authed: authed as never, fail: fail as never });
 registerOnboardingRoutes(app, { authed: authed as never, fail: fail as never });
 registerKycAdminRoutes(app, { fail: fail as never, adminActor: adminActor as never });
-registerVirtualAccountRoutes(app, { authed: authed as never, fail: fail as never });
+registerVirtualAccountRoutes(app, { authed: authed as never, fail: fail as never, routeOther: routePagaCallback });
 installVirtualAccountHooks(onEmit);
 registerAdminConsoleRoutes(app, { fail: fail as never, adminActor: adminActor as never });
 registerAdminPasswordRoutes(app, { fail: fail as never, adminActor: adminActor as never });

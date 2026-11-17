@@ -114,7 +114,7 @@ describe('PagaAdapter', () => {
     const r = await new PagaAdapter(new PagaClient(CFG, ok.f)).createPayout({ destinationId: 'BANK-UUID:0123456789', amountKobo: 1677500n, reference: 'po_1', idempotencyKey: 'po_1' });
     assert.equal(ok.calls[0].body.amount, '16775.00');
     assert.equal(ok.calls[0].headers.hash, sha512('po_116775.00BANK-UUID0123456789hash_test'));
-    assert.match(ok.calls[0].body.statusCallbackUrl, /\/webhooks\/paga\/transfer$/);
+    assert.match(ok.calls[0].body.statusCallbackUrl, /\/webhooks\/paga\/subsidiary$/); // Paga has one callback URL
     assert.equal(r.status, 'processing');
     for (const code of [3, -1, 135]) {
       const p = stubFetch(() => ({ json: { responseCode: code } }));
