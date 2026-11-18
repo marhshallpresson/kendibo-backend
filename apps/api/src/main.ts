@@ -1822,7 +1822,14 @@ async function buildPublicStorefront(providerId: string) {
     kycVerified: sf.badges.identityVerified,
     cacVerified: sf.badges.businessRegistered,
     faceVerified: sf.badges.faceVerified,
+    // Short-lived (1h) links for the vendor logo and cover, like offering photos.
+    logoUrl: await signedAssetUrl(sf.logoAssetId),
+    coverUrl: await signedAssetUrl(sf.coverAssetId),
   };
+}
+async function signedAssetUrl(assetId: string | null | undefined): Promise<string | null> {
+  if (!assetId) return null;
+  return objectStore.signedUrl(assetId, 3600).catch(() => null);
 }
 
 app.get('/v1/providers/:id', async (req, reply) => {
